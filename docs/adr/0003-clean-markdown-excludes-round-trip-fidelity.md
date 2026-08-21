@@ -1,0 +1,3 @@
+# "Clean markdown" excludes a round-trip-fidelity guarantee
+
+Clean markdown is defined as: no metadata outside YAML frontmatter. It deliberately does *not* also mean the editor preserves byte-for-byte formatting on every save. The MVP ships a WYSIWYG editor (Windows/Linux) and a plaintext editor (Android), and requiring either to reproduce untouched lines exactly would constrain editor implementation for little benefit, since diff noise from normal editing and importing is acceptable. The only invariant clean markdown protects is that the tool never injects markup into the body to serve its own bookkeeping.

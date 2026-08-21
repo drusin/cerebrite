@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PROTOTYPE — stable heading identity (throwaway, do not ship)</title>
+<style>
+  :root {
+    --ink: #1c1e26;
+    --dim: #6b7280;
+    --line: #e2e4e9;
+    --paper: #fdfdfc;
+    --panel: #f6f7f5;
+    --accent: #a2513f;
+    --accent-bg: #f4e9e6;
+    --live: #3a7d5c;
+    --live-bg: #e7f3ec;
+    --redirect: #a2513f;
+    --redirect-bg: #f4e9e6;
+    --broken: #b3261e;
+    --broken-bg: #fbeaea;
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    margin: 0;
+    padding: 2rem 1.5rem 4rem;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+  .badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #92400e;
+    background: #fef3c7;
+    border: 1px solid #fde68a;
+    border-radius: 4px;
+    padding: 0.15rem 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+  .question {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.5rem;
+    font-size: 0.95rem;
+  }
+  .question strong { color: var(--accent); }
+  .tabs {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 0.75rem;
+  }
+  .tab-btn {
+    border: 1px solid var(--line);
+    background: var(--paper);
+    border-radius: 999px;
+    padding: 0.4rem 0.9rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    color: var(--ink);
+  }
+  .tab-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .scenario-desc {
+    font-size: 0.9rem;
+    color: var(--dim);
+    margin-bottom: 0.75rem;
+    background: var(--panel);
+    border-left: 3px solid var(--accent);
+    padding: 0.6rem 0.9rem;
+    border-radius: 0 6px 6px 0;
+  }
+  .steps { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 1rem; }
+  .step-btn {
+    text-align: left;
+    border: 1px solid var(--line);
+    background: var(--paper);
+    border-radius: 8px;
+    padding: 0.55rem 0.9rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .step-btn .n {
+    flex: none;
+    width: 1.4rem; height: 1.4rem;
+    border-radius: 50%;
+    background: var(--line);
+    color: var(--dim);
+    font-size: 0.75rem;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step-btn.current { border-color: var(--accent); background: var(--accent-bg); }
+  .step-btn.current .n { background: var(--accent); color: white; }
+  .step-btn.done { opacity: 0.5; }
+  .step-btn.done .n { background: var(--live); color: white; }
+  .step-btn:disabled { cursor: not-allowed; }
+  .reset-link { background: none; border: none; color: var(--dim); text-decoration: underline; cursor: pointer; font-size: 0.8rem; padding: 0; }
+
+  h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
+  .freeplay { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.5rem; }
+  .freeplay button {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 0.45rem 0.75rem;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .freeplay button:hover:not(:disabled) { border-color: var(--accent); }
+  .freeplay button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .state-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+  @media (max-width: 760px) { .state-grid { grid-template-columns: 1fr; } }
+  .card {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--panel);
+    padding: 0.9rem 1rem;
+  }
+  .card h3 { margin: 0 0 0.6rem; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--dim); }
+  .page-block { margin-bottom: 0.6rem; padding-bottom: 0.6rem; border-bottom: 1px dashed var(--line); }
+  .page-block:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+  .page-name { font-weight: 600; font-size: 0.85rem; }
+  .buffer-flag { color: var(--broken); font-size: 0.72rem; font-weight: 700; margin-left: 0.4rem; }
+  .heading-row { font-size: 0.82rem; color: var(--dim); margin-left: 0.8rem; }
+  .heading-row code { background: #fff; border: 1px solid var(--line); border-radius: 4px; padding: 0 0.3rem; }
+
+  .link-row { font-size: 0.85rem; margin-bottom: 0.6rem; padding: 0.5rem 0.6rem; border-radius: 6px; background: #fff; border: 1px solid var(--line); }
+  .status-pill {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border-radius: 999px;
+    padding: 0.1rem 0.5rem;
+    margin-left: 0.4rem;
+  }
+  .status-live { color: var(--live); background: var(--live-bg); }
+  .status-redirected { color: var(--redirect); background: var(--redirect-bg); }
+  .status-broken { color: var(--broken); background: var(--broken-bg); }
+  .reason { color: var(--dim); font-size: 0.78rem; display: block; margin-top: 0.15rem; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; }
+  .empty { color: var(--dim); font-style: italic; font-size: 0.82rem; }
+
+  .log { background: #14161d; color: #d7dae0; border-radius: 10px; padding: 0.8rem 1rem; font-size: 0.78rem; max-height: 220px; overflow-y: auto; font-family: ui-monospace, monospace; }
+  .log div { margin-bottom: 0.3rem; }
+  .log .tag { color: #7dd3fc; }
+  .log .tag-danger { color: #fca5a5; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="badge">Prototype — throwaway — do not ship</span>
+  <h1>Stable heading identity: the temporary-mapping demo</h1>
+  <div class="question">
+    <strong>Question:</strong> when a link points at a heading and that heading is later renamed or moved,
+    can Cerebrite keep the link resolving correctly <em>without</em> writing any extra metadata into the
+    markdown body (clean markdown, ADR-0003)? The leading idea: a <strong>temporary in-app mapping</strong>
+    (a redirect table, living only in the derived index) bridges the gap immediately after the edit, and a
+    <strong>background cleanup job</strong> rewrites the referencing files to point at the new heading
+    directly — after which the mapping entry is disposable.
+    <br><br>
+    Click through the four scenarios below in order. Watch the <strong>Links</strong> panel (top right) —
+    that's where a link goes from <span class="status-pill status-live">live</span> to
+    <span class="status-pill status-redirected">redirected</span> to
+    <span class="status-pill status-broken">broken</span>, and the <strong>Redirects</strong> table
+    (the thing this whole idea hinges on).
+  </div>
+
+  <div class="tabs" id="tabButtons"></div>
+
+  <div id="tabPanels"></div>
+
+  <h2>Free play — any action, any order</h2>
+  <div class="freeplay" id="freeplay"></div>
+
+  <div class="state-grid">
+    <div class="card">
+      <h3>Pages &amp; headings (as literally written in the files)</h3>
+      <div id="pagesPanel"></div>
+    </div>
+    <div class="card">
+      <h3>Links (as literally written in the files) — and how they resolve <em>right now</em></h3>
+      <div id="linksPanel"></div>
+    </div>
+  </div>
+  <div class="state-grid">
+    <div class="card">
+      <h3>Redirects — the temporary in-app mapping (never written to a file)</h3>
+      <div id="redirectsPanel"></div>
+    </div>
+    <div class="card">
+      <h3>Pending rewrites — the background cleanup job's queue</h3>
+      <div id="pendingPanel"></div>
+    </div>
+  </div>
+
+  <h2>What just happened</h2>
+  <div class="log" id="logPanel"></div>
+</div>
+
+<script>
+// ============================================================================
+// PURE MODULE — no DOM, no document, nothing reaching in from the page below.
+// This is the part meant to survive the prototype: the redirect/cleanup model
+// for stable heading identity under clean-markdown constraints.
+// ============================================================================
+const HeadingIdentityModel = (() => {
+  function slugify(text) {
+    return text.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-+|-+$)/g, '');
+  }
+
+  function uniqueSlug(existingSlugs, baseSlug) {
+    if (!existingSlugs.includes(baseSlug)) return baseSlug;
+    let n = 2;
+    while (existingSlugs.includes(`${baseSlug}-${n}`)) n++;
+    return `${baseSlug}-${n}`;
+  }
+
+  function keyOf(pageId, slug) { return `${pageId}#${slug}`; }
+
+  function initialState() {
+    return {
+      pages: {
+        p1: { name: 'Recipes.md', headings: [
+          { slug: 'ingredients', text: 'Ingredients' },
+          { slug: 'method', text: 'Method' },
+        ]},
+        p2: { name: 'Shopping List.md', headings: [
+          { slug: 'weekly-staples', text: 'Weekly Staples' },
+        ]},
+        p3: { name: 'Kitchen Notes.md', headings: [
+          { slug: 'method', text: 'Method' }, // pre-existing, unrelated — sets up the collision
+        ]},
+        p4: { name: 'Menu Plan.md', headings: [
+          { slug: 'this-week', text: 'This Week' },
+        ]},
+      },
+      links: {
+        l1: { sourcePageId: 'p2', targetPageId: 'p1', targetSlug: 'ingredients' },
+        l2: { sourcePageId: 'p4', targetPageId: 'p1', targetSlug: 'method' },
+      },
+      redirects: {},      // key "pageId#slug" (OLD identity) -> { toPageId, toSlug }
+      pendingRewrites: [],// [{ id, linkId, fromKey }]
+      openBuffers: {},    // pageId -> true while the user has unsaved edits open
+      log: [],
+      nextRewriteId: 1,
+    };
+  }
+
+  function resolve(state, linkId) {
+    const link = state.links[linkId];
+    let pageId = link.targetPageId, slug = link.targetSlug, hops = 0;
+    const visited = new Set();
+    while (true) {
+      const key = keyOf(pageId, slug);
+      const page = state.pages[pageId];
+      const live = page && page.headings.find(h => h.slug === slug);
+      if (live) return { status: hops ? 'redirected' : 'live', pageId, slug, hops };
+      if (visited.has(key)) return { status: 'broken', reason: 'redirect cycle detected', pageId, slug, hops };
+      visited.add(key);
+      const redirect = state.redirects[key];
+      if (!redirect) {
+        return {
+          status: 'broken',
+          reason: hops
+            ? 'redirect chain ended without reaching a live heading'
+            : 'no live heading at this key, and no redirect for it',
+          pageId, slug, hops,
+        };
+      }
+      pageId = redirect.toPageId; slug = redirect.toSlug; hops++;
+    }
+  }
+
+  function log(state, text, danger) {
+    return { ...state, log: [...state.log, { text, danger: !!danger }] };
+  }
+
+  function renameHeading(state, pageId, oldSlug, newText) {
+    const page = state.pages[pageId];
+    const heading = page.headings.find(h => h.slug === oldSlug);
+    if (!heading) return log(state, `Rename skipped: no heading "${oldSlug}" found on ${page.name} (already renamed?).`);
+    const otherSlugs = page.headings.filter(h => h !== heading).map(h => h.slug);
+    const newSlug = uniqueSlug(otherSlugs, slugify(newText));
+
+    const pages = {
+      ...state.pages,
+      [pageId]: {
+        ...page,
+        headings: page.headings.map(h => h === heading ? { slug: newSlug, text: newText } : h),
+      },
+    };
+
+    const oldKey = keyOf(pageId, oldSlug);
+    const redirects = { ...state.redirects, [oldKey]: { toPageId: pageId, toSlug: newSlug } };
+
+    const newRewrites = Object.entries(state.links)
+      .filter(([, l]) => l.targetPageId === pageId && l.targetSlug === oldSlug)
+      .map(([linkId], i) => ({ id: state.nextRewriteId + i, linkId, fromKey: oldKey }));
+
+    let next = {
+      ...state,
+      pages,
+      redirects,
+      pendingRewrites: [...state.pendingRewrites, ...newRewrites],
+      nextRewriteId: state.nextRewriteId + newRewrites.length,
+    };
+    next = log(next, `Renamed "${heading.text}" → "${newText}" on ${page.name}. In-app redirect recorded: ${oldKey} → ${keyOf(pageId, newSlug)}. ${newRewrites.length} link(s) queued for cleanup — the files themselves are UNCHANGED so far.`);
+    return next;
+  }
+
+  function moveHeading(state, fromPageId, slug, toPageId) {
+    const fromPage = state.pages[fromPageId];
+    const toPage = state.pages[toPageId];
+    const heading = fromPage.headings.find(h => h.slug === slug);
+    if (!heading) return log(state, `Move skipped: no heading "${slug}" found on ${fromPage.name} (already moved?).`);
+
+    const collision = toPage.headings.some(h => h.slug === slug);
+    const newSlug = uniqueSlug(toPage.headings.map(h => h.slug), slug);
+
+    const pages = {
+      ...state.pages,
+      [fromPageId]: { ...fromPage, headings: fromPage.headings.filter(h => h !== heading) },
+      [toPageId]: { ...toPage, headings: [...toPage.headings, { slug: newSlug, text: heading.text }] },
+    };
+
+    const oldKey = keyOf(fromPageId, slug);
+    const redirects = { ...state.redirects, [oldKey]: { toPageId, toSlug: newSlug } };
+
+    const newRewrites = Object.entries(state.links)
+      .filter(([, l]) => l.targetPageId === fromPageId && l.targetSlug === slug)
+      .map(([linkId], i) => ({ id: state.nextRewriteId + i, linkId, fromKey: oldKey }));
+
+    let next = {
+      ...state,
+      pages,
+      redirects,
+      pendingRewrites: [...state.pendingRewrites, ...newRewrites],
+      nextRewriteId: state.nextRewriteId + newRewrites.length,
+    };
+    next = log(next, `Moved "${heading.text}" from ${fromPage.name} to ${toPage.name}.` +
+      (collision ? ` ${toPage.name} already had a "${slug}" heading, so the moved one was disambiguated to "${newSlug}" — identities were kept apart instead of silently merging.` : '') +
+      ` In-app redirect: ${oldKey} → ${keyOf(toPageId, newSlug)}. ${newRewrites.length} link(s) queued for cleanup.`);
+    return next;
+  }
+
+  function runCleanupStep(state) {
+    if (state.pendingRewrites.length === 0) return log(state, 'Cleanup job: nothing queued.');
+    const blocked = [];
+    let chosen = null;
+    for (const pr of state.pendingRewrites) {
+      const link = state.links[pr.linkId];
+      if (state.openBuffers[link.sourcePageId]) { blocked.push(pr); continue; }
+      chosen = pr; break;
+    }
+    if (!chosen) {
+      const names = blocked.map(pr => state.pages[state.links[pr.linkId].sourcePageId].name);
+      return log(state, `Cleanup job: every queued rewrite touches a file with unsaved edits open (${names.join(', ')}) — deferring rather than clobbering the user's buffer.`, true);
+    }
+    const link = state.links[chosen.linkId];
+    const result = resolve(state, chosen.linkId);
+    if (result.status === 'broken') {
+      const next = { ...state, pendingRewrites: state.pendingRewrites.filter(pr => pr !== chosen) };
+      return log(next, `Cleanup job: tried to rewrite the link in ${state.pages[link.sourcePageId].name}, but it no longer resolves at all (${result.reason}) — dropping it from the queue, link stays broken.`, true);
+    }
+    const links = {
+      ...state.links,
+      [chosen.linkId]: { ...link, targetPageId: result.pageId, targetSlug: result.slug },
+    };
+    const next = {
+      ...state,
+      links,
+      pendingRewrites: state.pendingRewrites.filter(pr => pr !== chosen),
+    };
+    return log(next, `Cleanup job: rewrote the link in ${state.pages[link.sourcePageId].name} to point directly at ${keyOf(result.pageId, result.slug)}${result.hops > 1 ? ` (collapsed a ${result.hops}-hop redirect chain into one direct rewrite)` : ''}. This is a real file edit — it needs its own commit.`);
+  }
+
+  function pruneRedirects(state) {
+    const stillNeeded = new Set();
+    for (const link of Object.values(state.links)) stillNeeded.add(keyOf(link.targetPageId, link.targetSlug));
+    for (const pr of state.pendingRewrites) stillNeeded.add(pr.fromKey);
+    const kept = {};
+    const dropped = [];
+    for (const [key, val] of Object.entries(state.redirects)) {
+      if (stillNeeded.has(key)) kept[key] = val; else dropped.push(key);
+    }
+    if (dropped.length === 0) return log(state, 'Prune: nothing to drop — every redirect is still referenced by a link or a pending rewrite.');
+    return log({ ...state, redirects: kept }, `Prune: dropped ${dropped.length} redirect(s) no longer referenced by anything (${dropped.join(', ')}). Fully disposable, as intended — but only because cleanup had already run.`);
+  }
+
+  function restartOrSync(state) {
+    if (Object.keys(state.redirects).length === 0 && state.pendingRewrites.length === 0) {
+      return log(state, 'Restart / sync: derived index rebuilt from files only — nothing was riding on the redirect table anyway.');
+    }
+    const next = { ...state, redirects: {}, pendingRewrites: [] };
+    return log(next, `Restart / sync to a new device: the derived index is rebuilt from the markdown files ALONE (that's the whole point of it being a derived index — never git-synced). The ${Object.keys(state.redirects).length} redirect(s) and ${state.pendingRewrites.length} pending rewrite(s) that only lived in this session's memory are gone. Any link still depending on one of them is now unresolvable until a human notices and fixes it by hand.`, true);
+  }
+
+  function toggleBuffer(state, pageId) {
+    const isOpen = !!state.openBuffers[pageId];
+    const next = { ...state, openBuffers: { ...state.openBuffers, [pageId]: !isOpen } };
+    return log(next, `${isOpen ? 'Closed' : 'Opened'} ${state.pages[pageId].name} in the editor${isOpen ? '' : ' (unsaved edits — cleanup must not touch it)'}.`);
+  }
+
+  function reduce(state, action) {
+    switch (action.type) {
+      case 'RENAME': return renameHeading(state, action.pageId, action.oldSlug, action.newText);
+      case 'MOVE': return moveHeading(state, action.fromPageId, action.slug, action.toPageId);
+      case 'CLEANUP_STEP': return runCleanupStep(state);
+      case 'PRUNE': return pruneRedirects(state);
+      case 'RESTART_OR_SYNC': return restartOrSync(state);
+      case 'TOGGLE_BUFFER': return toggleBuffer(state, action.pageId);
+      case 'RESET': return initialState();
+      default: return state;
+    }
+  }
+
+  return { initialState, reduce, resolve, keyOf };
+})();
+
+// ============================================================================
+// THROWAWAY PAGE SHELL — wires the pure module above to buttons and renders it.
+// ============================================================================
+let state = HeadingIdentityModel.initialState();
+
+const SCENARIOS = [
+  {
+    id: 'happy',
+    title: 'Happy path',
+    desc: 'Rename a heading, run the cleanup job, prune the redirect. The mapping is a genuinely temporary bridge and disappears once the file catches up.',
+    steps: [
+      { label: 'Rename "Ingredients" on Recipes.md → "Ingredients & Substitutions"', action: { type: 'RENAME', pageId: 'p1', oldSlug: 'ingredients', newText: 'Ingredients & Substitutions' } },
+      { label: 'Run one cleanup step', action: { type: 'CLEANUP_STEP' } },
+      { label: 'Prune stale redirects', action: { type: 'PRUNE' } },
+    ],
+  },
+  {
+    id: 'race',
+    title: 'The sync race',
+    desc: 'Rename the same heading again, but this time simulate a restart or a sync to a new device BEFORE the cleanup job gets a turn. Watch the link.',
+    steps: [
+      { label: 'Rename "Ingredients" on Recipes.md → "Ingredients & Substitutions"', action: { type: 'RENAME', pageId: 'p1', oldSlug: 'ingredients', newText: 'Ingredients & Substitutions' } },
+      { label: 'Restart app / sync to a new device — before cleanup runs', action: { type: 'RESTART_OR_SYNC' } },
+    ],
+  },
+  {
+    id: 'collision',
+    title: 'Slug collision & redirect chains',
+    desc: '"Method" moves onto a page that already has its own "Method" heading, then gets renamed again on its new page. One cleanup step has to collapse a two-hop chain into a single direct rewrite.',
+    steps: [
+      { label: 'Move "Method" from Recipes.md → Kitchen Notes.md (which already has its own "Method")', action: { type: 'MOVE', fromPageId: 'p1', slug: 'method', toPageId: 'p3' } },
+      { label: 'Rename "Method" on Kitchen Notes.md → "Cooking Method"', action: { type: 'RENAME', pageId: 'p3', oldSlug: 'method-2', newText: 'Cooking Method' } },
+      { label: 'Run one cleanup step', action: { type: 'CLEANUP_STEP' } },
+    ],
+  },
+  {
+    id: 'buffer',
+    title: 'Concurrent edit guard',
+    desc: 'Open the referencing file with unsaved edits, then rename its target. The cleanup job must not rewrite a file out from under a live edit — it should wait.',
+    steps: [
+      { label: 'Open Shopping List.md in the editor (unsaved edits)', action: { type: 'TOGGLE_BUFFER', pageId: 'p2' } },
+      { label: 'Rename "Ingredients" on Recipes.md → "Ingredients & Substitutions"', action: { type: 'RENAME', pageId: 'p1', oldSlug: 'ingredients', newText: 'Ingredients & Substitutions' } },
+      { label: 'Run one cleanup step — watch it defer', action: { type: 'CLEANUP_STEP' } },
+      { label: 'Close Shopping List.md buffer', action: { type: 'TOGGLE_BUFFER', pageId: 'p2' } },
+      { label: 'Run one cleanup step again — now it proceeds', action: { type: 'CLEANUP_STEP' } },
+    ],
+  },
+];
+
+const FREEPLAY = [
+  { label: 'Rename Ingredients → Ingredients & Substitutions', action: { type: 'RENAME', pageId: 'p1', oldSlug: 'ingredients', newText: 'Ingredients & Substitutions' } },
+  { label: 'Rename again → Prep & Substitutions', action: { type: 'RENAME', pageId: 'p1', oldSlug: 'ingredients-substitutions', newText: 'Prep & Substitutions' } },
+  { label: 'Move Method → Kitchen Notes.md', action: { type: 'MOVE', fromPageId: 'p1', slug: 'method', toPageId: 'p3' } },
+  { label: 'Rename Method → Cooking Method (on Kitchen Notes)', action: { type: 'RENAME', pageId: 'p3', oldSlug: 'method-2', newText: 'Cooking Method' } },
+  { label: 'Run one cleanup step', action: { type: 'CLEANUP_STEP' } },
+  { label: 'Prune stale redirects', action: { type: 'PRUNE' } },
+  { label: 'Restart app / sync to new device', action: { type: 'RESTART_OR_SYNC' } },
+  { label: 'Toggle Shopping List.md buffer open/closed', action: { type: 'TOGGLE_BUFFER', pageId: 'p2' } },
+  { label: 'Reset demo', action: { type: 'RESET' } },
+];
+
+let activeTab = 0;
+let walkthroughStep = 0; // next step index to run, per active tab
+
+function dispatch(action) {
+  state = HeadingIdentityModel.reduce(state, action);
+  render();
+}
+
+function startWalkthrough(tabIndex) {
+  activeTab = tabIndex;
+  walkthroughStep = 0;
+  state = HeadingIdentityModel.initialState();
+  render();
+}
+
+function clickStep(tabIndex, stepIndex) {
+  if (tabIndex !== activeTab || stepIndex !== walkthroughStep) return;
+  dispatch(SCENARIOS[tabIndex].steps[stepIndex].action);
+  walkthroughStep++;
+  render();
+}
+
+function renderTabs() {
+  const tabButtons = document.getElementById('tabButtons');
+  tabButtons.innerHTML = '';
+  SCENARIOS.forEach((s, i) => {
+    const b = document.createElement('button');
+    b.className = 'tab-btn' + (i === activeTab ? ' active' : '');
+    b.textContent = s.title;
+    b.onclick = () => startWalkthrough(i);
+    tabButtons.appendChild(b);
+  });
+
+  const tabPanels = document.getElementById('tabPanels');
+  tabPanels.innerHTML = '';
+  SCENARIOS.forEach((s, i) => {
+    const panel = document.createElement('div');
+    panel.className = 'tab-panel' + (i === activeTab ? ' active' : '');
+    const desc = document.createElement('div');
+    desc.className = 'scenario-desc';
+    desc.textContent = s.desc;
+    panel.appendChild(desc);
+
+    const stepsWrap = document.createElement('div');
+    stepsWrap.className = 'steps';
+    s.steps.forEach((step, si) => {
+      const btn = document.createElement('button');
+      const isDone = i === activeTab && si < walkthroughStep;
+      const isCurrent = i === activeTab && si === walkthroughStep;
+      btn.className = 'step-btn' + (isDone ? ' done' : '') + (isCurrent ? ' current' : '');
+      btn.disabled = !(i === activeTab && si === walkthroughStep);
+      btn.innerHTML = `<span class="n">${si + 1}</span><span>${step.label}</span>`;
+      btn.onclick = () => clickStep(i, si);
+      stepsWrap.appendChild(btn);
+    });
+    panel.appendChild(stepsWrap);
+
+    const resetBtn = document.createElement('button');
+    resetBtn.className = 'reset-link';
+    resetBtn.textContent = '↺ start this walkthrough over';
+    resetBtn.onclick = () => startWalkthrough(i);
+    panel.appendChild(resetBtn);
+
+    tabPanels.appendChild(panel);
+  });
+}
+
+function renderFreeplay() {
+  const el = document.getElementById('freeplay');
+  el.innerHTML = '';
+  FREEPLAY.forEach(item => {
+    const b = document.createElement('button');
+    b.textContent = item.label;
+    b.onclick = () => dispatch(item.action);
+    el.appendChild(b);
+  });
+}
+
+function renderPages() {
+  const el = document.getElementById('pagesPanel');
+  el.innerHTML = '';
+  Object.entries(state.pages).forEach(([pageId, page]) => {
+    const div = document.createElement('div');
+    div.className = 'page-block';
+    const bufferFlag = state.openBuffers[pageId] ? '<span class="buffer-flag">● unsaved edits open</span>' : '';
+    div.innerHTML = `<div class="page-name">${page.name}${bufferFlag}</div>` +
+      page.headings.map(h => `<div class="heading-row">## ${h.text} <code>${pageId}#${h.slug}</code></div>`).join('');
+    el.appendChild(div);
+  });
+}
+
+function renderLinks() {
+  const el = document.getElementById('linksPanel');
+  el.innerHTML = '';
+  Object.entries(state.links).forEach(([linkId, link]) => {
+    const result = HeadingIdentityModel.resolve(state, linkId);
+    const source = state.pages[link.sourcePageId].name;
+    const div = document.createElement('div');
+    div.className = 'link-row';
+    div.innerHTML = `${source} → <code>[[${link.targetPageId}#${link.targetSlug}]]</code>` +
+      `<span class="status-pill status-${result.status}">${result.status}</span>` +
+      (result.reason ? `<span class="reason">${result.reason}</span>` : '') +
+      (result.hops ? `<span class="reason">resolves via ${result.hops} redirect hop(s) → ${HeadingIdentityModel.keyOf(result.pageId, result.slug)}</span>` : '');
+    el.appendChild(div);
+  });
+}
+
+function renderRedirects() {
+  const el = document.getElementById('redirectsPanel');
+  const entries = Object.entries(state.redirects);
+  if (entries.length === 0) { el.innerHTML = '<div class="empty">No redirects — nothing pending, or already cleaned up.</div>'; return; }
+  el.innerHTML = `<table><thead><tr><th>Old key</th><th>→ New key</th></tr></thead><tbody>` +
+    entries.map(([key, r]) => `<tr><td>${key}</td><td>${HeadingIdentityModel.keyOf(r.toPageId, r.toSlug)}</td></tr>`).join('') +
+    `</tbody></table>`;
+}
+
+function renderPending() {
+  const el = document.getElementById('pendingPanel');
+  if (state.pendingRewrites.length === 0) { el.innerHTML = '<div class="empty">Queue empty.</div>'; return; }
+  el.innerHTML = `<table><thead><tr><th>Link</th><th>Old key to fix</th></tr></thead><tbody>` +
+    state.pendingRewrites.map(pr => `<tr><td>${pr.linkId}</td><td>${pr.fromKey}</td></tr>`).join('') +
+    `</tbody></table>`;
+}
+
+function renderLog() {
+  const el = document.getElementById('logPanel');
+  el.innerHTML = state.log.slice(-30).map(entry =>
+    `<div><span class="${entry.danger ? 'tag-danger' : 'tag'}">${entry.danger ? '⚠' : '›'}</span> ${entry.text}</div>`
+  ).join('') || '<div class="empty">Nothing has happened yet.</div>';
+  el.scrollTop = el.scrollHeight;
+}
+
+function render() {
+  renderTabs();
+  renderFreeplay();
+  renderPages();
+  renderLinks();
+  renderRedirects();
+  renderPending();
+  renderLog();
+}
+
+render();
+</script>
+</body>
+</html>
