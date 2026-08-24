@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PROTOTYPE — WYSIWYG editor component (throwaway, do not ship)</title>
+<style>
+  :root {
+    --ink: #1c1e26;
+    --dim: #6b7280;
+    --line: #e2e4e9;
+    --paper: #fdfdfc;
+    --panel: #f6f7f5;
+    --accent: #a2513f;
+    --accent-bg: #f4e9e6;
+    --good: #3a7d5c;
+    --good-bg: #e7f3ec;
+    --bad: #b3261e;
+    --bad-bg: #fbeaea;
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    margin: 0;
+    padding: 1.5rem 1.25rem 6rem;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 0 0 0.25rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
+  .badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #92400e;
+    background: #fef3c7;
+    border: 1px solid #fde68a;
+    border-radius: 4px;
+    padding: 0.15rem 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+  .question {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+    font-size: 0.92rem;
+  }
+  .question strong { color: var(--accent); }
+  .howto {
+    background: var(--accent-bg);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    padding: 0.9rem 1.15rem;
+    margin-bottom: 1.25rem;
+    font-size: 0.85rem;
+  }
+  .howto summary { cursor: pointer; font-weight: 700; color: var(--accent); }
+  .howto code { background: rgba(0,0,0,0.06); padding: 0.05rem 0.3rem; border-radius: 4px; }
+  .howto ol, .howto ul { margin: 0.5rem 0 0.25rem 1.1rem; padding: 0; }
+  .howto li { margin-bottom: 0.35rem; }
+
+  .tabs {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.9rem;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 0.75rem;
+    align-items: center;
+  }
+  .tab-btn {
+    border: 1px solid var(--line);
+    background: var(--paper);
+    border-radius: 999px;
+    padding: 0.4rem 0.9rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    color: var(--ink);
+  }
+  .tab-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .scenario-select {
+    margin-left: auto;
+    font-size: 0.85rem;
+    padding: 0.35rem 0.6rem;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+  }
+
+  .panes {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  @media (max-width: 800px) {
+    .panes { grid-template-columns: 1fr; }
+  }
+  .pane {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 380px;
+  }
+  .pane-title {
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--dim);
+    background: var(--panel);
+    padding: 0.5rem 0.85rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .editor-host {
+    flex: 1;
+    padding: 0.85rem;
+    font-size: 1rem;
+    overflow-y: auto;
+  }
+  .editor-host .ProseMirror { outline: none; min-height: 300px; }
+  .editor-host .ProseMirror h1 { font-size: 1.5rem; }
+  .editor-host .ProseMirror h2 { font-size: 1.25rem; }
+  .editor-host .ProseMirror h3 { font-size: 1.1rem; }
+  .editor-host .ProseMirror pre {
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    overflow-x: auto;
+  }
+  .editor-host .ProseMirror code { background: var(--panel); padding: 0.1rem 0.3rem; border-radius: 4px; }
+  .editor-host .ProseMirror pre code { background: none; padding: 0; }
+  .editor-host .ProseMirror blockquote {
+    border-left: 3px solid var(--accent);
+    margin: 0.5rem 0;
+    padding-left: 0.75rem;
+    color: var(--dim);
+  }
+  .editor-host .ProseMirror a { color: var(--accent); }
+  .editor-host .ProseMirror ul, .editor-host .ProseMirror ol { padding-left: 1.4rem; }
+
+  .md-out {
+    flex: 1;
+    margin: 0;
+    padding: 0.85rem;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.82rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-y: auto;
+    background: var(--panel);
+  }
+  .flag-row { padding: 0.6rem 0.85rem; border-top: 1px solid var(--line); font-size: 0.8rem; }
+  .flag-ok { color: var(--good); }
+  .flag-bad { color: var(--bad); font-weight: 600; }
+
+  .checklist {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    font-size: 0.88rem;
+  }
+  .checklist ul { margin: 0.4rem 0 0; padding-left: 1.2rem; }
+  .checklist li { margin-bottom: 0.4rem; }
+
+  .switcher {
+    position: fixed;
+    left: 50%;
+    bottom: 1.25rem;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    background: var(--ink);
+    color: white;
+    border-radius: 999px;
+    padding: 0.5rem 0.6rem 0.5rem 0.9rem;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+    font-size: 0.85rem;
+    z-index: 50;
+  }
+  .switcher button {
+    background: rgba(255,255,255,0.12);
+    border: none;
+    color: white;
+    width: 1.8rem;
+    height: 1.8rem;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 1rem;
+    line-height: 1;
+  }
+  .switcher button:hover { background: rgba(255,255,255,0.25); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="badge">Prototype — throwaway, do not ship</span>
+  <h1>WYSIWYG editor component</h1>
+
+  <div class="question">
+    <strong>Question:</strong> ticket
+    <a href="02-wysiwyg-editor-component.md">02-wysiwyg-editor-component</a> —
+    pick Milkdown or Tiptap as Cerebrite's WYSIWYG editor, and decide whether Android ships
+    WYSIWYG at MVP or falls back to plaintext. Clean markdown (<a href="../../../docs/adr/0003-clean-markdown-excludes-round-trip-fidelity.md">ADR-0003</a>)
+    requires that saving never injects metadata outside YAML frontmatter — the right-hand panel
+    below is the live markdown each editor would write to disk on save.
+  </div>
+
+  <details class="howto" open>
+    <summary>How to run this (desktop + Android)</summary>
+    <ol>
+      <li><strong>Desktop:</strong> just open this file directly in a browser (double-click, or
+        <code>file://…/02-wysiwyg-editor-component.prototype.html</code>). No build step, no server needed.</li>
+      <li><strong>Android:</strong> file:// won't reach a phone. Serve this directory instead —
+        from this folder run <code>python3 -m http.server 8000</code> — then, from inside the
+        sandbox, ask on the host: <code>sbx ports &lt;sandbox-name&gt; --publish 8000:8000/tcp</code>
+        (substitute the sandbox's own name/IP). Open <code>http://&lt;sandbox-host-ip&gt;:8000/02-wysiwyg-editor-component.prototype.html</code>
+        in Chrome on the Android device (same network as the host).</li>
+      <li>Alternative if publishing ports is inconvenient: copy this <code>.prototype.html</code>
+        file plus the two <code>*.bundle.js</code> files in
+        <code>02-wysiwyg-editor-component.assets/</code> to any machine/phone you can serve
+        statically from (a laptop's <code>python3 -m http.server</code> on the same Wi-Fi works fine).</li>
+    </ol>
+  </details>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-editor="tiptap">Tiptap</button>
+    <button class="tab-btn" data-editor="milkdown">Milkdown</button>
+    <select class="scenario-select" id="scenario-select"></select>
+  </div>
+
+  <div class="panes">
+    <div class="pane">
+      <div class="pane-title" id="editor-pane-title">Tiptap — editable</div>
+      <div class="editor-host" id="editor-host"></div>
+    </div>
+    <div class="pane">
+      <div class="pane-title">Markdown that would be saved to disk</div>
+      <pre class="md-out" id="md-out"></pre>
+      <div class="flag-row" id="flag-row"></div>
+    </div>
+  </div>
+
+  <h2>What to react to</h2>
+  <div class="checklist">
+    <strong>Clean-markdown-out (can try right here, no Android needed):</strong>
+    <ul>
+      <li>Switch between scenarios (especially <em>"Links &amp; wikilinks"</em>) and compare the
+        two editors' output panels. Tiptap's <code>tiptap-markdown</code> serializer
+        backslash-escapes literal <code>[[</code>/<code>]]</code> brackets it doesn't recognize
+        as its own syntax (<code>\[\[…\]\]</code>) — that's markup injected into the body that
+        wasn't there on load, a real clean-markdown concern once Cerebrite adopts a
+        wikilink-style syntax. Milkdown's commonmark serializer leaves them untouched.</li>
+      <li>Milkdown re-serializes bullets as <code>*</code> even if the source used <code>-</code>
+        (and generally re-flows formatting more aggressively). ADR-0003 explicitly allows this —
+        round-trip/diff fidelity isn't required — but confirm it doesn't bother you as a "my file
+        churns every time I open it" experience.</li>
+      <li>Try pasting messy content (e.g. from a webpage) into each and check the output panel for
+        stray HTML or attributes leaking through.</li>
+      <li>Look at the <em>"Headings &amp; inline formatting"</em> scenario's output: Tiptap's
+        <code>tiptap-markdown</code> serializer re-encodes the plain <code>&gt;</code> character in
+        "before a &gt; blockquote below" as the HTML entity <code>&amp;gt;</code> — a literal
+        prose character turned into markup on save. Milkdown leaves it as a plain
+        <code>&gt;</code>.</li>
+    </ul>
+    <strong>Android WebView behaviour (needs an actual Android device or emulator — this sandbox
+      has neither):</strong>
+    <ul>
+      <li>Tap to place the cursor mid-word, then mid-list-item — is the tap target precise, or does
+        it land in the wrong place?</li>
+      <li>Drag the selection handles to select a phrase spanning a bold/italic boundary.</li>
+      <li>Type a sentence using the on-screen keyboard's predictive-text / autocorrect — watch for
+        broken IME composition (text appearing twice, cursor jumping, composed characters like
+        accents or CJK input misplaced).</li>
+      <li>Press Enter inside a list item — does it continue the list correctly? Backspace at the
+        start of a list item — does it outdent/exit the list the way you'd expect on mobile?</li>
+      <li>Rotate the device / resize the on-screen keyboard while focused — does the editor scroll
+        correctly to keep the cursor visible?</li>
+      <li>If it's rough on either editor, that's the basis for Android falling back to
+        plaintext-only at MVP; if it holds up, Android ships the same WYSIWYG UI as desktop.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="switcher">
+  <button id="prev-btn" aria-label="Previous editor">&larr;</button>
+  <span id="switcher-label">A — Tiptap</span>
+  <button id="next-btn" aria-label="Next editor">&rarr;</button>
+</div>
+
+<script src="02-wysiwyg-editor-component.assets/tiptap.bundle.js"></script>
+<script src="02-wysiwyg-editor-component.assets/milkdown.bundle.js"></script>
+<script>
+(function () {
+  const scenarios = {
+    'headings-inline': {
+      label: 'Headings & inline formatting',
+      md: '# Project kickoff\n\n## Goals\n\nWe want **bold**, *italic*, ~~strikethrough~~, and `inline code` to survive a save untouched, plus a > blockquote below.\n\n> Ship the MVP before the leaves change colour.\n',
+    },
+    'lists': {
+      label: 'Lists (nested + mixed)',
+      md: '# Shopping list\n\n- Eggs\n- Milk\n  - Oat milk preferred\n  - Whole milk if unavailable\n- Bread\n\n1. Pack boxes\n2. Load van\n3. Drive to new place\n',
+    },
+    'links': {
+      label: 'Links & wikilinks',
+      md: '# Meeting notes\n\nDiscussed with the team, see [[Project Kickoff#goals]] and [[Q3 Roadmap]] for background.\n\nAlso linked externally: [Cerebrite repo](https://example.com/cerebrite).\n',
+    },
+    'code': {
+      label: 'Code block',
+      md: '# Snippet\n\nHere is the fix:\n\n```js\nfunction rebuildIndex(files) {\n  return files.map(parse).flat();\n}\n```\n\nInline `rebuildIndex()` call sites need updating too.\n',
+    },
+    'mixed': {
+      label: 'Mixed realistic note',
+      md: '# Weekly review\n\n## Wins\n\n- Shipped the [[Redirect Log Format]] change\n- Fixed the *flaky* backlink test\n\n## Risks\n\n> Android WebView IME behaviour is still unverified — see [[Android Platform Smoke Test]].\n\n```bash\ncargo test --workspace\n```\n',
+    },
+  };
+
+  const select = document.getElementById('scenario-select');
+  Object.entries(scenarios).forEach(([key, s]) => {
+    const opt = document.createElement('option');
+    opt.value = key;
+    opt.textContent = s.label;
+    select.appendChild(opt);
+  });
+
+  const editors = ['tiptap', 'milkdown'];
+  const labels = { tiptap: 'A — Tiptap', milkdown: 'B — Milkdown' };
+  let currentEditor = 'tiptap';
+  let currentScenario = 'headings-inline';
+  let liveEditor = null;
+
+  const host = document.getElementById('editor-host');
+  const mdOut = document.getElementById('md-out');
+  const flagRow = document.getElementById('flag-row');
+  const paneTitle = document.getElementById('editor-pane-title');
+  const switcherLabel = document.getElementById('switcher-label');
+
+  function checkFlags(md) {
+    const flags = [];
+    if (/\\\[/.test(md) || /\\\]/.test(md)) {
+      flags.push('⚠ backslash-escaped brackets found — markup injected into body');
+    }
+    if (/<[a-z][\s\S]*>/i.test(md)) {
+      flags.push('⚠ raw HTML tag found in output');
+    }
+    if (/&(gt|lt|amp|quot|#\d+);/.test(md)) {
+      flags.push('⚠ HTML entity found — a literal character was re-encoded');
+    }
+    if (!flags.length) {
+      flagRow.innerHTML = '<span class="flag-ok">no stray markup detected</span>';
+    } else {
+      flagRow.innerHTML = flags.map((f) => `<div class="flag-bad">${f}</div>`).join('');
+    }
+  }
+
+  async function mount() {
+    host.innerHTML = '';
+    mdOut.textContent = '';
+    const initial = scenarios[currentScenario].md;
+    if (currentEditor === 'tiptap') {
+      paneTitle.textContent = 'Tiptap — editable';
+      liveEditor = window.TiptapProto.mountTiptap(host, initial, (md) => {
+        mdOut.textContent = md;
+        checkFlags(md);
+      });
+    } else {
+      paneTitle.textContent = 'Milkdown — editable';
+      liveEditor = await window.MilkdownProto.mountMilkdown(host, initial, (md) => {
+        mdOut.textContent = md;
+        checkFlags(md);
+      });
+    }
+  }
+
+  document.querySelectorAll('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentEditor = btn.dataset.editor;
+      switcherLabel.textContent = labels[currentEditor];
+      mount();
+    });
+  });
+
+  select.addEventListener('change', () => {
+    currentScenario = select.value;
+    mount();
+  });
+
+  function cycle(dir) {
+    const idx = editors.indexOf(currentEditor);
+    const next = editors[(idx + dir + editors.length) % editors.length];
+    document.querySelector(`.tab-btn[data-editor="${next}"]`).click();
+  }
+  document.getElementById('prev-btn').addEventListener('click', () => cycle(-1));
+  document.getElementById('next-btn').addEventListener('click', () => cycle(1));
+  document.addEventListener('keydown', (e) => {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
+    if (e.key === 'ArrowLeft') cycle(-1);
+    if (e.key === 'ArrowRight') cycle(1);
+  });
+
+  select.value = currentScenario;
+  mount();
+})();
+</script>
+</body>
+</html>
