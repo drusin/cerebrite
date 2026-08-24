@@ -13,6 +13,7 @@ A written MVP spec for Cerebrite — a git-native, markdown-based, Logseq-inspir
 ## Decisions so far
 
 - [Stable heading identity prototype](issues/04-stable-heading-identity-prototype.md): viable for headings via a git-synced redirect-log sidecar file ([ADR-0007](../../docs/adr/0007-persisted-redirect-log-for-heading-rename-identity.md)), not a purely ephemeral mapping. Paragraph-level linking (ADR-0002) stays deferred — this doesn't solve paragraphs' harder, prior problem of having no natural key at all.
+- [Tech stack and core architecture](issues/01-tech-stack-and-core-architecture.md): Tauri 2.x (shared Rust core, one webview UI on all three platforms) + SQLite FTS5 + a disk-backed derived index rebuilt on launch/sync with no file watcher ([ADR-0008](../../docs/adr/0008-tauri-rust-core-with-sqlite-fts5.md)). Scope change: WYSIWYG-on-Android is now an open editor-behavior question, not ruled out — see [WYSIWYG editor component](issues/02-wysiwyg-editor-component.md). Three unresolved risks (Android production maturity, corpus benchmark, `git2-rs` cross-compile) spun out as [Android platform smoke test](issues/06-android-platform-smoke-test.md), gating Android implementation, not this decision.
 
 ## Not yet specified
 
@@ -30,5 +31,4 @@ A written MVP spec for Cerebrite — a git-native, markdown-based, Logseq-inspir
 - Plugin/extensibility system
 - Rich media beyond markdown-native embeds
 - Visual graph view, structural graph queries, MCP server (post-MVP goals)
-- Android WYSIWYG editing (Android is plaintext-only for MVP)
 - Distribution (store listings, update infrastructure) — packaging/install itself is in scope, ongoing distribution is not
