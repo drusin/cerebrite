@@ -1,0 +1,143 @@
+name: Build Android smoke-test APK
+
+# Manual trigger only: scaffolds the throwaway Tauri smoke-test app fresh in
+# CI (nothing is committed to the repo), builds a debug-signed APK for a real
+# device, and publishes it as a GitHub Release asset so it can be downloaded
+# and installed straight from a phone browser.
+#
+# See .scratch/cerebrite-mvp/issues/06-android-platform-smoke-test.md — this
+# workflow only proves the app builds and installs (Check 1). Corpus
+# rebuild timing and the git2-rs on-device check still need the app driven
+# by hand on the device; see 06-android-smoke-test-wizard.sh for those.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # to publish the release
+
+env:
+  APP_DIR: smoke-app
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK + platform
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-android-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-android-smoke-
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Scaffold the throwaway Tauri app
+        run: |
+          npm create tauri-app@latest "$APP_DIR" -- --manager npm --template vanilla --identifier com.cerebrite.smoketest --yes
+          cd "$APP_DIR"
+          npm install
+          npx tauri android init
+
+      - name: Add a ping/pong round-trip command
+        run: |
+          python3 - "$APP_DIR/src-tauri/src/lib.rs" <<'PYEOF'
+          import re, sys
+          path = sys.argv[1]
+          src = open(path).read()
+          if "fn ping" not in src:
+              src = '#[tauri::command]\nfn ping() -> String { "pong".into() }\n\n' + src
+              src = re.sub(
+                  r'\.invoke_handler\(tauri::generate_handler!\[',
+                  '.invoke_handler(tauri::generate_handler![ping, ',
+                  src,
+                  count=1,
+              )
+              open(path, "w").write(src)
+          PYEOF
+
+      - name: Wire the round-trip into the frontend
+        run: |
+          python3 - "$APP_DIR/index.html" <<'PYEOF'
+          import sys
+          path = sys.argv[1]
+          src = open(path).read()
+          snippet = """
+          <script>
+            window.addEventListener("DOMContentLoaded", async () => {
+              const el = document.createElement("p");
+              el.id = "ping-result";
+              document.body.appendChild(el);
+              try {
+                const result = await window.__TAURI__.core.invoke("ping");
+                el.textContent = "ping -> " + result;
+              } catch (e) {
+                el.textContent = "ping failed: " + e;
+              }
+            });
+          </script>
+          """
+          if "ping-result" not in src:
+              src = src.replace("</body>", snippet + "</body>")
+              open(path, "w").write(src)
+          PYEOF
+
+      - name: Build debug APK
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: npx tauri android build --debug --target aarch64-linux-android
+
+      - name: Locate the APK
+        id: apk
+        run: |
+          apk=$(find "$APP_DIR/src-tauri/gen/android" -name "*-debug.apk" | head -n1)
+          if [[ -z "$apk" ]]; then
+            echo "No debug APK found under src-tauri/gen/android" >&2
+            exit 1
+          fi
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cerebrite-android-smoke-test
+          path: ${{ steps.apk.outputs.path }}
+
+      - name: Publish as a release (downloadable from a phone browser)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-smoke-${{ github.run_number }}
+          name: Android smoke-test APK #${{ github.run_number }}
+          body: |
+            Debug-signed APK from the Cerebrite Android platform smoke test
+            (Check 1: build + round-trip only). See
+            .scratch/cerebrite-mvp/issues/06-android-platform-smoke-test.md.
+          files: ${{ steps.apk.outputs.path }}
+          prerelease: true
