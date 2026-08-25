@@ -112,7 +112,7 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         env:
           NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
-        run: npx tauri android build --debug --target aarch64-linux-android
+        run: npx tauri android build --debug --target aarch64
 
       - name: Locate the APK
         id: apk
