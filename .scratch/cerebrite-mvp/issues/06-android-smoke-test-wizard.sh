@@ -192,11 +192,12 @@ MAP="$REPO_ROOT/.scratch/cerebrite-mvp/map.md"
 APP_DIR="$REPO_ROOT/.scratch/cerebrite-mvp/android-smoke-test/app"
 CORPUS_DIR="${TMPDIR:-/tmp}/cerebrite-smoke-corpus"
 
-banner "Cerebrite: Android platform smoke test"
-say "This validates the three risks flagged (but not blocking) by the tech-stack"
-say "decision: does a bare Tauri app build & run on a real device, does the"
-say "SQLite FTS5 + backlinks index rebuild sub-second on-device, and does"
-say "git2-rs cross-compile and work on-device. Throwaway app lives at:"
+banner "Cerebrite: Android platform smoke test (Checks 2 & 3)"
+say "Check 1 (builds & runs on-device, ping/pong round-trip) already PASSED via"
+say "the CI-built APK on a Pixel 9a — see the ticket's partial Answer. This run"
+say "covers the two remaining checks: does the SQLite FTS5 + backlinks index"
+say "rebuild sub-second on-device, and does git2-rs cross-compile and work"
+say "on-device. Throwaway app lives at:"
 note "$APP_DIR"
 
 # ── Stage 1: prerequisites ─────────────────────────────────────────────────
@@ -282,24 +283,20 @@ note "Frontend: call invoke('ping') from src/main.js (or index.html's inline scr
 note "and render the result somewhere visible, so a launch proves the round-trip."
 pause "Wire up the ping call in the frontend now, then press Enter to continue..."
 
-# ── Stage 3: Check 1 — builds and runs on-device ───────────────────────────
-stage "Check 1: build + run on-device"
-say "Building and installing the debug APK on the connected device..."
+# ── Stage 3: build + install (foundation for Checks 2 & 3) ─────────────────
+stage "Build + install the local scaffold"
+say "Check 1 already passed via the CI APK, so this build isn't re-litigating"
+say "that — it's just getting a locally-built copy installed so bench_index"
+say "and git_smoke_test commands (added below) can be added to it and run."
 ( cd "$APP_DIR" && cargo tauri android build --debug --target aarch64-linux-android ) \
   || warn "build failed — see output above"
 APK=$(find "$APP_DIR/src-tauri/gen/android" -name "*-debug.apk" 2>/dev/null | head -n1 || true)
 if [[ -n "$APK" ]]; then
   adb install -r "$APK" && step "Installed $APK"
-  say "Launch the app on the device now and confirm the ping/pong round-trip works."
 else
-  warn "No debug APK found; build likely failed."
+  warn "No debug APK found; build likely failed. Checks 2 and 3 need a working local build — fix before continuing."
+  exit 1
 fi
-if confirm "CHECK 1 — did the app build, launch, and show the ping round-trip?"; then
-  CHECK1_RESULT="PASS"
-else
-  CHECK1_RESULT="FAIL"
-fi
-ask CHECK1_NOTES "Any rough edges (cold-start time, WebView version, crashes)?"
 
 # ── Stage 4: synthetic corpus ───────────────────────────────────────────────
 stage "Generate the synthetic ~500-file corpus"
@@ -361,28 +358,35 @@ ask CHECK3_NOTES "Any cross-compilation gotchas (linker flags, env vars, missing
 
 # ── Stage 7: record the results ────────────────────────────────────────────
 stage "Record the results"
-say "Writing the answer onto the ticket and updating the map's Decisions-so-far."
+say "Merging Check 2 and Check 3 results into the ticket's existing partial Answer"
+say "(Check 1 was already recorded from the CI-APK run) and updating the map."
 
 TODAY="$(date +%Y-%m-%d)"
+
+# Drop the "not yet done" line and the "Status stays claimed" line from the
+# partial Answer — both are being superseded by the results below.
+sed -i \
+  -e '/^- Check 2 (corpus rebuild time) and Check 3/d' \
+  -e '/^Status stays `claimed`, not `resolved`, until Checks 2 and 3 are in\.$/d' \
+  -e 's/^## Answer (partial — Check 1 only)$/## Answer/' \
+  "$TICKET"
+
 {
-  printf '\n## Answer\n\n'
-  printf -- '- Date: %s\n' "$TODAY"
-  printf -- '- Device: %s\n' "$DEVICE_MODEL"
-  printf -- '- Check 1 (builds + runs on-device): %s — %s\n' "$CHECK1_RESULT" "$CHECK1_NOTES"
+  printf -- '\n- Date (Checks 2 & 3): %s\n' "$TODAY"
   printf -- '- Check 2 (cold rebuild, ~500-file corpus): %s — %sms\n' "$CHECK2_RESULT" "$REBUILD_MS"
   printf -- '- Check 3 (git2-rs cross-compile + on-device op): %s — %s\n' "$CHECK3_RESULT" "$CHECK3_NOTES"
-  if [[ "$CHECK1_RESULT" == "FAIL" || "$CHECK2_RESULT" == "FAIL" || "$CHECK3_RESULT" == "FAIL" ]]; then
+  if [[ "$CHECK2_RESULT" == "FAIL" || "$CHECK3_RESULT" == "FAIL" ]]; then
     printf -- '\nAt least one check failed — per this ticket'"'"'s question, revisit [01-tech-stack-and-core-architecture](01-tech-stack-and-core-architecture.md) before proceeding with Android implementation.\n'
   fi
 } >> "$TICKET"
 sed -i 's/^Status: claimed$/Status: resolved/' "$TICKET"
-step "Appended results to $TICKET and marked it resolved."
+step "Merged Check 2 & 3 results into $TICKET and marked it resolved."
 
 OVERALL="all checks passed"
-if [[ "$CHECK1_RESULT" == "FAIL" || "$CHECK2_RESULT" == "FAIL" || "$CHECK3_RESULT" == "FAIL" ]]; then
+if [[ "$CHECK2_RESULT" == "FAIL" || "$CHECK3_RESULT" == "FAIL" ]]; then
   OVERALL="at least one check failed — see ticket for detail"
 fi
-DECISIONS_LINE="- [Android platform smoke test](issues/06-android-platform-smoke-test.md): $OVERALL on $DEVICE_MODEL (build/run \`$CHECK1_RESULT\`, rebuild \`$CHECK2_RESULT\` at ${REBUILD_MS}ms, git2-rs \`$CHECK3_RESULT\`)."
+DECISIONS_LINE="- [Android platform smoke test](issues/06-android-platform-smoke-test.md): $OVERALL on $DEVICE_MODEL (build/run \`PASS\` via CI APK, rebuild \`$CHECK2_RESULT\` at ${REBUILD_MS}ms, git2-rs \`$CHECK3_RESULT\`)."
 if [[ -f "$MAP" ]]; then
   awk -v line="$DECISIONS_LINE" '
     { print }

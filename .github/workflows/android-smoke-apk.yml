@@ -6,9 +6,20 @@ name: Build Android smoke-test APK
 # and installed straight from a phone browser.
 #
 # See .scratch/cerebrite-mvp/issues/06-android-platform-smoke-test.md — this
-# workflow only proves the app builds and installs (Check 1). Corpus
-# rebuild timing and the git2-rs on-device check still need the app driven
-# by hand on the device; see 06-android-smoke-test-wizard.sh for those.
+# single APK now covers all three checks: it builds/runs (Check 1), and on
+# launch it automatically generates a synthetic ~500-file corpus, times a
+# cold SQLite FTS5 + backlinks rebuild on-device (Check 2), and runs a git2-rs
+# init/commit/local-clone entirely on-device (Check 3). No adb, no local
+# Rust/Android SDK, no manual button-tapping required — just install and read
+# the screen. See 06-android-apk-check.md for the checklist.
+#
+# If this workflow fails at the "Build debug APK" step, that failure IS the
+# Check 3 answer: git2-rs (or rusqlite) didn't cross-compile cleanly to
+# Android — no need to get as far as installing anything.
+#
+# 06-android-smoke-test-wizard.sh remains as a fallback for driving these
+# checks on a locally-attached device, in case this CI route hits a
+# cross-compilation blocker that needs interactive debugging.
 on:
   workflow_dispatch: {}
 
@@ -65,24 +76,154 @@ jobs:
           npm install
           npx tauri android init
 
-      - name: Add a ping/pong round-trip command
+      - name: Add rusqlite + git2 dependencies (Check 2 & Check 3 subjects)
         run: |
-          python3 - "$APP_DIR/src-tauri/src/lib.rs" <<'PYEOF'
+          python3 - "$APP_DIR/src-tauri/Cargo.toml" <<'PYEOF'
           import re, sys
           path = sys.argv[1]
           src = open(path).read()
-          if "fn ping" not in src:
-              src = '#[tauri::command]\nfn ping() -> String { "pong".into() }\n\n' + src
+          if "rusqlite" not in src:
               src = re.sub(
-                  r'\.invoke_handler\(tauri::generate_handler!\[',
-                  '.invoke_handler(tauri::generate_handler![ping, ',
+                  r'(\[dependencies\]\n)',
+                  r'\1rusqlite = { version = "0.31", features = ["bundled", "fts5"] }\ngit2 = "0.19"\n',
                   src,
                   count=1,
               )
               open(path, "w").write(src)
           PYEOF
 
-      - name: Wire the round-trip into the frontend
+      - name: Add smoke-test commands (ping, corpus gen, index rebuild bench, git2)
+        run: |
+          python3 - "$APP_DIR/src-tauri/src/lib.rs" <<'PYEOF'
+          import re, sys
+          path = sys.argv[1]
+          src = open(path).read()
+          if "fn ping" not in src:
+              commands = '''use tauri::Manager;
+
+          #[tauri::command]
+          fn ping() -> String {
+              "pong".into()
+          }
+
+          #[tauri::command]
+          fn generate_corpus(app: tauri::AppHandle) -> Result<String, String> {
+              let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+              let dir = base.join("smoke-corpus");
+              std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+              for i in 1..=500u32 {
+                  let id = format!("page-{:04}", i);
+                  let link_a = format!("page-{:04}", (i * 7) % 500 + 1);
+                  let link_b = format!("page-{:04}", (i * 13) % 500 + 1);
+                  let content = format!(
+                      "---\\nid: {id}\\ntitle: \\"Note {i}\\"\\ntags: [smoke-test]\\n---\\n\\n\\
+                       # Note {i}\\n\\nSome intro text linking to [[{link_a}]] and [[{link_b}]].\\n\\n\\
+                       ## Section A\\n\\nBody text for section A, note {i}.\\n\\n\\
+                       ## Section B\\n\\nMore body text, referencing [[{link_a}]] again.\\n"
+                  );
+                  std::fs::write(dir.join(format!("{id}.md")), content).map_err(|e| e.to_string())?;
+              }
+              Ok(format!("wrote 500 files to {}", dir.display()))
+          }
+
+          #[tauri::command]
+          fn bench_index(app: tauri::AppHandle) -> Result<String, String> {
+              let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+              let dir = base.join("smoke-corpus");
+              let db_path = base.join("smoke-index.sqlite");
+              let _ = std::fs::remove_file(&db_path);
+
+              let start = std::time::Instant::now();
+              let mut conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+              conn.execute_batch(
+                  "CREATE VIRTUAL TABLE notes USING fts5(id, title, body);
+                   CREATE TABLE backlinks (src TEXT NOT NULL, dst TEXT NOT NULL);",
+              )
+              .map_err(|e| e.to_string())?;
+
+              let tx = conn.transaction().map_err(|e| e.to_string())?;
+              for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                  let entry = entry.map_err(|e| e.to_string())?;
+                  let path = entry.path();
+                  let id = path
+                      .file_stem()
+                      .map(|s| s.to_string_lossy().to_string())
+                      .unwrap_or_default();
+                  let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                  tx.execute(
+                      "INSERT INTO notes (id, title, body) VALUES (?1, ?2, ?3)",
+                      rusqlite::params![id, id, text],
+                  )
+                  .map_err(|e| e.to_string())?;
+
+                  let mut rest = text.as_str();
+                  while let Some(open_at) = rest.find("[[") {
+                      rest = &rest[open_at + 2..];
+                      let Some(close_at) = rest.find("]]") else { break };
+                      let target = &rest[..close_at];
+                      tx.execute(
+                          "INSERT INTO backlinks (src, dst) VALUES (?1, ?2)",
+                          rusqlite::params![id, target],
+                      )
+                      .map_err(|e| e.to_string())?;
+                      rest = &rest[close_at + 2..];
+                  }
+              }
+              tx.commit().map_err(|e| e.to_string())?;
+
+              Ok(start.elapsed().as_millis().to_string())
+          }
+
+          #[tauri::command]
+          fn git_smoke_test(app: tauri::AppHandle) -> Result<String, String> {
+              let base = app
+                  .path()
+                  .app_data_dir()
+                  .map_err(|e| e.to_string())?
+                  .join("smoke-git");
+              let _ = std::fs::remove_dir_all(&base);
+              std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+              let origin_path = base.join("origin");
+              let clone_path = base.join("clone");
+
+              let repo = git2::Repository::init(&origin_path).map_err(|e| e.to_string())?;
+              std::fs::write(origin_path.join("hello.md"), "# hello\\n").map_err(|e| e.to_string())?;
+              let mut index = repo.index().map_err(|e| e.to_string())?;
+              index
+                  .add_path(std::path::Path::new("hello.md"))
+                  .map_err(|e| e.to_string())?;
+              index.write().map_err(|e| e.to_string())?;
+              let tree_id = index.write_tree().map_err(|e| e.to_string())?;
+              let tree = repo.find_tree(tree_id).map_err(|e| e.to_string())?;
+              let sig = git2::Signature::now("smoke-test", "smoke-test@cerebrite.local")
+                  .map_err(|e| e.to_string())?;
+              repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
+                  .map_err(|e| e.to_string())?;
+
+              let cloned = git2::Repository::clone(
+                  origin_path.to_str().ok_or("origin path not valid UTF-8")?,
+                  &clone_path,
+              )
+              .map_err(|e| e.to_string())?;
+              let mut revwalk = cloned.revwalk().map_err(|e| e.to_string())?;
+              revwalk.push_head().map_err(|e| e.to_string())?;
+              let commit_count = revwalk.count();
+
+              Ok(format!("commit + local clone OK, {commit_count} commit(s) in clone"))
+          }
+
+          '''
+              src = commands + src
+              src = re.sub(
+                  r'\.invoke_handler\(tauri::generate_handler!\[',
+                  '.invoke_handler(tauri::generate_handler![ping, generate_corpus, bench_index, git_smoke_test, ',
+                  src,
+                  count=1,
+              )
+              open(path, "w").write(src)
+          PYEOF
+
+      - name: Wire smoke-test results into the frontend
         run: |
           python3 - "$APP_DIR/src/index.html" <<'PYEOF'
           import sys
@@ -91,14 +232,32 @@ jobs:
           snippet = """
           <script>
             window.addEventListener("DOMContentLoaded", async () => {
-              const el = document.createElement("p");
-              el.id = "ping-result";
-              document.body.appendChild(el);
+              const invoke = window.__TAURI__.core.invoke;
+              const log = (id, text) => {
+                const el = document.createElement("p");
+                el.id = id;
+                el.textContent = text;
+                document.body.appendChild(el);
+              };
               try {
-                const result = await window.__TAURI__.core.invoke("ping");
-                el.textContent = "ping -> " + result;
+                log("ping-result", "ping -> " + (await invoke("ping")));
               } catch (e) {
-                el.textContent = "ping failed: " + e;
+                log("ping-result", "ping failed: " + e);
+              }
+              try {
+                log("corpus-result", "corpus: " + (await invoke("generate_corpus")));
+              } catch (e) {
+                log("corpus-result", "corpus failed: " + e);
+              }
+              try {
+                log("bench-result", "index rebuild: " + (await invoke("bench_index")) + "ms");
+              } catch (e) {
+                log("bench-result", "index rebuild failed: " + e);
+              }
+              try {
+                log("git-result", "git: " + (await invoke("git_smoke_test")));
+              } catch (e) {
+                log("git-result", "git failed: " + e);
               }
             });
           </script>
@@ -136,8 +295,13 @@ jobs:
           tag_name: android-smoke-${{ github.run_number }}
           name: Android smoke-test APK #${{ github.run_number }}
           body: |
-            Debug-signed APK from the Cerebrite Android platform smoke test
-            (Check 1: build + round-trip only). See
-            .scratch/cerebrite-mvp/issues/06-android-platform-smoke-test.md.
+            Debug-signed APK from the Cerebrite Android platform smoke test.
+            Covers all three checks: builds/runs (Check 1), on-device
+            SQLite FTS5 + backlinks cold-rebuild timing over a synthetic
+            ~500-file corpus (Check 2), and a git2-rs init/commit/local-clone
+            round-trip (Check 3) — all run automatically on launch, results
+            shown on screen. See
+            .scratch/cerebrite-mvp/issues/06-android-platform-smoke-test.md
+            and 06-android-apk-check.md.
           files: ${{ steps.apk.outputs.path }}
           prerelease: true

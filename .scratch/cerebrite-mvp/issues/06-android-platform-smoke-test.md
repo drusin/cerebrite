@@ -13,7 +13,11 @@ Build and run a minimal Tauri Android app on a **real low/mid-range physical dev
 
 Record what was done and the results: device(s) tested, build steps, measured rebuild time, and any rough edges found (WebView version fragmentation, cold-start time, cross-compilation gotchas). If any check fails outright, that's grounds to revisit [01-tech-stack-and-core-architecture](01-tech-stack-and-core-architecture.md) rather than proceed.
 
-This requires a real physical device, Android SDK/NDK, and Rust — none available in the agent's sandbox, so this is HITL. Run [06-android-smoke-test-wizard.sh](06-android-smoke-test-wizard.sh) on a machine with a physical low/mid-range Android device attached; it walks prerequisite install, scaffolds a throwaway Tauri app, drives all three checks, and appends the `## Answer` + resolves this ticket + updates the map's Decisions-so-far automatically at the end.
+This requires a real physical device and, for the fallback path below, Android SDK/NDK and Rust — none available in the agent's sandbox, so this is HITL.
+
+**Primary path**: trigger [`.github/workflows/android-smoke-apk.yml`](../../../.github/workflows/android-smoke-apk.yml) (`gh workflow run android-smoke-apk.yml` or via the Actions tab). It builds one APK that covers all three checks automatically on launch — no local Rust/Android SDK/adb needed, just download the APK from the run's GitHub Release to your phone and install. Follow [06-android-apk-check.md](06-android-apk-check.md) to drive it and record results. If the workflow fails at its "Build debug APK" step, that failure alone is the Check 3 answer (git2-rs/rusqlite didn't cross-compile cleanly) — nothing to install in that case.
+
+**Fallback path**: if the CI route hits a cross-compilation blocker that needs interactive debugging, run [06-android-smoke-test-wizard.sh](06-android-smoke-test-wizard.sh) on a machine with a physical low/mid-range Android device attached, Rust, and the Android SDK/NDK installed; it walks prerequisite install, scaffolds a throwaway Tauri app locally, drives Checks 2 and 3 (Check 1 is already answered — see the partial Answer below), and appends the results + resolves this ticket + updates the map's Decisions-so-far automatically at the end.
 
 ## Answer (partial — Check 1 only)
 
