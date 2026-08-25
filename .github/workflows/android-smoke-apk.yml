@@ -84,7 +84,7 @@ jobs:
 
       - name: Wire the round-trip into the frontend
         run: |
-          python3 - "$APP_DIR/index.html" <<'PYEOF'
+          python3 - "$APP_DIR/src/index.html" <<'PYEOF'
           import sys
           path = sys.argv[1]
           src = open(path).read()
