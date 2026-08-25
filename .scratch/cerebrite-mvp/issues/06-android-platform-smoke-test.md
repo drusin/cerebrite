@@ -14,3 +14,13 @@ Build and run a minimal Tauri Android app on a **real low/mid-range physical dev
 Record what was done and the results: device(s) tested, build steps, measured rebuild time, and any rough edges found (WebView version fragmentation, cold-start time, cross-compilation gotchas). If any check fails outright, that's grounds to revisit [01-tech-stack-and-core-architecture](01-tech-stack-and-core-architecture.md) rather than proceed.
 
 This requires a real physical device, Android SDK/NDK, and Rust — none available in the agent's sandbox, so this is HITL. Run [06-android-smoke-test-wizard.sh](06-android-smoke-test-wizard.sh) on a machine with a physical low/mid-range Android device attached; it walks prerequisite install, scaffolds a throwaway Tauri app, drives all three checks, and appends the `## Answer` + resolves this ticket + updates the map's Decisions-so-far automatically at the end.
+
+## Answer (partial — Check 1 only)
+
+Check 1 done via the CI-built APK (`.github/workflows/android-smoke-apk.yml`) installed and driven by hand per [06-android-apk-check.md](06-android-apk-check.md):
+
+- Device: Pixel 9a, Android 17
+- Check 1 (builds + runs + round-trip on-device): **PASS** — installs cleanly, launches, `ping -> pong` shows, cold-start feels fine, WebView rendering clean, survives rotation and background/resume. Nothing unexpected.
+- Check 2 (corpus rebuild time) and Check 3 (git2-rs cross-compile + on-device op): **not yet done** — still need [06-android-smoke-test-wizard.sh](06-android-smoke-test-wizard.sh) (or an extended CI build) to cover those.
+
+Status stays `claimed`, not `resolved`, until Checks 2 and 3 are in.

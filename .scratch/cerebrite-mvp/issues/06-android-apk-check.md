@@ -15,25 +15,25 @@ need [06-android-smoke-test-wizard.sh](06-android-smoke-test-wizard.sh).
 
 ## What to check
 
-- [ ] **Installs without a warning about a corrupt/invalid package.**
-- [ ] **Launches at all** — no immediate crash or black-screen hang.
-- [ ] **Round-trip works**: the screen shows `ping -> pong` shortly after launch.
+- [x] **Installs without a warning about a corrupt/invalid package.**
+- [x] **Launches at all** — no immediate crash or black-screen hang.
+- [x] **Round-trip works**: the screen shows `ping -> pong` shortly after launch.
       If it instead shows `ping failed: ...`, note the error text.
-- [ ] **Cold-start time**: rough feel is fine — instant, ~1s, or noticeably slow?
-- [ ] **WebView rendering**: text/layout renders cleanly, no visible
+- [x] **Cold-start time**: rough feel is fine — instant, ~1s, or noticeably slow?
+- [x] **WebView rendering**: text/layout renders cleanly, no visible
       Chromium/WebView version warnings or broken styling.
-- [ ] **Rotate the screen** (if easy to do): app doesn't crash or blank out.
-- [ ] **Background/resume**: switch to another app and back — Cerebrite's app
+- [x] **Rotate the screen** (if easy to do): app doesn't crash or blank out.
+- [x] **Background/resume**: switch to another app and back — Cerebrite's app
       doesn't crash or lose its state.
-- [ ] **Uninstall cleanly** afterwards if you don't need it kept around —
+- [x] **Uninstall cleanly** afterwards if you don't need it kept around —
       this is a throwaway smoke-test app, not the real Cerebrite app.
 
 ## Record the result
 
 Note pass/fail on each item above, plus:
 
-- Device model + Android version
-- Anything unexpected (WebView fragmentation, slow cold start, crash logs)
+- Device model + Android version: Pixel 9a, Android 17
+- Anything unexpected (WebView fragmentation, slow cold start, crash logs): none
 
 Add this as the `CHECK1_NOTES` value if you later run the full
 [06-android-smoke-test-wizard.sh](06-android-smoke-test-wizard.sh), or append
