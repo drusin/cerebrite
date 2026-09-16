@@ -100,6 +100,13 @@ pub fn commit_all(vault_path: &Path, message: &str) -> Result<()> {
     index
         .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
         .context("staging changes")?;
+    // `add_all` alone never removes an index entry for a file that has been
+    // deleted from the working tree (e.g. trashing/emptying-trash, ticket
+    // 10's file moves and permanent removals) -- `update_all` covers exactly
+    // that case, matching plain `git add -A` semantics.
+    index
+        .update_all(["*"].iter(), None)
+        .context("staging deletions")?;
     index.write().context("writing repo index")?;
     let tree_id = index.write_tree().context("writing tree from index")?;
 

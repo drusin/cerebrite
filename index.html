@@ -23,11 +23,23 @@
           <button id="new-page-button" type="button">New page</button>
         </div>
         <ul id="page-list" class="page-list"></ul>
+        <div class="sidebar-header sidebar-trash-header">
+          <h2>Trash</h2>
+          <button id="empty-trash-button" type="button">Empty trash</button>
+        </div>
+        <ul id="trash-list" class="page-list trash-list"></ul>
       </aside>
       <main id="page-view" class="page-view">
         <p id="page-view-empty" class="page-view-empty">Select a page from the list.</p>
         <article id="page-article" hidden>
-          <h1 id="page-title"></h1>
+          <div class="page-title-row">
+            <h1 id="page-title"></h1>
+            <button id="delete-page-button" type="button" hidden>Delete page</button>
+          </div>
+          <p id="page-trash-banner" class="page-trash-banner" hidden>
+            This page is in trash.
+            <button id="restore-page-button" type="button">Restore</button>
+          </p>
           <div id="page-body" class="milkdown-root"></div>
           <section id="backlinks-section" class="backlinks-section">
             <h2>Backlinks</h2>

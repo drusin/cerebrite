@@ -9,8 +9,13 @@ import {
   resolvePage,
   materializeAndSavePage,
   getBacklinks,
+  trashPage,
+  restorePage,
+  emptyTrash,
+  listTrashedPages,
   type PageSummary,
   type PageResolution,
+  type TrashedPageSummary,
 } from "./vault-api";
 import { PageEditor } from "./page-editor";
 import { humanizeHeadingSlug } from "./heading-slug";
@@ -34,11 +39,21 @@ const pageTitleEl = document.querySelector<HTMLElement>("#page-title");
 const pageBodyEl = document.querySelector<HTMLElement>("#page-body");
 const backlinksListEl = document.querySelector<HTMLUListElement>("#backlinks-list");
 const backlinksEmptyEl = document.querySelector<HTMLElement>("#backlinks-empty");
+const deletePageButtonEl = document.querySelector<HTMLButtonElement>("#delete-page-button");
+const pageTrashBannerEl = document.querySelector<HTMLElement>("#page-trash-banner");
+const restorePageButtonEl = document.querySelector<HTMLButtonElement>("#restore-page-button");
+const trashListEl = document.querySelector<HTMLUListElement>("#trash-list");
+const emptyTrashButtonEl = document.querySelector<HTMLButtonElement>("#empty-trash-button");
 
 // The page currently loaded in the editor: either a persisted page (has an
 // id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
-// backing file until the first write materializes it.
-type OpenPage = { kind: "persisted"; id: string } | { kind: "dynamic"; title: string };
+// backing file until the first write materializes it. A persisted page may
+// currently sit in trash (issue 10 / ADR-0010) -- still resolves/renders,
+// but flagged so the UI can show an "in trash" indicator and restore prompt
+// instead of the ordinary "Delete page" action.
+type OpenPage =
+  | { kind: "persisted"; id: string; inTrash: boolean; trashedFilename: string | null }
+  | { kind: "dynamic"; title: string };
 
 let currentPage: OpenPage | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -64,7 +79,7 @@ async function flushSave(markdown: string) {
       await savePage(currentPage.id, markdown);
     } else {
       const summary = await materializeAndSavePage(currentPage.title, markdown);
-      currentPage = { kind: "persisted", id: summary.id };
+      currentPage = { kind: "persisted", id: summary.id, inTrash: false, trashedFilename: null };
       await loadPages();
     }
   } catch (err) {
@@ -195,10 +210,39 @@ async function renderBacklinks(title: string) {
  * `[[Page#Heading]]` link that navigated here -- once the fresh content is
  * mounted, the matching heading (if any) is scrolled into view.
  */
-async function renderPageArticle(title: string, body: string, headingSlug?: string | null) {
+async function renderPageArticle(
+  title: string,
+  body: string,
+  headingSlug?: string | null,
+  options?: {
+    /** Whether the "Delete page" button should be offered at all -- only a persisted, non-trashed page is deletable. */
+    deletable?: boolean;
+    pageId?: string;
+    /** In trash (issue 10 / ADR-0010): renders a banner + inline "Restore" action instead of the "Delete page" button. */
+    inTrash?: boolean;
+    trashedFilename?: string | null;
+  }
+) {
   if (pageTitleEl) pageTitleEl.textContent = title;
   pageViewEmptyEl?.setAttribute("hidden", "");
   pageArticleEl?.removeAttribute("hidden");
+
+  const inTrash = options?.inTrash ?? false;
+  const trashedFilename = options?.trashedFilename ?? null;
+  const deletable = (options?.deletable ?? false) && !inTrash;
+  const pageId = options?.pageId ?? null;
+
+  if (deletePageButtonEl) {
+    deletePageButtonEl.hidden = !deletable;
+    deletePageButtonEl.onclick = deletable && pageId ? () => void handleDeletePageClick(pageId) : null;
+  }
+  if (pageTrashBannerEl) {
+    pageTrashBannerEl.hidden = !inTrash;
+  }
+  if (restorePageButtonEl) {
+    restorePageButtonEl.onclick =
+      inTrash && trashedFilename ? () => void handleRestoreClick(trashedFilename) : null;
+  }
 
   if (pageBodyEl) {
     if (!pageEditor) {
@@ -247,9 +291,16 @@ async function openResolution(resolution: PageResolution) {
   await flushPendingSaveForCurrentPage();
 
   if (resolution.kind === "persisted") {
-    currentPage = { kind: "persisted", id: resolution.id };
+    const inTrash = resolution.inTrash ?? false;
+    const trashedFilename = resolution.trashedFilename ?? null;
+    currentPage = { kind: "persisted", id: resolution.id, inTrash, trashedFilename };
     highlightActivePage();
-    await renderPageArticle(resolution.title, resolution.body, resolution.headingSlug);
+    await renderPageArticle(resolution.title, resolution.body, resolution.headingSlug, {
+      deletable: true,
+      pageId: resolution.id,
+      inTrash,
+      trashedFilename,
+    });
   } else {
     // Dynamic page (ADR-0009): UI-identical to a persisted page, but merely
     // viewing it must not create a file -- no id, no file, just its
@@ -263,7 +314,7 @@ async function openResolution(resolution: PageResolution) {
 }
 
 async function selectPage(id: string) {
-  if (currentPage?.kind === "persisted" && currentPage.id === id) return;
+  if (currentPage?.kind === "persisted" && currentPage.id === id && !currentPage.inTrash) return;
   const page = await getPage(id);
   await openResolution({ kind: "persisted", id: page.id, title: page.title, body: page.body, html: page.html });
 }
@@ -277,6 +328,77 @@ async function openPageByTitle(rawTitle: string) {
 async function loadPages() {
   const pages = await listPages();
   renderPageList(pages);
+}
+
+/** Renders the sidebar's "Trash" list (issue 10): clicking an entry opens it the same way a `[[Link]]` to it would -- rendered with the "in trash" banner and inline restore action. */
+function renderTrashList(pages: TrashedPageSummary[]) {
+  if (!trashListEl) return;
+  trashListEl.innerHTML = "";
+
+  for (const page of pages) {
+    const li = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = page.title;
+    button.addEventListener("click", () => void openPageByTitle(page.title));
+    li.appendChild(button);
+    trashListEl.appendChild(li);
+  }
+}
+
+async function loadTrash() {
+  const pages = await listTrashedPages();
+  renderTrashList(pages);
+}
+
+/**
+ * Explicit "delete page" action (issue 10 / ADR-0010): moves the page's file
+ * into `.cerebrite/trash/` (git-tracked move, auto-committed) and closes the
+ * page view, since the page is no longer an ordinary persisted page.
+ */
+async function handleDeletePageClick(id: string) {
+  if (!window.confirm("Move this page to trash?")) return;
+
+  try {
+    await trashPage(id);
+    currentPage = null;
+    pageArticleEl?.setAttribute("hidden", "");
+    pageViewEmptyEl?.removeAttribute("hidden");
+    await loadPages();
+    await loadTrash();
+  } catch (err) {
+    window.alert(String(err));
+  }
+}
+
+/** Explicit "restore" action (issue 10): moves a trashed page's file back to its original path and reopens it as an ordinary persisted page. */
+async function handleRestoreClick(trashedFilename: string) {
+  try {
+    const summary = await restorePage(trashedFilename);
+    await loadPages();
+    await loadTrash();
+    currentPage = null; // force a fresh render so the trash banner/button clear
+    await selectPage(summary.id);
+  } catch (err) {
+    window.alert(String(err));
+  }
+}
+
+/** Explicit "empty trash" action (issue 10): permanently deletes every trashed page. There is no other purge path. */
+async function handleEmptyTrashClick() {
+  if (!window.confirm("Permanently delete all trashed pages? This cannot be undone.")) return;
+
+  try {
+    await emptyTrash();
+    if (currentPage?.kind === "persisted" && currentPage.inTrash) {
+      currentPage = null;
+      pageArticleEl?.setAttribute("hidden", "");
+      pageViewEmptyEl?.removeAttribute("hidden");
+    }
+    await loadTrash();
+  } catch (err) {
+    window.alert(String(err));
+  }
 }
 
 /**
@@ -308,6 +430,7 @@ async function openVaultAndLoad(path: string) {
   await openVault(path);
   showWorkspace();
   await loadPages();
+  await loadTrash();
 }
 
 async function handleSelectVaultClick() {
@@ -324,6 +447,7 @@ async function handleSelectVaultClick() {
 async function init() {
   selectVaultButtonEl?.addEventListener("click", handleSelectVaultClick);
   newPageButtonEl?.addEventListener("click", () => void handleNewPageClick());
+  emptyTrashButtonEl?.addEventListener("click", () => void handleEmptyTrashClick());
 
   const remembered = await getRememberedVault();
   if (remembered) {

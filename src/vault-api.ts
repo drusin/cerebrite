@@ -31,7 +31,21 @@ export interface PageContent {
 /// dynamic resolution is carried through for consistency only and never
 /// acted on.
 export type PageResolution =
-  | { kind: "persisted"; id: string; title: string; body: string; html: string; headingSlug?: string | null }
+  | {
+      kind: "persisted";
+      id: string;
+      title: string;
+      body: string;
+      html: string;
+      headingSlug?: string | null;
+      /// True when this page currently sits in `.cerebrite/trash/` (issue
+      /// 10) -- the page still resolves/renders, but the UI should show an
+      /// "in trash" indicator with an inline restore action.
+      inTrash?: boolean;
+      /// The trashed file's filename under `.cerebrite/trash/`, needed by
+      /// the "Restore" action. Present only when `inTrash` is true.
+      trashedFilename?: string | null;
+    }
   | { kind: "dynamic"; normalizedTitle: string; headingSlug?: string | null };
 
 export function getRememberedVault(): Promise<string | null> {
@@ -105,4 +119,38 @@ export function getBacklinks(title: string): Promise<BacklinkEntry[]> {
 /// from-scratch file write, so the frontmatter/id survive identically.
 export function materializeAndSavePage(title: string, markdownBody: string): Promise<PageSummary> {
   return invoke("materialize_and_save_page", { title, markdownBody });
+}
+
+/// One trashed page (issue 10), as returned by `listTrashedPages` for the
+/// "Trash" view. `trashedFilename` is the manifest key needed by `restorePage`.
+export interface TrashedPageSummary {
+  id: string;
+  title: string;
+  trashedFilename: string;
+  originalRelativePath: string;
+}
+
+/// Explicit "delete page" action (issue 10 / ADR-0010): moves a persisted
+/// page's file into `.cerebrite/trash/`, git-committed as a move like any
+/// other edit, and removes it from "All pages"/search.
+export function trashPage(id: string): Promise<void> {
+  return invoke("trash_page", { id });
+}
+
+/// Explicit "restore" action (issue 10): moves a trashed page's file back to
+/// its original path (preserving its frontmatter id) and re-adds it to "All
+/// pages"/search.
+export function restorePage(trashedFilename: string): Promise<PageSummary> {
+  return invoke("restore_page", { trashedFilename });
+}
+
+/// Explicit "empty trash" action (issue 10): permanently deletes every file
+/// under `.cerebrite/trash/`. There is no other purge path.
+export function emptyTrash(): Promise<void> {
+  return invoke("empty_trash");
+}
+
+/// Lists every page currently sitting in `.cerebrite/trash/` (issue 10).
+export function listTrashedPages(): Promise<TrashedPageSummary[]> {
+  return invoke("list_trashed_pages");
 }

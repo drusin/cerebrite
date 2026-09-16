@@ -287,6 +287,51 @@ pub fn insert_page(
     Ok(())
 }
 
+/// Inserts a restored page's row back into the derived index, identically to
+/// `insert_page` but carrying whatever tags its frontmatter has (a restored
+/// page's file is untouched by trash/restore, so its tags may be non-empty,
+/// unlike a brand-new page).
+pub fn insert_restored_page(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    path: &Path,
+    body: &str,
+    tags: &[String],
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO pages (id, title, path, body, modified_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, title, path.to_string_lossy(), body, now_epoch()],
+    )?;
+    conn.execute(
+        "INSERT INTO pages_fts (id, title, body) VALUES (?1, ?2, ?3)",
+        params![id, title, body],
+    )?;
+    replace_page_links(conn, id, body, tags)?;
+    Ok(())
+}
+
+/// Removes a page's rows from the derived index entirely: `pages`,
+/// `pages_fts`, and every `backlinks` row *sourced* by this page (its
+/// outbound links) -- used when a page is trashed (issue 10).
+///
+/// This is the chosen mechanism for excluding a trashed page from "All
+/// pages"/search (it's no longer in `pages` at all) *and* for excluding its
+/// outbound links from other pages' backlinks sections (point 7 of the
+/// ticket): removing its `backlinks` rows at trash time is simpler than
+/// adding an "is this source currently trashed" check to every
+/// `get_backlinks` query, and produces the same visible result. Backlink rows
+/// that merely *target* this page (sourced by other, non-trashed pages) are
+/// untouched, since a trashed page's own backlinks section should still work
+/// once it's restored (or even while still trashed, per the ticket -- a
+/// trashed page keeps resolving).
+pub fn remove_page(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM backlinks WHERE source_id = ?1", params![id])?;
+    conn.execute("DELETE FROM pages_fts WHERE id = ?1", params![id])?;
+    conn.execute("DELETE FROM pages WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +586,54 @@ mod tests {
         let mut source_ids: Vec<&str> = entries.iter().map(|e| e.source_id.as_str()).collect();
         source_ids.sort();
         assert_eq!(source_ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn remove_page_deletes_pages_fts_and_its_outbound_backlinks_only() {
+        let dir = tempdir().unwrap();
+        write_page(dir.path(), "a.md", "---\nid: a\ntitle: A\n---\nLinks to [[B]].\n");
+        write_page(dir.path(), "b.md", "---\nid: b\ntitle: B\n---\nLinks to [[A]].\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+        assert_eq!(get_backlinks(&conn, "b").unwrap().len(), 1);
+        assert_eq!(get_backlinks(&conn, "a").unwrap().len(), 1);
+
+        remove_page(&conn, "a").unwrap();
+
+        let count: i64 = conn.query_row("SELECT count(*) FROM pages WHERE id = 'a'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let fts_count: i64 = conn
+            .query_row("SELECT count(*) FROM pages_fts WHERE id = 'a'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 0);
+
+        // A's outbound link (to B) is gone -- B's backlinks section no
+        // longer lists A.
+        assert!(get_backlinks(&conn, "b").unwrap().is_empty());
+        // But A's own backlinks (sourced by B, which is not trashed) remain.
+        assert_eq!(get_backlinks(&conn, "a").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn insert_restored_page_reinstates_a_removed_page_with_its_tags() {
+        let dir = tempdir().unwrap();
+        write_page(dir.path(), "a.md", "---\nid: a\ntitle: A\ntags: [foo]\n---\nBody.\n");
+        write_page(dir.path(), "foo.md", "---\nid: f\ntitle: Foo\n---\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+        remove_page(&conn, "a").unwrap();
+        assert!(get_backlinks(&conn, "foo").unwrap().is_empty());
+
+        let path = dir.path().join("a.md");
+        insert_restored_page(&conn, "a", "A", &path, "Body.\n", &["foo".to_string()]).unwrap();
+
+        let count: i64 = conn.query_row("SELECT count(*) FROM pages WHERE id = 'a'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+        let entries = get_backlinks(&conn, "foo").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "a");
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod index;
 mod links;
 mod markdown;
 mod redirects;
+mod trash;
 mod vault;
 
 use std::path::{Path, PathBuf};
@@ -46,6 +47,29 @@ pub struct PageContent {
     title: String,
     body: String,
     html: String,
+}
+
+/// One trashed page (issue 10), as surfaced to the frontend's "Trash" list:
+/// enough to display it and to drive an in-app "Restore" action (which needs
+/// `trashed_filename`, the manifest key).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashedPageSummary {
+    id: String,
+    title: String,
+    trashed_filename: String,
+    original_relative_path: String,
+}
+
+impl From<trash::TrashedPage> for TrashedPageSummary {
+    fn from(page: trash::TrashedPage) -> Self {
+        TrashedPageSummary {
+            id: page.id,
+            title: page.title,
+            trashed_filename: page.trashed_filename,
+            original_relative_path: page.original_relative_path,
+        }
+    }
 }
 
 /// A single grouped-by-source-page backlink entry, as returned to the
@@ -96,6 +120,18 @@ pub enum PageResolution {
         /// included a `#Heading` fragment -- the frontend uses this to
         /// scroll to that heading after navigating to the page.
         heading_slug: Option<String>,
+        /// True when this page currently sits in `.cerebrite/trash/` (issue
+        /// 10): links to a trashed page must keep resolving here (not fall
+        /// through to `Dynamic`) since the id/content are still on disk --
+        /// the frontend renders an "in trash" indicator with an inline
+        /// restore action instead of the ordinary page chrome.
+        #[serde(default)]
+        in_trash: bool,
+        /// The trashed file's filename under `.cerebrite/trash/` (the trash
+        /// manifest key) -- present only when `in_trash` is true, since
+        /// that's what the "Restore" action needs.
+        #[serde(default)]
+        trashed_filename: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Dynamic {
@@ -415,7 +451,36 @@ fn resolve_page_impl(state: &AppState, title: &str) -> Result<PageResolution, St
                 body,
                 html,
                 heading_slug: resolved_heading_slug,
+                in_trash: false,
+                trashed_filename: None,
             });
+        }
+    }
+
+    // No persisted (non-trashed) match -- but per ADR-0010, a page currently
+    // sitting in `.cerebrite/trash/` must still resolve (rendered "in trash"
+    // with a restore prompt) rather than falling through to `Dynamic`, since
+    // its id/content are still on disk. Only emptying the trash makes a link
+    // to it truly dangling/dynamic.
+    if let Some(vault_path) = vault_path.as_deref() {
+        if let Ok(trashed_pages) = trash::list_trashed_pages(vault_path) {
+            for trashed in trashed_pages {
+                if frontmatter::normalize_title(&trashed.title) == normalized {
+                    let file_path = trash::trash_dir(vault_path).join(&trashed.trashed_filename);
+                    if let Ok(parsed) = frontmatter::parse_and_ensure_id(&file_path) {
+                        let html = markdown::render(&parsed.body);
+                        return Ok(PageResolution::Persisted {
+                            id: trashed.id,
+                            title: trashed.title,
+                            body: parsed.body,
+                            html,
+                            heading_slug,
+                            in_trash: true,
+                            trashed_filename: Some(trashed.trashed_filename),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -552,6 +617,103 @@ fn materialize_and_save_page_impl(
     Ok(summary)
 }
 
+/// Explicit "delete page" action (issue 10 / ADR-0010): moves a persisted
+/// page's file into `.cerebrite/trash/` (a git-tracked move, auto-committed
+/// like any other edit) rather than deleting it, and removes it from the
+/// derived index (`index::remove_page`) so it stops appearing in "All
+/// pages"/search and its outbound links stop counting as backlinks
+/// elsewhere. The frontmatter (and its id) is untouched -- a pure move.
+#[tauri::command]
+fn trash_page(state: State<AppState>, id: String) -> Result<(), String> {
+    trash_page_impl(&state, &id)
+}
+
+fn trash_page_impl(state: &AppState, id: &str) -> Result<(), String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+
+    let mut db_guard = state.db.lock().unwrap();
+    let conn = db_guard.as_mut().ok_or("No vault is open")?;
+
+    let (title, path): (String, String) = conn
+        .query_row(
+            "SELECT title, path FROM pages WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let page_path = PathBuf::from(&path);
+    trash::trash_page(&vault_path, &page_path, id, &format!("Trash {title}")).map_err(|e| e.to_string())?;
+
+    // Only drop the DB rows once the filesystem move + commit succeeded.
+    index::remove_page(conn, id).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Explicit "restore" action (issue 10): moves a trashed page's file back to
+/// its original path (per the trash manifest), re-adds it to the derived
+/// index, and git-commits the restore. The file's frontmatter/id are
+/// untouched -- a pure move.
+#[tauri::command]
+fn restore_page(state: State<AppState>, trashed_filename: String) -> Result<PageSummary, String> {
+    restore_page_impl(&state, &trashed_filename)
+}
+
+fn restore_page_impl(state: &AppState, trashed_filename: &str) -> Result<PageSummary, String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+
+    let trashed_path = trash::trash_dir(&vault_path).join(trashed_filename);
+    let parsed = frontmatter::parse_and_ensure_id(&trashed_path).map_err(|e| e.to_string())?;
+
+    let restored_path =
+        trash::restore_page(&vault_path, trashed_filename, &format!("Restore {}", parsed.title))
+            .map_err(|e| e.to_string())?;
+
+    let mut db_guard = state.db.lock().unwrap();
+    let conn = db_guard.as_mut().ok_or("No vault is open")?;
+    index::insert_restored_page(conn, &parsed.id, &parsed.title, &restored_path, &parsed.body, &parsed.tags)
+        .map_err(|e| e.to_string())?;
+
+    Ok(PageSummary {
+        id: parsed.id,
+        title: parsed.title,
+    })
+}
+
+/// Explicit "empty trash" action (issue 10): permanently deletes every file
+/// under `.cerebrite/trash/` (real filesystem removal -- there is no other
+/// purge path) and git-commits the removal. Trashed pages already have no
+/// rows in the derived index (removed at trash time), so no index cleanup is
+/// needed here.
+#[tauri::command]
+fn empty_trash(state: State<AppState>) -> Result<(), String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    trash::empty_trash(&vault_path).map_err(|e| e.to_string())
+}
+
+/// Lists every page currently sitting in `.cerebrite/trash/` (issue 10), for
+/// the frontend's "Trash" view.
+#[tauri::command]
+fn list_trashed_pages(state: State<AppState>) -> Result<Vec<TrashedPageSummary>, String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    trash::list_trashed_pages(&vault_path)
+        .map(|pages| pages.into_iter().map(TrashedPageSummary::from).collect())
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -569,6 +731,10 @@ pub fn run() {
             resolve_page,
             get_backlinks,
             materialize_and_save_page,
+            trash_page,
+            restore_page,
+            empty_trash,
+            list_trashed_pages,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -933,5 +1099,111 @@ mod tests {
         let entries = get_backlinks_impl(&state, "Target").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].target_heading_slug.as_deref(), Some("getting-started"));
+    }
+
+    #[test]
+    fn trash_page_removes_it_from_list_pages_and_moves_the_file() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "hello.md", "---\nid: h1\ntitle: Hello\n---\nBody.\n");
+        let state = setup_vault(&dir);
+
+        trash_page_impl(&state, "h1").unwrap();
+
+        assert!(!dir.path().join("hello.md").exists());
+        assert!(dir.path().join(".cerebrite/trash/hello.md").exists());
+        let ids: i64 = {
+            let guard = state.db.lock().unwrap();
+            guard
+                .as_ref()
+                .unwrap()
+                .query_row("SELECT count(*) FROM pages WHERE id = 'h1'", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(ids, 0);
+    }
+
+    #[test]
+    fn trash_page_excludes_its_outbound_backlinks_from_the_targets_section() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "source.md", "---\nid: s1\ntitle: Source\n---\nLinks to [[Target]].\n");
+        write_page(&dir, "target.md", "---\nid: t1\ntitle: Target\n---\n");
+        let state = setup_vault(&dir);
+
+        assert_eq!(get_backlinks_impl(&state, "Target").unwrap().len(), 1);
+
+        trash_page_impl(&state, "s1").unwrap();
+
+        assert!(get_backlinks_impl(&state, "Target").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_page_finds_a_trashed_page_and_flags_it_in_trash() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "hello.md", "---\nid: h1\ntitle: Hello World\n---\nBody.\n");
+        let state = setup_vault(&dir);
+
+        trash_page_impl(&state, "h1").unwrap();
+
+        let resolution = resolve_page_impl(&state, "Hello World").unwrap();
+        match resolution {
+            PageResolution::Persisted { id, title, body, in_trash, trashed_filename, .. } => {
+                assert_eq!(id, "h1");
+                assert_eq!(title, "Hello World");
+                assert_eq!(body, "Body.\n");
+                assert!(in_trash);
+                assert_eq!(trashed_filename.as_deref(), Some("hello.md"));
+            }
+            PageResolution::Dynamic { .. } => panic!("expected a trashed-but-resolving match"),
+        }
+    }
+
+    #[test]
+    fn restore_page_reinstates_the_page_in_the_index_and_original_path() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "hello.md", "---\nid: h1\ntitle: Hello World\n---\nBody.\n");
+        let state = setup_vault(&dir);
+
+        trash_page_impl(&state, "h1").unwrap();
+        let summary = restore_page_impl(&state, "hello.md").unwrap();
+
+        assert_eq!(summary.id, "h1");
+        assert_eq!(summary.title, "Hello World");
+        assert!(dir.path().join("hello.md").exists());
+        assert!(!dir.path().join(".cerebrite/trash/hello.md").exists());
+
+        // Ordinary resolve_page again -- no longer in trash.
+        let resolution = resolve_page_impl(&state, "Hello World").unwrap();
+        match resolution {
+            PageResolution::Persisted { in_trash, .. } => assert!(!in_trash),
+            PageResolution::Dynamic { .. } => panic!("expected the restored persisted page"),
+        }
+    }
+
+    #[test]
+    fn empty_trash_permanently_deletes_a_trashed_page() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "hello.md", "---\nid: h1\ntitle: Hello World\n---\nBody.\n");
+        let state = setup_vault(&dir);
+
+        trash_page_impl(&state, "h1").unwrap();
+        assert_eq!(list_trashed_pages_impl(&state).unwrap().len(), 1);
+
+        empty_trash_impl(&state).unwrap();
+
+        assert!(!dir.path().join(".cerebrite/trash/hello.md").exists());
+        assert!(list_trashed_pages_impl(&state).unwrap().is_empty());
+    }
+
+    // Small `_impl`-free wrappers, mirroring the pattern used elsewhere in
+    // this test module, so trash/empty-trash tests don't need a full Tauri
+    // `State<AppState>` harness.
+    fn empty_trash_impl(state: &AppState) -> Result<(), String> {
+        let vault_path = state.vault_path.lock().unwrap().as_ref().unwrap().clone();
+        trash::empty_trash(&vault_path).map_err(|e| e.to_string())
+    }
+
+    fn list_trashed_pages_impl(state: &AppState) -> Result<Vec<trash::TrashedPage>, String> {
+        let vault_path = state.vault_path.lock().unwrap().as_ref().unwrap().clone();
+        trash::list_trashed_pages(&vault_path).map_err(|e| e.to_string())
     }
 }

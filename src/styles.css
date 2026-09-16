@@ -177,6 +177,39 @@ body {
   font-weight: 600;
 }
 
+.sidebar-trash-header {
+  margin-top: 1em;
+}
+
+#empty-trash-button {
+  padding: 0.3em 0.6em;
+  font-size: 0.8em;
+  box-shadow: none;
+}
+
+.page-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75em;
+}
+
+#delete-page-button {
+  padding: 0.3em 0.6em;
+  font-size: 0.8em;
+  box-shadow: none;
+}
+
+.page-trash-banner {
+  background: rgba(192, 57, 43, 0.1);
+  color: #c0392b;
+  padding: 0.5em 0.75em;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: 0.75em;
+}
+
 .page-view {
   flex: 1;
   overflow-y: auto;
