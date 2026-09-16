@@ -14,6 +14,12 @@ pub struct ParsedPage {
     pub id: String,
     pub title: String,
     pub body: String,
+    /// The page's frontmatter `tags:` list (issue 09), verbatim (not yet
+    /// normalized) -- each entry is sugar for a link to a page titled that
+    /// tag text (`links::frontmatter_tag_occurrences` does the
+    /// normalization/link-occurrence conversion). Empty when the file has no
+    /// `tags` key, or a `tags` value that isn't a YAML sequence of strings.
+    pub tags: Vec<String>,
 }
 
 /// Splits `content` into an optional raw YAML frontmatter block and the
@@ -75,6 +81,17 @@ fn parse_content(content: &str, default_title: &str) -> (ParsedPage, Option<Stri
         .map(|s| s.to_string())
         .unwrap_or_else(|| default_title.to_string());
 
+    let tags_key = Value::String("tags".to_string());
+    let tags = mapping
+        .get(&tags_key)
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let new_content = if needs_rewrite {
         let yaml_str =
             serde_yaml::to_string(&Value::Mapping(mapping)).unwrap_or_else(|_| String::new());
@@ -88,6 +105,7 @@ fn parse_content(content: &str, default_title: &str) -> (ParsedPage, Option<Stri
             id,
             title,
             body: body.to_string(),
+            tags,
         },
         new_content,
     )
@@ -397,6 +415,44 @@ mod tests {
     fn normalize_title_of_empty_or_whitespace_only_is_empty() {
         assert_eq!(normalize_title(""), "");
         assert_eq!(normalize_title("   "), "");
+    }
+
+    #[test]
+    fn parses_frontmatter_tags_list() {
+        let dir = tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            "tagged.md",
+            "---\nid: t1\ntitle: Tagged Page\ntags: [foo, bar]\n---\nSome body.\n",
+        );
+
+        let parsed = parse_and_ensure_id(&path).unwrap();
+
+        assert_eq!(parsed.tags, vec!["foo".to_string(), "bar".to_string()]);
+    }
+
+    #[test]
+    fn parses_frontmatter_tags_list_in_block_yaml_form() {
+        let dir = tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            "tagged.md",
+            "---\nid: t2\ntags:\n  - one\n  - two\n---\nBody.\n",
+        );
+
+        let parsed = parse_and_ensure_id(&path).unwrap();
+
+        assert_eq!(parsed.tags, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    #[test]
+    fn missing_tags_key_yields_empty_tags() {
+        let dir = tempdir().unwrap();
+        let path = write_file(dir.path(), "untagged.md", "---\nid: u1\n---\nBody.\n");
+
+        let parsed = parse_and_ensure_id(&path).unwrap();
+
+        assert!(parsed.tags.is_empty());
     }
 
     #[test]

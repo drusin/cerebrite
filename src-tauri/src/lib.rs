@@ -280,7 +280,7 @@ fn save_page_impl(state: &AppState, id: &str, markdown_body: &str) -> Result<(),
 
     vault::commit_all(&vault_path, &format!("Update {title}")).map_err(|e| e.to_string())?;
 
-    index::update_page_content(conn, id, &parsed.title, &parsed.body).map_err(|e| e.to_string())?;
+    index::update_page_content(conn, id, &parsed.title, &parsed.body, &parsed.tags).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -345,7 +345,7 @@ fn create_page_impl(state: &AppState, title: &str) -> Result<PageSummary, String
 
     vault::commit_all(&vault_path, &format!("Create {trimmed}")).map_err(|e| e.to_string())?;
 
-    index::insert_page(conn, &id, trimmed, &file_path, "").map_err(|e| e.to_string())?;
+    index::insert_page(conn, &id, trimmed, &file_path, "").map_err(|e| e.to_string())?; // no frontmatter tags on a brand-new page
 
     Ok(PageSummary {
         id,

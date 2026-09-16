@@ -20,12 +20,16 @@ pub struct PageRecord {
     pub path: PathBuf,
     pub body: String,
     pub modified_at: i64,
+    /// Frontmatter `tags:` list (issue 09), verbatim from `ParsedPage`; folded
+    /// into this page's outbound links alongside body-derived links/tags by
+    /// `replace_page_links`.
+    pub tags: Vec<String>,
 }
 
 /// One grouped-by-source-page backlink entry (issue 06): a page whose body
-/// contains a `[[Link]]` (or `#tag`, per CONTEXT.md's "Tag" definition --
-/// though tags aren't parsed yet as of this ticket) targeting the page whose
-/// backlinks were requested.
+/// contains a `[[Link]]`, a `#tag`/`#[[tag]]` (issue 09, both pure sugar for
+/// a link per CONTEXT.md's "Tag" definition), or a frontmatter `tags:` entry
+/// targeting the page whose backlinks were requested.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BacklinkEntry {
     pub source_id: String,
@@ -98,6 +102,7 @@ pub fn collect_pages(vault_path: &Path) -> Result<Vec<PageRecord>> {
             path: path.to_path_buf(),
             body: parsed.body,
             modified_at: file_modified_at(path),
+            tags: parsed.tags,
         });
     }
 
@@ -172,25 +177,33 @@ pub fn build_index(conn: &mut Connection, vault_path: &Path) -> Result<usize> {
     // -- a link's target is stored/matched purely by normalized title text,
     // never a foreign key into `pages`.
     for page in &pages {
-        replace_page_links(&tx, &page.id, &page.body)?;
+        replace_page_links(&tx, &page.id, &page.body, &page.tags)?;
     }
     tx.commit()?;
 
     Ok(pages.len())
 }
 
-/// Re-extracts every `[[Link]]` occurrence out of `body` and replaces
-/// `source_id`'s rows in the `backlinks` table with the fresh set -- run
-/// every time a page's body changes (full rebuild, single-page save, or
-/// page creation) so other pages' Backlinks sections stay correct without a
-/// full rebuild (issue 06).
-pub fn replace_page_links(conn: &Connection, source_id: &str, body: &str) -> rusqlite::Result<()> {
+/// Re-extracts every `[[Link]]`/`#tag`/`#[[tag]]` occurrence out of `body`,
+/// folds in `tags` (this page's frontmatter `tags:` list, issue 09), and
+/// replaces `source_id`'s rows in the `backlinks` table with the fresh
+/// combined set -- run every time a page's body or frontmatter changes (full
+/// rebuild, single-page save, or page creation) so other pages' Backlinks
+/// sections stay correct without a full index rebuild (issue 06). Tags feed
+/// this table identically to bracket links -- no separate flag or column
+/// distinguishes their origin.
+pub fn replace_page_links(
+    conn: &Connection,
+    source_id: &str,
+    body: &str,
+    tags: &[String],
+) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM backlinks WHERE source_id = ?1", params![source_id])?;
 
     let mut insert = conn.prepare(
         "INSERT INTO backlinks (source_id, target_normalized_title, snippet, target_heading_slug) VALUES (?1, ?2, ?3, ?4)",
     )?;
-    for link in links::extract_links(body) {
+    for link in links::extract_all_links(body, tags) {
         insert.execute(params![source_id, link.normalized_target, link.snippet, link.heading_slug])?;
     }
     Ok(())
@@ -231,6 +244,7 @@ pub fn update_page_content(
     id: &str,
     title: &str,
     body: &str,
+    tags: &[String],
 ) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE pages SET title = ?1, body = ?2, modified_at = ?3 WHERE id = ?4",
@@ -240,10 +254,10 @@ pub fn update_page_content(
         "UPDATE pages_fts SET title = ?1, body = ?2 WHERE id = ?3",
         params![title, body, id],
     )?;
-    // Keep the derived link graph in sync with this page's new body (issue
-    // 06) -- other pages' Backlinks sections must reflect this save without
-    // a full index rebuild.
-    replace_page_links(conn, id, body)?;
+    // Keep the derived link graph in sync with this page's new body/tags
+    // (issue 06/09) -- other pages' Backlinks sections must reflect this
+    // save without a full index rebuild.
+    replace_page_links(conn, id, body, tags)?;
     Ok(())
 }
 
@@ -265,7 +279,11 @@ pub fn insert_page(
         "INSERT INTO pages_fts (id, title, body) VALUES (?1, ?2, ?3)",
         params![id, title, body],
     )?;
-    replace_page_links(conn, id, body)?;
+    // A brand-new page has no frontmatter tags yet (`new_page_content` never
+    // writes a `tags` key), so this only needs the empty slice -- but the
+    // parameter exists so a future frontmatter-tags-on-create path doesn't
+    // need a signature change.
+    replace_page_links(conn, id, body, &[])?;
     Ok(())
 }
 
@@ -363,7 +381,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         build_index(&mut conn, dir.path()).unwrap();
 
-        update_page_content(&conn, "one", "One", "Edited body with newword.\n").unwrap();
+        update_page_content(&conn, "one", "One", "Edited body with newword.\n", &[]).unwrap();
 
         let body: String = conn
             .query_row("SELECT body FROM pages WHERE id = 'one'", [], |row| row.get(0))
@@ -462,12 +480,67 @@ mod tests {
         build_index(&mut conn, dir.path()).unwrap();
         assert_eq!(get_backlinks(&conn, "b").unwrap().len(), 1);
 
-        replace_page_links(&conn, "a", "Now links to [[C]] instead.\n").unwrap();
+        replace_page_links(&conn, "a", "Now links to [[C]] instead.\n", &[]).unwrap();
 
         assert!(get_backlinks(&conn, "b").unwrap().is_empty());
         let entries = get_backlinks(&conn, "c").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source_id, "a");
+    }
+
+    #[test]
+    fn build_index_populates_backlinks_from_frontmatter_tags() {
+        let dir = tempdir().unwrap();
+        write_page(
+            dir.path(),
+            "a.md",
+            "---\nid: a\ntitle: A\ntags: [foo, bar]\n---\nNo inline tags here.\n",
+        );
+        write_page(dir.path(), "foo.md", "---\nid: f\ntitle: Foo\n---\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+
+        let entries = get_backlinks(&conn, "foo").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "a");
+    }
+
+    #[test]
+    fn build_index_populates_backlinks_from_inline_hash_tags() {
+        let dir = tempdir().unwrap();
+        write_page(dir.path(), "a.md", "---\nid: a\ntitle: A\n---\nThis is #foo tagged.\n");
+        write_page(dir.path(), "foo.md", "---\nid: f\ntitle: Foo\n---\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+
+        let entries = get_backlinks(&conn, "foo").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "a");
+    }
+
+    #[test]
+    fn inline_tag_and_frontmatter_tag_both_feed_the_same_target_backlinks() {
+        let dir = tempdir().unwrap();
+        write_page(
+            dir.path(),
+            "a.md",
+            "---\nid: a\ntitle: A\n---\nInline #shared tag here.\n",
+        );
+        write_page(
+            dir.path(),
+            "b.md",
+            "---\nid: b\ntitle: B\ntags: [shared]\n---\nNo inline tag.\n",
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+
+        let entries = get_backlinks(&conn, "shared").unwrap();
+        let mut source_ids: Vec<&str> = entries.iter().map(|e| e.source_id.as_str()).collect();
+        source_ids.sort();
+        assert_eq!(source_ids, vec!["a", "b"]);
     }
 
     #[test]

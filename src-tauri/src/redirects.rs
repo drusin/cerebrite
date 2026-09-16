@@ -329,7 +329,12 @@ pub fn cleanup_and_prune(vault_path: &Path, conn: &Connection) -> Result<()> {
         }
 
         frontmatter::write_body(Path::new(path), &new_body)?;
-        index::update_page_content(conn, id, title, &new_body)?;
+        // Re-read the file's frontmatter tags (issue 09) rather than assuming
+        // they're unaffected -- this rewrite only ever touches heading-link
+        // fragments in the body, but re-parsing keeps this in lockstep with
+        // save_page_impl's "trust what's actually on disk" approach.
+        let tags = frontmatter::parse_and_ensure_id(Path::new(path))?.tags;
+        index::update_page_content(conn, id, title, &new_body, &tags)?;
         any_file_changed = true;
     }
 
