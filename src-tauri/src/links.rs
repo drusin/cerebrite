@@ -86,6 +86,59 @@ pub fn extract_links(body: &str) -> Vec<LinkOccurrence> {
     out
 }
 
+/// One `[[Page#fragment]]` occurrence's heading fragment, located precisely
+/// enough in `body` to be rewritten in place (ticket 08's rebuild-time
+/// cleanup pass): `fragment_range` is the exact byte range of the raw
+/// fragment text itself (e.g. `Some Heading` in `[[Page#Some Heading]]`),
+/// trimmed of surrounding whitespace but *not* slugified, so a rewrite can
+/// replace exactly that text (whatever it originally was) with a new slug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadingLinkSpan {
+    pub normalized_target: String,
+    pub heading_slug: String,
+    pub fragment_range: std::ops::Range<usize>,
+}
+
+/// Scans `body` for `[[Page#fragment]]` occurrences that carry a non-empty
+/// heading fragment, returning one `HeadingLinkSpan` per match. Plain
+/// page-level links (no `#`, or an empty fragment) are skipped, same as
+/// `extract_links`.
+pub fn find_heading_link_spans(body: &str) -> Vec<HeadingLinkSpan> {
+    let mut out = Vec::new();
+
+    for capture in wiki_link_regex().captures_iter(body) {
+        let group = capture.get(1).expect("capture group 1 always matches");
+        let raw_title = group.as_str();
+        let group_start = group.start();
+
+        let Some(hash_rel) = raw_title.find('#') else {
+            continue;
+        };
+        let target_text = raw_title[..hash_rel].trim();
+        if target_text.is_empty() {
+            continue;
+        }
+
+        let fragment_raw = &raw_title[hash_rel + 1..];
+        let fragment_trimmed = fragment_raw.trim();
+        if fragment_trimmed.is_empty() {
+            continue;
+        }
+
+        let leading_ws = fragment_raw.len() - fragment_raw.trim_start().len();
+        let frag_start = group_start + hash_rel + 1 + leading_ws;
+        let frag_end = frag_start + fragment_trimmed.len();
+
+        out.push(HeadingLinkSpan {
+            normalized_target: normalize_title(target_text),
+            heading_slug: slugify_heading(fragment_trimmed),
+            fragment_range: frag_start..frag_end,
+        });
+    }
+
+    out
+}
+
 /// Builds a plain-text snippet of `body` around the byte range
 /// `[match_start, match_end)`, expanded by `SNIPPET_RADIUS` characters on
 /// each side, with whitespace/newlines collapsed to single spaces and an
@@ -217,5 +270,38 @@ mod tests {
         let links = extract_links(body);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].normalized_target, "my page");
+    }
+
+    #[test]
+    fn find_heading_link_spans_locates_the_raw_fragment_text() {
+        let body = "See [[Some Page#A Heading]] for more.";
+        let spans = find_heading_link_spans(body);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].normalized_target, "some page");
+        assert_eq!(spans[0].heading_slug, "a-heading");
+        assert_eq!(&body[spans[0].fragment_range.clone()], "A Heading");
+    }
+
+    #[test]
+    fn find_heading_link_spans_skips_page_only_links() {
+        let body = "See [[Some Page]] for more.";
+        assert!(find_heading_link_spans(body).is_empty());
+    }
+
+    #[test]
+    fn find_heading_link_spans_replacement_round_trips() {
+        let body = "Intro [[Page#old-slug]] and [[Other#Another Heading]] tail.";
+        let spans = find_heading_link_spans(body);
+        assert_eq!(spans.len(), 2);
+
+        // Replace back-to-front so earlier byte ranges stay valid.
+        let mut new_body = body.to_string();
+        for span in spans.iter().rev() {
+            new_body.replace_range(span.fragment_range.clone(), "new-slug");
+        }
+        assert_eq!(
+            new_body,
+            "Intro [[Page#new-slug]] and [[Other#new-slug]] tail."
+        );
     }
 }

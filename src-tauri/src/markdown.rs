@@ -79,9 +79,46 @@ fn add_heading_ids<'a>(events: Vec<Event<'a>>) -> Vec<Event<'a>> {
     out
 }
 
+/// Returns the slug of every heading in `body`, in document order, deduped
+/// per-page the same way `add_heading_ids` assigns rendered `id`s (ticket 08:
+/// this is the "current set of heading slugs" a rename-detection diff and a
+/// redirect-chain resolution both compare against).
+pub fn heading_slugs(body: &str) -> Vec<String> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_FOOTNOTES);
+
+    let parser = Parser::new_ext(body, options);
+    let events: Vec<Event> = parser.collect();
+
+    let mut slugger = HeadingSlugger::new();
+    let mut out = Vec::new();
+    for (idx, event) in events.iter().enumerate() {
+        if let Event::Start(Tag::Heading { .. }) = event {
+            let text = heading_text(&events, idx);
+            out.push(slugger.slug(&text));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heading_slugs_returns_slugs_in_document_order() {
+        let slugs = heading_slugs("# Setup\n\nBody.\n\n## Usage\n\nMore.\n");
+        assert_eq!(slugs, vec!["setup".to_string(), "usage".to_string()]);
+    }
+
+    #[test]
+    fn heading_slugs_dedupes_like_rendering_does() {
+        let slugs = heading_slugs("# Setup\n\nOne.\n\n# Setup\n\nTwo.\n");
+        assert_eq!(slugs, vec!["setup".to_string(), "setup-2".to_string()]);
+    }
 
     #[test]
     fn renders_basic_markdown_to_html() {

@@ -53,6 +53,31 @@ pub fn persist_vault_path(app: &AppHandle, vault_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Returns (and mints on first use) a stable random device id, persisted
+/// alongside the remembered-vault-path file in the app's config dir (ticket
+/// 08): redirect-log entries carry this so a human reading a merge conflict
+/// on `redirects.tsv` can tell which device made which entry. Plain text, no
+/// JSON wrapper needed for a single opaque string.
+pub fn load_or_create_device_id(app: &AppHandle) -> Result<String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .context("resolving app config dir")?;
+    fs::create_dir_all(&dir).context("creating app config dir")?;
+    let path = dir.join("device_id.txt");
+
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    fs::write(&path, &id).context("writing device id")?;
+    Ok(id)
+}
+
 /// Ensures `vault_path` is a git repository, running `git init` (via git2)
 /// if it isn't one already.
 pub fn ensure_git_repo(vault_path: &Path) -> Result<()> {

@@ -3,9 +3,10 @@ mod heading_slug;
 mod index;
 mod links;
 mod markdown;
+mod redirects;
 mod vault;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection};
@@ -19,6 +20,11 @@ use tauri_plugin_dialog::DialogExt;
 pub struct AppState {
     vault_path: Mutex<Option<PathBuf>>,
     db: Mutex<Option<Connection>>,
+    /// This device's stable id (ticket 08), used to attribute entries this
+    /// device appends to `.cerebrite/redirects.tsv`. `None` until a vault is
+    /// open (or, in tests that construct `AppState` directly, always --
+    /// callers fall back to a placeholder id in that case).
+    device_id: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +143,7 @@ fn open_vault(app: AppHandle, state: State<AppState>, path: String) -> Result<Va
 
     vault::ensure_git_repo(&vault_path).map_err(|e| e.to_string())?;
     vault::persist_vault_path(&app, &vault_path).map_err(|e| e.to_string())?;
+    let device_id = vault::load_or_create_device_id(&app).map_err(|e| e.to_string())?;
 
     let db_file = derived_index_path(&app)?;
     // Rebuild from scratch every launch/open (ADR-0008): drop any stale file
@@ -145,8 +152,15 @@ fn open_vault(app: AppHandle, state: State<AppState>, path: String) -> Result<Va
     let mut conn = Connection::open(&db_file).map_err(|e| e.to_string())?;
     let page_count = index::build_index(&mut conn, &vault_path).map_err(|e| e.to_string())?;
 
+    // Byproduct of the full rebuild (ticket 08), never a separate scan:
+    // rewrite files whose heading links resolve through a redirect chain to
+    // a now-current slug, then prune redirect entries nothing references
+    // any more.
+    redirects::cleanup_and_prune(&vault_path, &conn).map_err(|e| e.to_string())?;
+
     *state.vault_path.lock().unwrap() = Some(vault_path.clone());
     *state.db.lock().unwrap() = Some(conn);
+    *state.device_id.lock().unwrap() = Some(device_id);
 
     Ok(VaultInfo {
         path: vault_path.to_string_lossy().to_string(),
@@ -223,25 +237,49 @@ fn save_page_impl(state: &AppState, id: &str, markdown_body: &str) -> Result<(),
         guard.as_ref().ok_or("No vault is open")?.clone()
     };
 
+    let device_id = state
+        .device_id
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "unknown-device".to_string());
+
     let mut db_guard = state.db.lock().unwrap();
     let conn = db_guard.as_mut().ok_or("No vault is open")?;
 
-    let (title, path): (String, String) = conn
+    let (title, path, old_body): (String, String, String) = conn
         .query_row(
-            "SELECT title, path FROM pages WHERE id = ?1",
+            "SELECT title, path, body FROM pages WHERE id = ?1",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| e.to_string())?;
 
     let page_path = PathBuf::from(&path);
     frontmatter::write_body(&page_path, markdown_body).map_err(|e| e.to_string())?;
 
-    vault::commit_all(&vault_path, &format!("Update {title}")).map_err(|e| e.to_string())?;
-
     // Re-parse from disk (rather than trusting `markdown_body` verbatim) so
     // the index reflects exactly what write_body persisted.
     let parsed = frontmatter::parse_and_ensure_id(&page_path).map_err(|e| e.to_string())?;
+
+    // Rename detection (ticket 08): compare this page's heading slugs before
+    // and after the save. Any detected rename gets a sorted-inserted entry in
+    // `.cerebrite/redirects.tsv` *before* committing, so the same commit that
+    // saves the page's new content also carries the redirect log update.
+    let old_slugs = markdown::heading_slugs(&old_body);
+    let new_slugs = markdown::heading_slugs(&parsed.body);
+    for (old_slug, new_slug) in redirects::detect_renames(&old_slugs, &new_slugs) {
+        let redirect_entry = redirects::RedirectEntry {
+            old_key: redirects::make_key(id, &old_slug),
+            new_key: redirects::make_key(id, &new_slug),
+            timestamp: redirects::now_rfc3339(),
+            device_id: device_id.clone(),
+        };
+        redirects::insert_sorted(&vault_path, redirect_entry).map_err(|e| e.to_string())?;
+    }
+
+    vault::commit_all(&vault_path, &format!("Update {title}")).map_err(|e| e.to_string())?;
+
     index::update_page_content(conn, id, &parsed.title, &parsed.body).map_err(|e| e.to_string())?;
 
     Ok(())
@@ -346,6 +384,8 @@ fn split_title_and_heading_slug(raw_title: &str) -> (&str, Option<String>) {
 /// `create_page_impl`/`save_page_impl`) so it's unit-testable directly
 /// against a plain `AppState` without needing a full Tauri app harness.
 fn resolve_page_impl(state: &AppState, title: &str) -> Result<PageResolution, String> {
+    let vault_path = state.vault_path.lock().unwrap().clone();
+
     let guard = state.db.lock().unwrap();
     let conn = guard.as_ref().ok_or("No vault is open")?;
 
@@ -363,12 +403,18 @@ fn resolve_page_impl(state: &AppState, title: &str) -> Result<PageResolution, St
         if frontmatter::normalize_title(&page_title) == normalized {
             let body: String = row.get(2).map_err(|e| e.to_string())?;
             let html = markdown::render(&body);
+            let resolved_heading_slug = resolve_heading_slug_via_redirects(
+                vault_path.as_deref(),
+                &id,
+                &body,
+                heading_slug.as_deref(),
+            );
             return Ok(PageResolution::Persisted {
                 id,
                 title: page_title,
                 body,
                 html,
-                heading_slug,
+                heading_slug: resolved_heading_slug,
             });
         }
     }
@@ -377,6 +423,30 @@ fn resolve_page_impl(state: &AppState, title: &str) -> Result<PageResolution, St
         normalized_title: normalized,
         heading_slug,
     })
+}
+
+/// Resolves `slug` against `page_id`'s current heading slugs (parsed from
+/// `body`), following the vault's redirect log (ticket 08) when `slug`
+/// doesn't currently exist on the page -- so a `[[Page#old-slug]]` link keeps
+/// resolving immediately after a rename, without the file itself being
+/// rewritten yet. Returns `slug` unchanged if there's no vault open, no
+/// redirect log, or nothing to resolve through (`slug` is `None`).
+fn resolve_heading_slug_via_redirects(
+    vault_path: Option<&Path>,
+    page_id: &str,
+    body: &str,
+    slug: Option<&str>,
+) -> Option<String> {
+    let slug = slug?;
+    let Some(vault_path) = vault_path else {
+        return Some(slug.to_string());
+    };
+    let current_slugs = markdown::heading_slugs(body);
+    if current_slugs.iter().any(|s| s == slug) {
+        return Some(slug.to_string());
+    }
+    let entries = redirects::load(vault_path).unwrap_or_default();
+    Some(redirects::resolve_heading_slug(&entries, page_id, slug, &current_slugs))
 }
 
 /// Returns every backlink pointing at the page identified by `title`,
@@ -396,12 +466,63 @@ fn get_backlinks(state: State<AppState>, title: String) -> Result<Vec<BacklinkEn
 /// Shared implementation behind `get_backlinks`, split out for direct unit
 /// testing against a plain `AppState`.
 fn get_backlinks_impl(state: &AppState, title: &str) -> Result<Vec<BacklinkEntry>, String> {
+    let vault_path = state.vault_path.lock().unwrap().clone();
+
     let guard = state.db.lock().unwrap();
     let conn = guard.as_ref().ok_or("No vault is open")?;
 
     let normalized = frontmatter::normalize_title(title);
     let entries = index::get_backlinks(conn, &normalized).map_err(|e| e.to_string())?;
+
+    // Resolve each entry's target_heading_slug through the redirect log
+    // (ticket 08), same as `resolve_page` -- a backlink recorded against an
+    // old heading slug should still show the target's current one. Only
+    // meaningful when the target itself is a persisted page (a dynamic
+    // target has no id/body to resolve against).
+    let target_page = find_page_by_normalized_title(conn, &normalized);
+
+    let entries = if let (Some(vault_path), Some((target_id, target_body))) = (&vault_path, &target_page) {
+        let current_slugs = markdown::heading_slugs(target_body);
+        let redirect_entries = redirects::load(vault_path).unwrap_or_default();
+        entries
+            .into_iter()
+            .map(|mut entry| {
+                if let Some(slug) = &entry.target_heading_slug {
+                    if !current_slugs.iter().any(|s| s == slug) {
+                        entry.target_heading_slug = Some(redirects::resolve_heading_slug(
+                            &redirect_entries,
+                            target_id,
+                            slug,
+                            &current_slugs,
+                        ));
+                    }
+                }
+                entry
+            })
+            .collect()
+    } else {
+        entries
+    };
+
     Ok(entries.into_iter().map(BacklinkEntry::from).collect())
+}
+
+/// Scans `pages` for a row whose title normalizes to `normalized`, returning
+/// its id/body -- the same case/whitespace-insensitive match `resolve_page`
+/// uses, needed here to find the *target* page's current heading slugs for
+/// redirect resolution.
+fn find_page_by_normalized_title(conn: &Connection, normalized: &str) -> Option<(String, String)> {
+    let mut stmt = conn.prepare("SELECT id, title, body FROM pages").ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    while let Some(row) = rows.next().ok()? {
+        let id: String = row.get(0).ok()?;
+        let title: String = row.get(1).ok()?;
+        if frontmatter::normalize_title(&title) == normalized {
+            let body: String = row.get(2).ok()?;
+            return Some((id, body));
+        }
+    }
+    None
 }
 
 /// Materializes a dynamic page into a real persisted file the instant it
@@ -472,6 +593,7 @@ mod tests {
         AppState {
             vault_path: Mutex::new(Some(dir.path().to_path_buf())),
             db: Mutex::new(Some(conn)),
+            device_id: Mutex::new(Some("test-device".to_string())),
         }
     }
 
@@ -745,5 +867,71 @@ mod tests {
             PageResolution::Persisted { body, .. } => assert_eq!(body, "Second write, edited.\n"),
             PageResolution::Dynamic { .. } => panic!("expected the persisted page"),
         }
+    }
+
+    #[test]
+    fn saving_a_heading_rename_writes_a_redirect_entry_that_resolve_page_honors() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "guide.md", "---\nid: guide\ntitle: Guide\n---\n## Setup\n\nBody.\n");
+        let state = setup_vault(&dir);
+
+        // A link written against the pre-rename slug resolves fine right now.
+        let resolution = resolve_page_impl(&state, "Guide#Setup").unwrap();
+        match resolution {
+            PageResolution::Persisted { heading_slug, .. } => {
+                assert_eq!(heading_slug.as_deref(), Some("setup"))
+            }
+            PageResolution::Dynamic { .. } => panic!("expected a persisted match"),
+        }
+
+        // Rename the heading via an ordinary save.
+        save_page_impl(&state, "guide", "## Getting Started\n\nBody.\n").unwrap();
+
+        // The redirect log now has exactly one sorted entry for this rename.
+        let entries = redirects::load(dir.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].old_key, "guide#setup");
+        assert_eq!(entries[0].new_key, "guide#getting-started");
+
+        // The old link text still resolves -- to the new slug -- without the
+        // file itself being rewritten.
+        let resolution = resolve_page_impl(&state, "Guide#Setup").unwrap();
+        match resolution {
+            PageResolution::Persisted { heading_slug, .. } => {
+                assert_eq!(heading_slug.as_deref(), Some("getting-started"))
+            }
+            PageResolution::Dynamic { .. } => panic!("expected a persisted match"),
+        }
+    }
+
+    #[test]
+    fn renaming_a_heading_that_is_only_edited_not_removed_is_not_a_false_positive_rename() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "guide.md", "---\nid: guide\ntitle: Guide\n---\n## Setup\n\nBody.\n");
+        let state = setup_vault(&dir);
+
+        // Adding a second, unrelated heading (no removal) must not be
+        // mistaken for a rename of "Setup".
+        save_page_impl(&state, "guide", "## Setup\n\nBody.\n\n## Usage\n\nMore.\n").unwrap();
+
+        assert!(redirects::load(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_backlinks_resolves_a_stale_target_heading_slug_through_the_redirect_log() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "target.md", "---\nid: target\ntitle: Target\n---\n## Setup\n\nBody.\n");
+        write_page(
+            &dir,
+            "source.md",
+            "---\nid: source\ntitle: Source\n---\nSee [[Target#Setup]] here.\n",
+        );
+        let state = setup_vault(&dir);
+
+        save_page_impl(&state, "target", "## Getting Started\n\nBody.\n").unwrap();
+
+        let entries = get_backlinks_impl(&state, "Target").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].target_heading_slug.as_deref(), Some("getting-started"));
     }
 }
