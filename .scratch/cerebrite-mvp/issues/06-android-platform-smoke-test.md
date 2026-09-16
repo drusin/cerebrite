@@ -1,5 +1,5 @@
 Type: task
-Status: claimed
+Status: resolved
 
 ## Question
 
@@ -25,6 +25,9 @@ Check 1 done via the CI-built APK (`.github/workflows/android-smoke-apk.yml`) in
 
 - Device: Pixel 9a, Android 17
 - Check 1 (builds + runs + round-trip on-device): **PASS** — installs cleanly, launches, `ping -> pong` shows, cold-start feels fine, WebView rendering clean, survives rotation and background/resume. Nothing unexpected.
-- Check 2 (corpus rebuild time) and Check 3 (git2-rs cross-compile + on-device op): **not yet done** — still need [06-android-smoke-test-wizard.sh](06-android-smoke-test-wizard.sh) (or an extended CI build) to cover those.
+- Check 2 (corpus rebuild time) and Check 3 (git2-rs cross-compile + on-device op): completed via the same CI-built APK, same device.
+  - Check 2 (corpus rebuild time): **PASS** — index rebuild: 169ms (comfortably sub-second per the standing constraint).
+  - Check 3 (git2-rs cross-compile + on-device op): **PASS** — git commit + local clone round-trip succeeded on-device.
+  - Nothing unexpected noted (cold-start, WebView rendering, rotation, background/resume all fine per Check 1 pass above).
 
-Status stays `claimed`, not `resolved`, until Checks 2 and 3 are in.
+All three checks pass. Tech stack decision ([01-tech-stack-and-core-architecture](01-tech-stack-and-core-architecture.md) / [ADR-0008](../../../docs/adr/0008-tauri-rust-core-with-sqlite-fts5.md)) stands as-is; Android implementation is unblocked.
