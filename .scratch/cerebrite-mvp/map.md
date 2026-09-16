@@ -18,15 +18,11 @@ A written MVP spec for Cerebrite — a git-native, markdown-based, Logseq-inspir
 - [Packaging and install](issues/03-packaging-and-install.md): Windows gets an unsigned NSIS installer, Linux (CachyOS/Arch) gets an AppImage (`fuse2` caveat), Android gets a release-signed sideload APK via `tauri android build -- --apk`. Ongoing distribution stays out of scope; Google's 2026-09-30 Android developer-verification rollout flagged for awareness, not blocking.
 - [Redirect log format](issues/05-redirect-log-format.md): `.cerebrite/redirects.tsv`, tab-separated, keyed by frontmatter page id, lines inserted in **sorted-by-key order** (not blind append — corrects [ADR-0007](../../docs/adr/0007-persisted-redirect-log-for-heading-rename-identity.md)'s original assumption, verified against real git merges). Pruning piggybacks on the existing derived-index rebuild; a bounded, accepted cross-device pruning race can leave a link broken (never silently wrong).
 - [Android platform smoke test](issues/06-android-platform-smoke-test.md): all three checks PASS on a Pixel 9a (Android 17) via the CI-built APK — round-trip works, corpus index rebuild at 169ms (comfortably sub-second), `git2-rs` cross-compiles and runs a commit+clone round-trip on-device. Tech stack decision stands; Android implementation is unblocked.
+- [Page creation/deletion UX](issues/07-page-creation-deletion-ux.md): pages are either a *dynamic page* (link/tag to nonexistent text, UI-identical, no file until first write — [ADR-0009](../../docs/adr/0009-dynamic-pages-materialize-on-first-write.md)) or a *persisted page* (real file); explicit "new page" persists immediately on title alone. Deletion moves a persisted page to a git-tracked `.cerebrite/trash/` with manual-only purge and in-app restore ([ADR-0010](../../docs/adr/0010-page-deletion-via-git-tracked-trash-folder.md)).
 
 ## Not yet specified
 
-- Page creation/deletion UX
-- Navigation / sidebar UI structure
-- Whether a tag system exists at all
-- Whether daily notes are a first-class concept
-- Search UI/UX (how results are presented, ranked, filtered)
-- How backlinks are displayed to the reader
+(empty — all fog graduated into tickets: [07](issues/07-page-creation-deletion-ux.md), [08](issues/08-navigation-sidebar-ui-structure.md), [09](issues/09-tag-system.md), [10](issues/10-daily-notes.md), [11](issues/11-search-ui-ux.md), [12](issues/12-backlinks-display.md))
 
 ## Out of scope
 

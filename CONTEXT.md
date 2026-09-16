@@ -5,8 +5,16 @@ A git-native, markdown-based knowledge base ("second brain"): notes live as plai
 ## Language
 
 **Page**:
-A single markdown file, identified by a stable id in its frontmatter so it survives renames and moves. The top-level linkable entity.
+The top-level linkable entity. Exists as either a **persisted page** or a **dynamic page** — see both below.
 _Avoid_: Note, document (both used loosely elsewhere for the same file-on-disk concept; "page" is the canonical term)
+
+**Persisted page**:
+A page backed by an actual markdown file, identified by a stable id in its frontmatter so it survives renames and moves.
+_Avoid_: Note, document; "real page" (implies a dynamic page is somehow fake, when it renders identically)
+
+**Dynamic page**:
+A page that exists only because a link or tag reaches it, with no backing file and no frontmatter id yet — identified purely by the normalized text of that link. Renders with identical UI to a persisted page, and is included in search/navigation the same way once the derived index has been built. Becomes a persisted page automatically the instant it receives its first write (merely viewing it does not); needs no explicit deletion, since it simply ceases to exist once nothing references it any more. See [ADR-0009](docs/adr/0009-dynamic-pages-materialize-on-first-write.md).
+_Avoid_: Stub, placeholder, ghost page (all suggest a lesser or temporary UI, when the UI is identical to a persisted page's)
 
 **Linkable entity**:
 The unit of granularity a link can target. Fixed at page, heading, and sub-heading for the MVP. Paragraph-level linking is not yet decided — see the open question below.
