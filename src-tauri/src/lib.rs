@@ -18,6 +18,7 @@ use std::time::Duration;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
 
 /// Shared app state: the currently open vault path and its derived-index
@@ -213,12 +214,44 @@ fn get_remembered_vault(app: AppHandle) -> Option<String> {
 
 /// Opens a native folder picker and returns the chosen path, or `None` if the
 /// user cancelled.
+///
+/// Desktop only: `tauri-plugin-dialog` 2.7.3 gates its entire folder-picker
+/// surface (`pick_folder`/`pick_folders` and their blocking variants) behind
+/// `#[cfg(desktop)]` -- there is currently no folder picker at all on
+/// Android (only `pick_file`/`pick_files`, backed by Android's
+/// ACTION_OPEN_DOCUMENT, work cross-platform). This was discovered by
+/// actually cross-compiling to aarch64-linux-android for ticket 15, not
+/// assumed: the original code (`app.dialog().file().blocking_pick_folder()`)
+/// failed to *compile* for Android at all.
+///
+/// This means picking a vault folder -- and therefore opening a vault at
+/// all -- has no working UI path on Android yet. Shipping real folder
+/// access there needs a native Storage Access Framework (SAF) integration
+/// (an `ACTION_OPEN_DOCUMENT_TREE` picker plus routing all of vault.rs's
+/// `std::fs`/`git2`/`walkdir` calls through SAF's `content://` URIs instead
+/// of plain paths), which is a substantial platform-specific undertaking
+/// that needs a real device to build and verify against -- well beyond a
+/// config-level fix, and explicitly left as follow-up rather than guessed
+/// at blind. The `#[cfg(mobile)]` arm below keeps the app compiling and
+/// fails the picker loudly (a clear "not supported yet" error) rather than
+/// silently returning `None` as if the user simply cancelled.
+#[cfg(desktop)]
 #[tauri::command]
-fn pick_vault_folder(app: AppHandle) -> Option<String> {
-    app.dialog()
-        .file()
-        .blocking_pick_folder()
-        .map(|p| p.to_string())
+async fn pick_vault_folder(app: AppHandle) -> Option<String> {
+    // Non-blocking `pick_folder` (callback bridged to `.await` via a oneshot
+    // channel) rather than `blocking_pick_folder`: an async tauri command
+    // must not block its executor thread on user interaction.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |folder| {
+        let _ = tx.send(folder);
+    });
+    rx.await.ok().flatten().map(|p| p.to_string())
+}
+
+#[cfg(mobile)]
+#[tauri::command]
+async fn pick_vault_folder(_app: AppHandle) -> Result<Option<String>, String> {
+    Err("Selecting a vault folder isn't supported on Android yet (no Storage Access Framework integration -- see pick_vault_folder in lib.rs).".into())
 }
 
 /// Opens `path` as the vault: ensures it's a git repo, persists it as the

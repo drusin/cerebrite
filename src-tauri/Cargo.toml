@@ -26,11 +26,25 @@ serde_json = "1"
 serde_yaml = "0.9"
 rusqlite = { version = "0.31", features = ["bundled"] }
 walkdir = "2"
-git2 = "0.19"
+# `vendored-openssl` builds and statically links openssl-src instead of
+# relying on a system OpenSSL install: required for cross-compiling to
+# Android, where no OpenSSL dev headers/libs exist for the target triple.
+# Same fix already validated for git2 in the 06 smoke-test CI workflow
+# (.github/workflows/android-smoke-apk.yml) -- ticket 15 hit the identical
+# `openssl-sys` "Could not find directory of OpenSSL installation" failure
+# cross-compiling the real app to aarch64-linux-android without it.
+git2 = { version = "0.19", features = ["vendored-openssl"] }
 pulldown-cmark = "0.12"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 regex = "1"
+# Only needed for the oneshot channel that bridges tauri-plugin-dialog's
+# non-blocking `pick_folder` callback into an `.await`-able command (see
+# `pick_vault_folder` in lib.rs): the plugin's `blocking_pick_folder` is
+# `#[cfg(desktop)]`-only and doesn't exist on Android at all, which is a
+# real compile-time failure discovered cross-compiling ticket 15's real app
+# to aarch64-linux-android, not a hypothetical.
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"

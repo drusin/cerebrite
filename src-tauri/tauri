@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+// Compatibility shim, NOT the tauri CLI itself: Tauri 2.11.4's generated
+// Android Gradle project (src-tauri/gen/android/buildSrc/.../BuildTask.kt,
+// task "rustBuild<Arch><Profile>") shells out to literally
+// `node tauri android android-studio-script ...` with the working directory
+// set to this `src-tauri/` folder (via app/build.gradle.kts's
+// `rootDirRel = "../../../"`) to re-invoke the CLI mid-Gradle-build for each
+// target ABI.
+//
+// That only works if a file literally named `tauri` exists in that working
+// directory: Node's *entry-script* resolution (unlike `require()` inside a
+// module) does NOT search `node_modules` -- confirmed empirically while
+// debugging ticket 15's real cross-compile, which failed with
+// "Cannot find module '<repo>/src-tauri/tauri'" even though
+// `@tauri-apps/cli` (and `node_modules/.bin/tauri`, when bin-links are
+// linked) were both present. `npx`/`node_modules/.bin` never enter into it,
+// since Gradle spawns `node <arg>` directly rather than resolving `tauri` as
+// its own executable via PATH.
+//
+// This shim just forwards straight to `@tauri-apps/cli`'s real CLI entry so
+// the Gradle-triggered re-invocation has a `tauri` file to find.
+require("../node_modules/@tauri-apps/cli/tauri.js");

@@ -563,10 +563,14 @@ async function openVaultAndLoad(path: string) {
 }
 
 async function handleSelectVaultClick() {
-  const path = await pickVaultFolder();
-  if (!path) return; // user cancelled
-
+  // `pickVaultFolder` itself can reject -- not just `openVaultAndLoad` below
+  // -- on platforms with no folder-picker at all (Android currently has
+  // none; see `pick_vault_folder`'s `#[cfg(mobile)]` arm in lib.rs), so both
+  // calls need to land on the same error path rather than leaving that
+  // rejection unhandled.
   try {
+    const path = await pickVaultFolder();
+    if (!path) return; // user cancelled
     await openVaultAndLoad(path);
   } catch (err) {
     showVaultPicker(String(err));

@@ -1,0 +1,97 @@
+name: Build Android app (debug)
+
+# Ticket 15 (android-build-and-editor-parity): builds the REAL Cerebrite app
+# (this repo's own src-tauri/gen/android project, wired to the actual
+# Milkdown-editor frontend and Rust commands) for Android, as opposed to
+# android-smoke-apk.yml's throwaway ping-pong harness from ticket 06 (which
+# only proves the toolchain/cross-compilation story in isolation and builds
+# nothing from this repo).
+#
+# Debug build only -- release signing is ticket 16's job. Manual trigger for
+# now (like android-smoke-apk.yml): a full Android SDK/NDK/Rust-target setup
+# plus a from-scratch cross-compile of git2/rusqlite is multiple minutes of
+# heavyweight setup that doesn't belong on every push/PR until it's proven
+# stable in CI a few times; wire it to `push`/`pull_request` once it has.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # Default packages input is "tools platform-tools"; Google removed
+          # the legacy `tools` package from the SDK repo, so the action's own
+          # sdkmanager call fails installing it. platform-tools is all this
+          # step needs -- the next step installs platform/build-tools/NDK.
+          packages: "platform-tools"
+
+      - name: Install Android platform, build-tools, and NDK
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-34" "platforms;android-36" "build-tools;34.0.0" "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          # openssl-src's Configure/Makefile (pulled in by git2's
+          # vendored-openssl feature, required to cross-compile cleanly to
+          # Android -- see src-tauri/Cargo.toml) invoke the triple-prefixed
+          # binutils wrappers via CROSS_COMPILE, resolved off PATH. The NDK
+          # ships these as symlinks to llvm-ranlib/llvm-ar in its unified
+          # toolchain bin dir, which must be on PATH for them to be found.
+          echo "$ANDROID_SDK_ROOT/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: cargo-android-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-android-
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build the real app for Android (debug)
+        run: npx tauri android build --debug --target aarch64
+
+      - name: Locate the APK
+        id: apk
+        run: |
+          apk=$(find src-tauri/gen/android -name "*-debug.apk" | head -n1)
+          if [[ -z "$apk" ]]; then
+            echo "No debug APK found under src-tauri/gen/android" >&2
+            exit 1
+          fi
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cerebrite-android-debug
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
