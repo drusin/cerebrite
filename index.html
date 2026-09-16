@@ -17,18 +17,49 @@
     </section>
 
     <div id="workspace" class="workspace" hidden>
+      <!-- Android-proxy layout only (viewport-width heuristic, see main.ts):
+           hamburger trigger for the hidden-by-default drawer. Hidden outright
+           on desktop via CSS. -->
+      <button id="sidebar-open-button" class="sidebar-open-button" type="button" aria-label="Open sidebar">☰</button>
+      <div id="sidebar-overlay" class="sidebar-overlay" hidden></div>
+
       <aside id="sidebar" class="sidebar">
-        <div class="sidebar-header">
-          <h2>All pages</h2>
-          <button id="today-button" type="button">Today</button>
-          <button id="new-page-button" type="button">New page</button>
+        <div class="sidebar-top">
+          <button id="sidebar-collapse-toggle" class="sidebar-collapse-toggle" type="button" aria-label="Collapse sidebar">☰</button>
+          <!-- Ticket 13 stub: reserves the "prominent Search entry point" UI
+               slot per issue 08. No search UI/modal here -- that's ticket
+               13's job. -->
+          <button id="search-button" class="search-button" type="button">🔍 Search</button>
+          <button id="sidebar-close-button" class="sidebar-close-button" type="button" aria-label="Close sidebar">✕</button>
         </div>
-        <ul id="page-list" class="page-list"></ul>
-        <div class="sidebar-header sidebar-trash-header">
-          <h2>Trash</h2>
-          <button id="empty-trash-button" type="button">Empty trash</button>
+
+        <div class="sidebar-section">
+          <div class="sidebar-header">
+            <h2>Recent</h2>
+          </div>
+          <ul id="recent-list" class="page-list recent-list"></ul>
+          <p id="recent-empty" class="sidebar-empty-hint">No pages opened yet.</p>
         </div>
-        <ul id="trash-list" class="page-list trash-list"></ul>
+
+        <div class="sidebar-section">
+          <div class="sidebar-header">
+            <h2>All pages</h2>
+            <button id="new-page-button" type="button">New page</button>
+          </div>
+          <ul id="page-list" class="page-list"></ul>
+        </div>
+
+        <div class="sidebar-section">
+          <button id="today-button" class="today-button" type="button">Today</button>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-header sidebar-trash-header">
+            <h2>Trash</h2>
+            <button id="empty-trash-button" type="button">Empty trash</button>
+          </div>
+          <ul id="trash-list" class="page-list trash-list"></ul>
+        </div>
       </aside>
       <main id="page-view" class="page-view">
         <p id="page-view-empty" class="page-view-empty">Select a page from the list.</p>

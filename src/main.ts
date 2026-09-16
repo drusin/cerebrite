@@ -30,9 +30,17 @@ const vaultPickerErrorEl = document.querySelector<HTMLElement>("#vault-picker-er
 const selectVaultButtonEl = document.querySelector<HTMLButtonElement>("#select-vault-button");
 
 const workspaceEl = document.querySelector<HTMLElement>("#workspace");
+const sidebarEl = document.querySelector<HTMLElement>("#sidebar");
 const pageListEl = document.querySelector<HTMLUListElement>("#page-list");
 const newPageButtonEl = document.querySelector<HTMLButtonElement>("#new-page-button");
 const todayButtonEl = document.querySelector<HTMLButtonElement>("#today-button");
+const searchButtonEl = document.querySelector<HTMLButtonElement>("#search-button");
+const recentListEl = document.querySelector<HTMLUListElement>("#recent-list");
+const recentEmptyEl = document.querySelector<HTMLElement>("#recent-empty");
+const sidebarOpenButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-open-button");
+const sidebarCloseButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-close-button");
+const sidebarCollapseToggleEl = document.querySelector<HTMLButtonElement>("#sidebar-collapse-toggle");
+const sidebarOverlayEl = document.querySelector<HTMLElement>("#sidebar-overlay");
 
 const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
@@ -60,6 +68,66 @@ let currentPage: OpenPage | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pageEditor: PageEditor | null = null;
 
+// --- Recent (issue 12) ---------------------------------------------------
+//
+// Last-*opened* pages (not last-edited), most-recent-first, capped at
+// RECENT_LIMIT, no pagination -- per issue 08's sidebar spec. Deliberately
+// in-memory only (module-level array, not persisted to disk/config): there
+// is no existing persistence mechanism for this kind of transient UI state
+// (the config file only stores the vault path + device id), and the ticket
+// doesn't require surviving a restart, so the simplest option -- resetting
+// each app launch -- is the pragmatic default here.
+const RECENT_LIMIT = 10;
+
+interface RecentEntry {
+  /** Dedupe/identity key: `p:<id>` for a persisted page, `d:<normalizedTitle>` for a dynamic one. */
+  key: string;
+  title: string;
+  kind: "persisted" | "dynamic";
+  /** Set only for `kind === "persisted"`; used to navigate via `selectPage`. */
+  pageId?: string;
+}
+
+let recentPages: RecentEntry[] = [];
+
+/** Records a page-open event: moves an existing entry to the top (no duplicate) or inserts a new one, capped at RECENT_LIMIT. */
+function recordRecentOpen(entry: RecentEntry) {
+  recentPages = recentPages.filter((existing) => existing.key !== entry.key);
+  recentPages.unshift(entry);
+  if (recentPages.length > RECENT_LIMIT) recentPages.length = RECENT_LIMIT;
+  renderRecentList();
+}
+
+function renderRecentList() {
+  if (!recentListEl) return;
+  recentListEl.innerHTML = "";
+
+  if (recentPages.length === 0) {
+    recentEmptyEl?.removeAttribute("hidden");
+  } else {
+    recentEmptyEl?.setAttribute("hidden", "");
+  }
+
+  for (const entry of recentPages) {
+    const li = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = entry.title;
+    if (entry.kind === "persisted" && entry.pageId) {
+      const pageId = entry.pageId;
+      button.dataset.pageId = pageId;
+      button.addEventListener("click", () => void selectPage(pageId));
+    } else {
+      button.dataset.dynamicTitle = entry.title;
+      button.addEventListener("click", () => void openPageByTitle(entry.title));
+    }
+    li.appendChild(button);
+    recentListEl.appendChild(li);
+  }
+
+  highlightActivePage();
+}
+
 /**
  * Cancels any pending debounced autosave and immediately saves `markdown`
  * against whichever page is currently open, if not already saved.
@@ -79,8 +147,17 @@ async function flushSave(markdown: string) {
     if (currentPage.kind === "persisted") {
       await savePage(currentPage.id, markdown);
     } else {
+      const dynamicKey = `d:${currentPage.title}`;
       const summary = await materializeAndSavePage(currentPage.title, markdown);
       currentPage = { kind: "persisted", id: summary.id, inTrash: false, trashedFilename: null };
+      // Keep the Recent entry (if any) pointing at the same page now that it
+      // has materialized, rather than leaving a stale dynamic-kind entry.
+      recentPages = recentPages.map((entry) =>
+        entry.key === dynamicKey
+          ? { key: `p:${summary.id}`, title: summary.title, kind: "persisted", pageId: summary.id }
+          : entry
+      );
+      renderRecentList();
       await loadPages();
     }
   } catch (err) {
@@ -105,9 +182,16 @@ async function flushPendingSaveForCurrentPage() {
 }
 
 function highlightActivePage() {
+  const isActiveButton = (btn: HTMLButtonElement) => {
+    if (currentPage?.kind === "persisted") return btn.dataset.pageId === currentPage.id;
+    if (currentPage?.kind === "dynamic") return btn.dataset.dynamicTitle === currentPage.title;
+    return false;
+  };
   pageListEl?.querySelectorAll<HTMLButtonElement>("button").forEach((btn) => {
-    const isActive = currentPage?.kind === "persisted" && btn.dataset.pageId === currentPage.id;
-    btn.classList.toggle("active", isActive);
+    btn.classList.toggle("active", isActiveButton(btn));
+  });
+  recentListEl?.querySelectorAll<HTMLButtonElement>("button").forEach((btn) => {
+    btn.classList.toggle("active", isActiveButton(btn));
   });
 }
 
@@ -276,6 +360,16 @@ async function renderPageArticle(
 
 /** Opens whatever `resolution` points to: an existing persisted page, or a dynamic (unmaterialized) one. */
 async function openResolution(resolution: PageResolution) {
+  // Recent (issue 12) tracks last-*opened*, so every navigation here counts
+  // as an open -- including re-opening the already-active page (e.g. a
+  // different heading target on the same page) -- and moves it to the top
+  // rather than duplicating it.
+  recordRecentOpen(
+    resolution.kind === "persisted"
+      ? { key: `p:${resolution.id}`, title: resolution.title, kind: "persisted", pageId: resolution.id }
+      : { key: `d:${resolution.normalizedTitle}`, title: resolution.normalizedTitle, kind: "dynamic" }
+  );
+
   const alreadyOpen =
     (resolution.kind === "persisted" && currentPage?.kind === "persisted" && currentPage.id === resolution.id) ||
     (resolution.kind === "dynamic" &&
@@ -471,11 +565,68 @@ async function handleSelectVaultClick() {
   }
 }
 
+/**
+ * Search entry point (issue 12): reserves the sidebar UI slot the ticket
+ * calls for. Ticket 13 owns the actual search modal/UX -- this is a stub
+ * placeholder only.
+ */
+function handleSearchStub() {
+  window.alert("Search is coming soon (ticket 13).");
+}
+
+/**
+ * Compact-mode layout (issue 12): Desktop (Windows/Linux) gets a persistent,
+ * user-collapsible sidebar; Android gets a hamburger-triggered drawer,
+ * hidden by default. This project has no runtime OS-detection yet, so
+ * rather than build one for an MVP milestone with no Android device to test
+ * on, both behaviors are driven by one boolean -- "compact mode" -- and a
+ * viewport-width media query stands in as a *proxy* for "phone-sized
+ * screen." This is explicitly a proxy, not real platform detection: it will
+ * also fire on a narrow desktop window. Ticket 15 (actual Android bring-up)
+ * is expected to replace this with a real platform check (e.g.
+ * `@tauri-apps/plugin-os`) if the proxy proves wrong in practice.
+ */
+const COMPACT_MEDIA_QUERY = window.matchMedia("(max-width: 700px)");
+
+function closeSidebarDrawer() {
+  sidebarEl?.classList.remove("drawer-open");
+  sidebarOverlayEl?.setAttribute("hidden", "");
+}
+
+function applyLayoutMode() {
+  const compact = COMPACT_MEDIA_QUERY.matches;
+  workspaceEl?.classList.toggle("compact", compact);
+  // Neither mode's "hidden" state should leak into the other when the
+  // viewport crosses the threshold (e.g. resizing a window).
+  closeSidebarDrawer();
+}
+
 async function init() {
   selectVaultButtonEl?.addEventListener("click", handleSelectVaultClick);
   newPageButtonEl?.addEventListener("click", () => void handleNewPageClick());
   todayButtonEl?.addEventListener("click", () => void handleTodayClick());
   emptyTrashButtonEl?.addEventListener("click", () => void handleEmptyTrashClick());
+
+  searchButtonEl?.addEventListener("click", handleSearchStub);
+  // TODO(ticket 13): wire this to actually open the search UI instead of the stub.
+  window.addEventListener("keydown", (event) => {
+    const isSearchShortcut = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k";
+    if (!isSearchShortcut) return;
+    event.preventDefault();
+    handleSearchStub();
+  });
+
+  sidebarCollapseToggleEl?.addEventListener("click", () => {
+    workspaceEl?.classList.toggle("sidebar-collapsed");
+  });
+  sidebarOpenButtonEl?.addEventListener("click", () => {
+    sidebarEl?.classList.add("drawer-open");
+    sidebarOverlayEl?.removeAttribute("hidden");
+  });
+  sidebarCloseButtonEl?.addEventListener("click", closeSidebarDrawer);
+  sidebarOverlayEl?.addEventListener("click", closeSidebarDrawer);
+  COMPACT_MEDIA_QUERY.addEventListener("change", applyLayoutMode);
+  applyLayoutMode();
 
   const remembered = await getRememberedVault();
   if (remembered) {
