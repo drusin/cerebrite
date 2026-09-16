@@ -18,6 +18,15 @@ export interface PageContent {
   html: string;
 }
 
+/// Result of resolving a `[[Link]]` title (issue 05): either an existing
+/// persisted page (with its content, ready to display), or a dynamic page
+/// that has no backing file yet -- identified purely by its normalized
+/// title (see src-tauri/src/frontmatter.rs's `normalize_title` for the
+/// exact normalization rule).
+export type PageResolution =
+  | { kind: "persisted"; id: string; title: string; body: string; html: string }
+  | { kind: "dynamic"; normalizedTitle: string };
+
 export function getRememberedVault(): Promise<string | null> {
   return invoke("get_remembered_vault");
 }
@@ -51,4 +60,21 @@ export function savePage(id: string, markdownBody: string): Promise<void> {
 /// a page with that title already exists.
 export function createPage(title: string): Promise<PageSummary> {
   return invoke("create_page", { title });
+}
+
+/// Resolves a clicked `[[Link]]`'s raw title to either an existing
+/// persisted page or a not-yet-materialized dynamic page (issue 05). Used
+/// both for link-click navigation and (implicitly, by the caller) to decide
+/// whether a subsequent save must materialize the page first.
+export function resolvePage(title: string): Promise<PageResolution> {
+  return invoke("resolve_page", { title });
+}
+
+/// Materializes a dynamic page into a real persisted file the instant it
+/// receives its first write (ADR-0009): mints an id, derives a slug
+/// filename, writes frontmatter, then writes `markdownBody` as the body --
+/// using the exact same creation mechanics as `create_page`, not a
+/// from-scratch file write, so the frontmatter/id survive identically.
+export function materializeAndSavePage(title: string, markdownBody: string): Promise<PageSummary> {
+  return invoke("materialize_and_save_page", { title, markdownBody });
 }

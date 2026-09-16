@@ -199,6 +199,19 @@ body {
   margin: 0.6em 0;
 }
 
+.wiki-link-chip {
+  display: inline-block;
+  padding: 0.05em 0.5em;
+  border-radius: 1em;
+  background: rgba(57, 108, 216, 0.15);
+  color: #396cd8;
+  cursor: pointer;
+}
+
+.wiki-link-chip:hover {
+  background: rgba(57, 108, 216, 0.28);
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;
@@ -224,5 +237,14 @@ body {
 
   .page-list button:hover {
     background: rgba(255, 255, 255, 0.08);
+  }
+
+  .wiki-link-chip {
+    background: rgba(36, 200, 219, 0.2);
+    color: #24c8db;
+  }
+
+  .wiki-link-chip:hover {
+    background: rgba(36, 200, 219, 0.32);
   }
 }

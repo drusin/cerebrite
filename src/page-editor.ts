@@ -13,15 +13,32 @@ import { Editor, defaultValueCtx, editorViewCtx, rootCtx, serializerCtx } from "
 import { commonmark } from "@milkdown/kit/preset/commonmark";
 import { history } from "@milkdown/kit/plugin/history";
 import { listener, listenerCtx } from "@milkdown/kit/plugin/listener";
+import { wikiLinkPlugins } from "./wiki-link-plugin";
 
 export class PageEditor {
   #root: HTMLElement;
   #onChange: (markdown: string) => void;
+  #onLinkClick: (title: string) => void;
   #editor: Editor | null = null;
+  #handleClick: (event: MouseEvent) => void;
 
-  constructor(root: HTMLElement, onChange: (markdown: string) => void) {
+  constructor(root: HTMLElement, onChange: (markdown: string) => void, onLinkClick: (title: string) => void) {
     this.#root = root;
     this.#onChange = onChange;
+    this.#onLinkClick = onLinkClick;
+
+    // Delegated click handler for `[[Link]]` chips (issue 05): the chip is
+    // rendered as an atomic ProseMirror node (see wiki-link-plugin.ts), so a
+    // plain DOM click listener on the root -- rather than a custom NodeView
+    // -- is enough to intercept clicks on it.
+    this.#handleClick = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const chip = target.closest<HTMLElement>("[data-wiki-link-title]");
+      if (!chip) return;
+      event.preventDefault();
+      this.#onLinkClick(chip.dataset.wikiLinkTitle ?? "");
+    };
   }
 
   /** Tears down any existing instance and mounts a fresh editor over `markdown`. */
@@ -37,6 +54,7 @@ export class PageEditor {
       .use(commonmark)
       .use(history)
       .use(listener)
+      .use(wikiLinkPlugins)
       .create();
 
     editor.action((ctx) => {
@@ -46,6 +64,8 @@ export class PageEditor {
         }
       });
     });
+
+    this.#root.addEventListener("click", this.#handleClick);
 
     this.#editor = editor;
   }
@@ -61,6 +81,7 @@ export class PageEditor {
   }
 
   async destroy(): Promise<void> {
+    this.#root.removeEventListener("click", this.#handleClick);
     if (this.#editor) {
       const editor = this.#editor;
       this.#editor = null;

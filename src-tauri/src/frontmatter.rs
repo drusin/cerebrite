@@ -127,6 +127,24 @@ pub fn generate_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Normalizes a page title for link resolution (issue 05 / ADR-0009): a
+/// dynamic page has no file and no frontmatter id, so it's identified
+/// purely by this normalized form of its title.
+///
+/// The rule, chosen to be concrete and simple rather than clever: trim
+/// leading/trailing whitespace, collapse any internal run of whitespace to
+/// a single space, and lowercase the result. `split_whitespace` already
+/// gives us trim + collapse for free; lowercasing on top makes `[[Todo]]`,
+/// `[[ todo ]]` and `[[TODO]]` all resolve to the same page.
+///
+/// This same normalization is used to case/whitespace-insensitively match a
+/// link's title against existing persisted pages' titles (`resolve_page`)
+/// -- an existing page's own title/casing is never rewritten by this, only
+/// compared against.
+pub fn normalize_title(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
 /// Converts a page title into a filesystem-safe slug: lowercased, with any
 /// run of non-alphanumeric characters (spaces, punctuation, ...) collapsed
 /// into a single hyphen, and no leading/trailing hyphen. Unicode letters are
@@ -360,6 +378,25 @@ mod tests {
         assert_eq!(parsed.id, "abc-123");
         assert_eq!(parsed.title, "My New Page");
         assert_eq!(parsed.body, "");
+    }
+
+    #[test]
+    fn normalize_title_trims_and_collapses_whitespace() {
+        assert_eq!(normalize_title("  Some   Page  "), "some page");
+        assert_eq!(normalize_title("Some\tPage\n"), "some page");
+    }
+
+    #[test]
+    fn normalize_title_is_case_insensitive() {
+        assert_eq!(normalize_title("Todo"), "todo");
+        assert_eq!(normalize_title("TODO"), normalize_title("todo"));
+        assert_eq!(normalize_title("  ToDo  "), normalize_title("todo"));
+    }
+
+    #[test]
+    fn normalize_title_of_empty_or_whitespace_only_is_empty() {
+        assert_eq!(normalize_title(""), "");
+        assert_eq!(normalize_title("   "), "");
     }
 
     #[test]

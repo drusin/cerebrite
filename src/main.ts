@@ -6,7 +6,10 @@ import {
   getPage,
   savePage,
   createPage,
+  resolvePage,
+  materializeAndSavePage,
   type PageSummary,
+  type PageResolution,
 } from "./vault-api";
 import { PageEditor } from "./page-editor";
 
@@ -28,37 +31,64 @@ const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
 const pageTitleEl = document.querySelector<HTMLElement>("#page-title");
 const pageBodyEl = document.querySelector<HTMLElement>("#page-body");
 
-let selectedPageId: string | null = null;
+// The page currently loaded in the editor: either a persisted page (has an
+// id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
+// backing file until the first write materializes it.
+type OpenPage = { kind: "persisted"; id: string } | { kind: "dynamic"; title: string };
+
+let currentPage: OpenPage | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pageEditor: PageEditor | null = null;
 
-/** Cancels any pending debounced autosave and immediately saves `id` with `markdown`, if not already saved. */
-async function flushSave(id: string, markdown: string) {
+/**
+ * Cancels any pending debounced autosave and immediately saves `markdown`
+ * against whichever page is currently open, if not already saved.
+ *
+ * Branches per ADR-0009: a persisted page just saves normally; a dynamic
+ * page materializes first (same mechanics as the explicit "new page"
+ * action, issue 04) and then becomes the persisted page from now on.
+ */
+async function flushSave(markdown: string) {
   if (saveTimer !== null) {
     clearTimeout(saveTimer);
     saveTimer = null;
   }
+  if (!currentPage) return;
+
   try {
-    await savePage(id, markdown);
+    if (currentPage.kind === "persisted") {
+      await savePage(currentPage.id, markdown);
+    } else {
+      const summary = await materializeAndSavePage(currentPage.title, markdown);
+      currentPage = { kind: "persisted", id: summary.id };
+      await loadPages();
+    }
   } catch (err) {
-    console.error("Failed to save page", id, err);
+    console.error("Failed to save page", err);
   }
 }
 
-function scheduleAutosave(id: string, markdown: string) {
+function scheduleAutosave(markdown: string) {
   if (saveTimer !== null) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    void flushSave(id, markdown);
+    void flushSave(markdown);
   }, AUTOSAVE_DEBOUNCE_MS);
 }
 
 /** Flushes any pending save for the page currently loaded in the editor before switching away from it. */
 async function flushPendingSaveForCurrentPage() {
-  if (saveTimer === null || selectedPageId === null || !pageEditor) return;
+  if (saveTimer === null || !currentPage || !pageEditor) return;
   const markdown = pageEditor.getMarkdown();
   if (markdown === null) return;
-  await flushSave(selectedPageId, markdown);
+  await flushSave(markdown);
+}
+
+function highlightActivePage() {
+  pageListEl?.querySelectorAll<HTMLButtonElement>("button").forEach((btn) => {
+    const isActive = currentPage?.kind === "persisted" && btn.dataset.pageId === currentPage.id;
+    btn.classList.toggle("active", isActive);
+  });
 }
 
 function showVaultPicker(errorMessage?: string) {
@@ -89,39 +119,71 @@ function renderPageList(pages: PageSummary[]) {
     button.type = "button";
     button.textContent = page.title;
     button.dataset.pageId = page.id;
-    button.classList.toggle("active", page.id === selectedPageId);
-    button.addEventListener("click", () => selectPage(page.id));
+    button.classList.toggle("active", currentPage?.kind === "persisted" && page.id === currentPage.id);
+    button.addEventListener("click", () => void selectPage(page.id));
     li.appendChild(button);
     pageListEl.appendChild(li);
   }
 }
 
-async function selectPage(id: string) {
-  if (id === selectedPageId) return;
-
-  // Persist any unsaved edit on the page we're leaving before switching.
-  await flushPendingSaveForCurrentPage();
-
-  selectedPageId = id;
-  pageListEl
-    ?.querySelectorAll<HTMLButtonElement>("button")
-    .forEach((btn) => btn.classList.toggle("active", btn.dataset.pageId === id));
-
-  const page = await getPage(id);
-  if (pageTitleEl) pageTitleEl.textContent = page.title;
+/** Renders the title/body into the article view and (re)loads them into the editor. */
+async function renderPageArticle(title: string, body: string) {
+  if (pageTitleEl) pageTitleEl.textContent = title;
   pageViewEmptyEl?.setAttribute("hidden", "");
   pageArticleEl?.removeAttribute("hidden");
 
   if (pageBodyEl) {
     if (!pageEditor) {
-      // `selectedPageId` is read at callback time (not captured here), so
-      // this single instance stays correct across page switches.
-      pageEditor = new PageEditor(pageBodyEl, (markdown) => {
-        if (selectedPageId) scheduleAutosave(selectedPageId, markdown);
-      });
+      // `currentPage`/`scheduleAutosave` are read at callback time (not
+      // captured here), so this single instance stays correct across page
+      // switches -- including a dynamic page turning into a persisted one
+      // mid-session.
+      pageEditor = new PageEditor(
+        pageBodyEl,
+        (markdown) => scheduleAutosave(markdown),
+        (linkTitle) => void openPageByTitle(linkTitle)
+      );
     }
-    await pageEditor.load(page.body);
+    await pageEditor.load(body);
   }
+}
+
+/** Opens whatever `resolution` points to: an existing persisted page, or a dynamic (unmaterialized) one. */
+async function openResolution(resolution: PageResolution) {
+  const alreadyOpen =
+    (resolution.kind === "persisted" && currentPage?.kind === "persisted" && currentPage.id === resolution.id) ||
+    (resolution.kind === "dynamic" &&
+      currentPage?.kind === "dynamic" &&
+      currentPage.title === resolution.normalizedTitle);
+  if (alreadyOpen) return;
+
+  // Persist any unsaved edit on the page we're leaving before switching.
+  await flushPendingSaveForCurrentPage();
+
+  if (resolution.kind === "persisted") {
+    currentPage = { kind: "persisted", id: resolution.id };
+    highlightActivePage();
+    await renderPageArticle(resolution.title, resolution.body);
+  } else {
+    // Dynamic page (ADR-0009): UI-identical to a persisted page, but merely
+    // viewing it must not create a file -- no id, no file, just its
+    // normalized title, until the first write materializes it.
+    currentPage = { kind: "dynamic", title: resolution.normalizedTitle };
+    highlightActivePage();
+    await renderPageArticle(resolution.normalizedTitle, "");
+  }
+}
+
+async function selectPage(id: string) {
+  if (currentPage?.kind === "persisted" && currentPage.id === id) return;
+  const page = await getPage(id);
+  await openResolution({ kind: "persisted", id: page.id, title: page.title, body: page.body, html: page.html });
+}
+
+/** Navigates to whatever a clicked `[[Link]]` chip targets (issue 05). */
+async function openPageByTitle(rawTitle: string) {
+  const resolution = await resolvePage(rawTitle);
+  await openResolution(resolution);
 }
 
 async function loadPages() {
