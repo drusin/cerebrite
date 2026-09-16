@@ -111,6 +111,27 @@ pub fn build_index(conn: &mut Connection, vault_path: &Path) -> Result<usize> {
     Ok(pages.len())
 }
 
+/// Updates the derived index's `pages` and `pages_fts` rows for a single
+/// page id, in place -- used after a save so the index stays in sync without
+/// a full vault rebuild on every edit (per issue 03: debounce/only update on
+/// explicit save, not on every keystroke).
+pub fn update_page_content(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    body: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE pages SET title = ?1, body = ?2 WHERE id = ?3",
+        params![title, body, id],
+    )?;
+    conn.execute(
+        "UPDATE pages_fts SET title = ?1, body = ?2 WHERE id = ?3",
+        params![title, body, id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +216,31 @@ mod tests {
             elapsed.as_secs_f64() < 1.0,
             "index rebuild over 500 files took {elapsed:?}, expected sub-second"
         );
+    }
+
+    #[test]
+    fn update_page_content_updates_pages_and_fts_without_full_rebuild() {
+        let dir = tempdir().unwrap();
+        write_page(dir.path(), "one.md", "---\nid: one\ntitle: One\n---\nOriginal body.\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+
+        update_page_content(&conn, "one", "One", "Edited body with newword.\n").unwrap();
+
+        let body: String = conn
+            .query_row("SELECT body FROM pages WHERE id = 'one'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(body, "Edited body with newword.\n");
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pages_fts WHERE pages_fts MATCH 'newword'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
     }
 
     #[test]

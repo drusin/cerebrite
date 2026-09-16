@@ -172,6 +172,16 @@ body {
   opacity: 0.6;
 }
 
+.milkdown-root .ProseMirror {
+  outline: none;
+  min-height: 60vh;
+  line-height: 1.6;
+}
+
+.milkdown-root .ProseMirror p {
+  margin: 0.6em 0;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;

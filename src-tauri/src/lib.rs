@@ -140,6 +140,42 @@ fn get_page(state: State<AppState>, id: String) -> Result<PageContent, String> {
     })
 }
 
+/// Saves a page's edited body: preserves the file's existing frontmatter
+/// exactly, writes the new body, auto-commits the change to the vault's
+/// local git repo (ADR-0006 -- local commit only, no remote push/pull), and
+/// updates the derived index's row for this page so search stays in sync
+/// without a full rebuild.
+#[tauri::command]
+fn save_page(state: State<AppState>, id: String, markdown_body: String) -> Result<(), String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+
+    let mut db_guard = state.db.lock().unwrap();
+    let conn = db_guard.as_mut().ok_or("No vault is open")?;
+
+    let (title, path): (String, String) = conn
+        .query_row(
+            "SELECT title, path FROM pages WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let page_path = PathBuf::from(&path);
+    frontmatter::write_body(&page_path, &markdown_body).map_err(|e| e.to_string())?;
+
+    vault::commit_all(&vault_path, &format!("Update {title}")).map_err(|e| e.to_string())?;
+
+    // Re-parse from disk (rather than trusting `markdown_body` verbatim) so
+    // the index reflects exactly what write_body persisted.
+    let parsed = frontmatter::parse_and_ensure_id(&page_path).map_err(|e| e.to_string())?;
+    index::update_page_content(conn, &id, &parsed.title, &parsed.body).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -152,6 +188,7 @@ pub fn run() {
             open_vault,
             list_pages,
             get_page,
+            save_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

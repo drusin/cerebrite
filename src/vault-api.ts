@@ -37,3 +37,10 @@ export function listPages(): Promise<PageSummary[]> {
 export function getPage(id: string): Promise<PageContent> {
   return invoke("get_page", { id });
 }
+
+/// Saves a page's edited markdown body. The frontmatter block is preserved
+/// exactly by the Rust side (src-tauri/src/frontmatter.rs) -- the editor
+/// only ever sends the body.
+export function savePage(id: string, markdownBody: string): Promise<void> {
+  return invoke("save_page", { id, markdownBody });
+}

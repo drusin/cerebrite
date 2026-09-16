@@ -4,8 +4,15 @@ import {
   openVault,
   listPages,
   getPage,
+  savePage,
   type PageSummary,
 } from "./vault-api";
+import { PageEditor } from "./page-editor";
+
+// Autosave debounce: fires this long after the last edit with no further
+// typing, rather than on every keystroke or requiring an explicit "save"
+// action -- see issue 03's save-trigger note.
+const AUTOSAVE_DEBOUNCE_MS = 1500;
 
 const vaultPickerEl = document.querySelector<HTMLElement>("#vault-picker");
 const vaultPickerErrorEl = document.querySelector<HTMLElement>("#vault-picker-error");
@@ -20,6 +27,37 @@ const pageTitleEl = document.querySelector<HTMLElement>("#page-title");
 const pageBodyEl = document.querySelector<HTMLElement>("#page-body");
 
 let selectedPageId: string | null = null;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let pageEditor: PageEditor | null = null;
+
+/** Cancels any pending debounced autosave and immediately saves `id` with `markdown`, if not already saved. */
+async function flushSave(id: string, markdown: string) {
+  if (saveTimer !== null) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  try {
+    await savePage(id, markdown);
+  } catch (err) {
+    console.error("Failed to save page", id, err);
+  }
+}
+
+function scheduleAutosave(id: string, markdown: string) {
+  if (saveTimer !== null) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    void flushSave(id, markdown);
+  }, AUTOSAVE_DEBOUNCE_MS);
+}
+
+/** Flushes any pending save for the page currently loaded in the editor before switching away from it. */
+async function flushPendingSaveForCurrentPage() {
+  if (saveTimer === null || selectedPageId === null || !pageEditor) return;
+  const markdown = pageEditor.getMarkdown();
+  if (markdown === null) return;
+  await flushSave(selectedPageId, markdown);
+}
 
 function showVaultPicker(errorMessage?: string) {
   vaultPickerEl?.removeAttribute("hidden");
@@ -57,6 +95,11 @@ function renderPageList(pages: PageSummary[]) {
 }
 
 async function selectPage(id: string) {
+  if (id === selectedPageId) return;
+
+  // Persist any unsaved edit on the page we're leaving before switching.
+  await flushPendingSaveForCurrentPage();
+
   selectedPageId = id;
   pageListEl
     ?.querySelectorAll<HTMLButtonElement>("button")
@@ -64,9 +107,19 @@ async function selectPage(id: string) {
 
   const page = await getPage(id);
   if (pageTitleEl) pageTitleEl.textContent = page.title;
-  if (pageBodyEl) pageBodyEl.innerHTML = page.html;
   pageViewEmptyEl?.setAttribute("hidden", "");
   pageArticleEl?.removeAttribute("hidden");
+
+  if (pageBodyEl) {
+    if (!pageEditor) {
+      // `selectedPageId` is read at callback time (not captured here), so
+      // this single instance stays correct across page switches.
+      pageEditor = new PageEditor(pageBodyEl, (markdown) => {
+        if (selectedPageId) scheduleAutosave(selectedPageId, markdown);
+      });
+    }
+    await pageEditor.load(page.body);
+  }
 }
 
 async function loadPages() {

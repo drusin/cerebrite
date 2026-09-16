@@ -93,6 +93,33 @@ fn parse_content(content: &str, default_title: &str) -> (ParsedPage, Option<Stri
     )
 }
 
+/// Rewrites `content`'s body while preserving its existing frontmatter block
+/// (delimiters and raw YAML) exactly as found, byte-for-byte. This is the
+/// "serialize" counterpart to `split_frontmatter`/`parse_content`: the
+/// editor only ever produces a new body, never a new frontmatter block, so
+/// splicing the old frontmatter text back in is what keeps fields like `id`
+/// preserved exactly across a save (per ADR-0003 / issue 03). If `content`
+/// has no frontmatter block at all, `new_body` becomes the entire file.
+fn splice_body(content: &str, new_body: &str) -> String {
+    let (yaml_block, _old_body) = split_frontmatter(content);
+    match yaml_block {
+        Some(yaml) => format!("---\n{yaml}\n---\n{new_body}"),
+        None => new_body.to_string(),
+    }
+}
+
+/// Reads `path`, replaces its body with `new_body` while preserving the
+/// existing frontmatter block byte-for-byte, and writes the result back to
+/// disk.
+pub fn write_body(path: &Path, new_body: &str) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("reading page file {}", path.display()))?;
+    let new_content = splice_body(&content, new_body);
+    fs::write(path, new_content)
+        .with_context(|| format!("writing updated body to {}", path.display()))?;
+    Ok(())
+}
+
 /// Reads `path`, parses its frontmatter, generating and persisting a stable
 /// id if one is missing, and returns the resulting page (id, title, body).
 pub fn parse_and_ensure_id(path: &Path) -> Result<ParsedPage> {
@@ -187,6 +214,64 @@ mod tests {
 
         assert_eq!(parsed.id, "xyz");
         assert_eq!(parsed.title, "My Page Name");
+    }
+
+    #[test]
+    fn write_body_preserves_frontmatter_including_extra_fields() {
+        let dir = tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            "hello.md",
+            "---\nid: abc-123\ntitle: Hello World\ntags:\n  - foo\n  - bar\n---\nOld body.\n",
+        );
+
+        write_body(&path, "New body with *different* content.\n").unwrap();
+
+        let content_after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content_after,
+            "---\nid: abc-123\ntitle: Hello World\ntags:\n  - foo\n  - bar\n---\nNew body with *different* content.\n"
+        );
+
+        // Round-trip: re-parsing must still see the same id/title, and tags
+        // must remain in the raw frontmatter untouched.
+        let parsed = parse_and_ensure_id(&path).unwrap();
+        assert_eq!(parsed.id, "abc-123");
+        assert_eq!(parsed.title, "Hello World");
+        assert_eq!(parsed.body, "New body with *different* content.\n");
+        assert!(content_after.contains("tags:\n  - foo\n  - bar"));
+    }
+
+    #[test]
+    fn write_body_round_trip_parse_mutate_serialize_reparse() {
+        let dir = tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            "page.md",
+            "---\nid: keep-me\ntitle: Keep Title\ntags: [a, b]\n---\nOriginal body text.\n",
+        );
+
+        let before = parse_and_ensure_id(&path).unwrap();
+        write_body(&path, "Edited body text.\n").unwrap();
+        let after = parse_and_ensure_id(&path).unwrap();
+
+        assert_eq!(before.id, after.id);
+        assert_eq!(before.title, after.title);
+        assert_eq!(after.body, "Edited body text.\n");
+
+        let content_after = fs::read_to_string(&path).unwrap();
+        assert!(content_after.contains("tags: [a, b]"));
+    }
+
+    #[test]
+    fn write_body_on_file_with_no_frontmatter_writes_body_as_is() {
+        let dir = tempdir().unwrap();
+        let path = write_file(dir.path(), "plain.md", "Original plain content.\n");
+
+        write_body(&path, "Replaced plain content.\n").unwrap();
+
+        let content_after = fs::read_to_string(&path).unwrap();
+        assert_eq!(content_after, "Replaced plain content.\n");
     }
 
     #[test]
