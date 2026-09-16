@@ -23,10 +23,11 @@ A written MVP spec for Cerebrite — a git-native, markdown-based, Logseq-inspir
 - [Tag system](issues/09-tag-system.md): tags are pure syntax sugar for a page link, no separate identity anywhere downstream. Inline `#tagname` / `#[[multi word tag]]` and frontmatter `tags: [foo, bar]` (persisted pages only) both resolve through the same dynamic/persisted page mechanism as `[[link]]` (ADR-0009); flat, no hierarchy; same WYSIWYG chip rendering as a link.
 - [Daily notes](issues/10-daily-notes.md): first-class but lightweight — a page is a daily note purely by having a title that exactly matches ISO-8601 `YYYY-MM-DD`, no frontmatter flag, no new page type ([Daily note](../../CONTEXT.md) glossary entry). Sidebar's reserved slot is a single "Today" shortcut, navigating to today's date as an ordinary dynamic page; no calendar, no prev/next navigation — cut from MVP.
 - [Search UI/UX](issues/11-search-ui-ux.md): one modal overlay (sidebar button + Ctrl/Cmd+K), searching title/tags/body together in one query, ranked in three strict tiers (title match → tag match → BM25 body match), one row per page with a best-section snippet. Trash excluded from default results (explicit checkbox to include); no tag/date filters at MVP; empty state offers "Create page" wired to the existing new-page action.
+- [Backlinks display](issues/12-backlinks-display.md): a single "Backlinks" section always appended at the bottom of a page, rolling up links to the page itself and to any heading within it into one list, grouped by source page (most-recently-modified source first) with a per-entry target-heading label and search-style snippet. Trashed sources excluded, tags fully indistinguishable from ordinary links, click-through jumps to the linking location, empty state shows "No backlinks yet".
 
 ## Not yet specified
 
-(empty — all fog graduated into tickets: [07](issues/07-page-creation-deletion-ux.md), [08](issues/08-navigation-sidebar-ui-structure.md), [09](issues/09-tag-system.md), [10](issues/10-daily-notes.md), [11](issues/11-search-ui-ux.md), [12](issues/12-backlinks-display.md))
+(empty — all fog has graduated into tickets, and every ticket is now resolved)
 
 ## Out of scope
 
