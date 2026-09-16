@@ -22,3 +22,13 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local/throwaway Android signing material (ticket 16, packaging-and-install).
+# Never commit real or dev keystores or their passwords -- see
+# docs/install.md for how to generate a throwaway dev keystore locally and
+# src-tauri/gen/android/keystore.properties.example for the real signing
+# setup a human must do before a production release.
+src-tauri/gen/android/keystore-dev/
+src-tauri/gen/android/keystore.properties
+*.jks
+*.keystore

@@ -1,7 +1,10 @@
 name: CI
 
 # Builds the Windows and Linux desktop targets on every push, per
-# .scratch/cerebrite-mvp-implementation/issues/01-project-scaffold.md.
+# .scratch/cerebrite-mvp-implementation/issues/01-project-scaffold.md, and
+# (ticket 16, packaging-and-install) bundles the actual sideload installers:
+# an unsigned NSIS `-setup.exe` on Windows and an AppImage on Linux. See
+# docs/install.md for end-user install instructions for both.
 # android-smoke-apk.yml separately proves Tauri's Android target builds at
 # all (via a throwaway scaffolded app, nothing committed) - it does not build
 # this app's own Android target. That's ticket 15 (android-build-and-editor-
@@ -57,13 +60,45 @@ jobs:
         working-directory: src-tauri
         run: cargo test
 
-      - name: Build desktop app
-        working-directory: src-tauri
-        run: cargo build --release
+      # Ticket 16 (packaging-and-install): build the actual sideload
+      # installers, not just a bare compiled binary, so CI is the source of
+      # the artifacts an end user installs from. `tauri build` bundles per
+      # tauri.conf.json's `bundle.targets: "all"`, but each OS only produces
+      # the bundle formats it can build (NSIS/MSI on Windows, AppImage/deb/
+      # rpm on Linux) -- `--bundles` narrows it to exactly the one artifact
+      # each platform needs here, per 03-packaging-and-install.md's answer:
+      # unsigned NSIS on Windows, AppImage on Linux. This also performs the
+      # `cargo build --release` the old step did, so it isn't duplicated.
+      - name: Build desktop app + Linux AppImage
+        if: matrix.os == 'ubuntu-latest'
+        run: npx tauri build --bundles appimage
+
+      - name: Build desktop app + Windows NSIS installer
+        if: matrix.os == 'windows-latest'
+        run: npx tauri build --bundles nsis
 
       - name: Upload built binary
         uses: actions/upload-artifact@v4
         with:
           name: cerebrite-${{ matrix.os }}
           path: src-tauri/target/release/cerebrite${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+          if-no-files-found: error
+
+      # Unsigned NSIS `-setup.exe` -- see docs/install.md for the SmartScreen
+      # "Run anyway" click-through end users will need.
+      - name: Upload Windows NSIS installer
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cerebrite-windows-nsis-installer
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
+      # AppImage -- see docs/install.md for the fuse2 caveat on Arch/CachyOS.
+      - name: Upload Linux AppImage
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cerebrite-linux-appimage
+          path: src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
