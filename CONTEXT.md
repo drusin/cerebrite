@@ -24,6 +24,10 @@ _Avoid_: Block (implies arbitrary/nested granularity broader than what's support
 A file whose only metadata lives in its YAML frontmatter — no inline block IDs, no injected HTML comments, no other markup appended into the body to serve the tool. Editors are free to reformat the body on save; "clean" is about what content is permitted in the file, not about minimizing diffs between saves.
 _Avoid_: Round-trip-safe, diff-clean (both wrongly imply a diff-minimization guarantee that clean markdown does not make)
 
+**Tag**:
+Pure syntax sugar for a link to a [page](#language) — `#tagname` or `#[[multi word tag]]` inline, or a `tags:` YAML list in a persisted page's frontmatter. Resolves through the identical dynamic/persisted page mechanism as `[[link]]` (see [ADR-0009](docs/adr/0009-dynamic-pages-materialize-on-first-write.md)): no separate identity, no separate entry in the derived index, same [backlink](#language) it would produce as an ordinary link. Adding a frontmatter tag to a dynamic page is a write like any other, so it materializes the page same as writing its body would.
+_Avoid_: Label, category (both imply a distinct classification system; a tag is exactly a link, not a second mechanism)
+
 **Backlink**:
 A reference, surfaced to the reader, from one linkable entity to every other linkable entity that links to it. The only graph feature in the MVP.
 _Avoid_: Graph view, graph query (both are post-MVP capabilities built on top of backlinks, not synonyms for it)
