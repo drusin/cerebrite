@@ -10,10 +10,11 @@
 // .scratch/cerebrite-mvp/issues/02-wysiwyg-editor-component.md for why
 // Milkdown was chosen over Tiptap here).
 import { Editor, defaultValueCtx, editorViewCtx, rootCtx, serializerCtx } from "@milkdown/kit/core";
-import { commonmark } from "@milkdown/kit/preset/commonmark";
+import { commonmark, headingIdGenerator } from "@milkdown/kit/preset/commonmark";
 import { history } from "@milkdown/kit/plugin/history";
 import { listener, listenerCtx } from "@milkdown/kit/plugin/listener";
 import { wikiLinkPlugins } from "./wiki-link-plugin";
+import { slugifyHeadingText } from "./heading-slug";
 
 export class PageEditor {
   #root: HTMLElement;
@@ -50,6 +51,26 @@ export class PageEditor {
       .config((ctx) => {
         ctx.set(rootCtx, this.#root);
         ctx.set(defaultValueCtx, markdown);
+        // Heading-level linking (issue 07 / ADR-0005): the editor is the
+        // only place page content renders (there's no separate read-only
+        // HTML view -- markdown.rs's HTML renderer is unused by the
+        // frontend), so headings need addressable ids right inside the
+        // ProseMirror DOM. Milkdown's commonmark preset already ships a
+        // `headingIdGenerator` context slice plus a plugin
+        // (`syncHeadingIdPlugin`) that keeps every heading node's `id`
+        // attribute (and therefore its rendered `<h2 id="...">`) in sync
+        // with its text, deduping repeats within the page automatically.
+        // Overriding the generator to use the same base slug scheme as the
+        // Rust side (`slugifyHeadingText`, mirroring
+        // src-tauri/src/heading_slug.rs) makes a heading's DOM id match
+        // exactly what a `[[Page#Heading]]` link resolves to, for the (by
+        // far most common) case of no duplicate heading text on the page.
+        // Milkdown's own dedup suffix format (`-#2`, `-#3`) differs from the
+        // Rust side's (`-2`, `-3`) for the edge case of repeated headings --
+        // left as a known, documented mismatch rather than replacing
+        // Milkdown's built-in plugin, since duplicate heading text within one
+        // page is rare and this can't be visually verified here anyway.
+        ctx.set(headingIdGenerator.key, (node) => slugifyHeadingText(node.textContent));
       })
       .use(commonmark)
       .use(history)
@@ -68,6 +89,20 @@ export class PageEditor {
     this.#root.addEventListener("click", this.#handleClick);
 
     this.#editor = editor;
+  }
+
+  /**
+   * Scrolls the heading whose id matches `headingSlug` into view (ticket 07's
+   * click-through-to-heading requirement), if one exists in the currently
+   * mounted document. A no-op (returns `false`) when nothing matches -- e.g.
+   * the link's heading fragment doesn't exist on this page -- so callers
+   * don't need to special-case that themselves.
+   */
+  scrollToHeading(headingSlug: string): boolean {
+    const target = this.#root.querySelector<HTMLElement>(`#${CSS.escape(headingSlug)}`);
+    if (!target) return false;
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+    return true;
   }
 
   /** Serializes the current document back to markdown, or `null` if nothing is mounted. */

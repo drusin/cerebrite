@@ -29,10 +29,13 @@
 // wired up the same way Milkdown's own commonmark preset wires up its
 // node/mark schemas.
 //
-// Scope: page-level links only. `[[Page#Heading]]` (heading-level linking,
-// ticket 07) is not special-cased here -- it would currently be treated as
-// a page-level link whose raw title happens to contain a `#`, which is an
-// acceptable, documented limitation until ticket 07 refines it.
+// `[[Page#Heading]]` (heading-level linking, ticket 07) is not special-cased
+// here -- the chip's `title` attribute carries the raw bracket contents
+// verbatim (e.g. "Page#Heading"), `#` included, exactly as typed. It's the
+// Rust side (resolve_page, links.rs) and main.ts's navigation that split the
+// page target from the heading fragment; this plugin only needs to keep the
+// round trip exact, which it already does for any raw text a `[[...]]` can
+// contain.
 import { findAndReplace } from "mdast-util-find-and-replace";
 import type { Root as MdastRoot } from "mdast";
 import { $inputRule, $nodeSchema, $remark } from "@milkdown/kit/utils";

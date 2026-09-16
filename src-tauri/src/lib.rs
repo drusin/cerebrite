@@ -1,4 +1,5 @@
 mod frontmatter;
+mod heading_slug;
 mod index;
 mod links;
 mod markdown;
@@ -50,6 +51,10 @@ pub struct BacklinkEntry {
     source_title: String,
     snippet: String,
     modified_at: i64,
+    /// The target heading's slug (ticket 07), present only when the link
+    /// that produced this entry targeted a heading rather than the page
+    /// itself -- the frontend renders a "→ Heading" label when this is set.
+    target_heading_slug: Option<String>,
 }
 
 impl From<index::BacklinkEntry> for BacklinkEntry {
@@ -59,6 +64,7 @@ impl From<index::BacklinkEntry> for BacklinkEntry {
             source_title: entry.source_title,
             snippet: entry.snippet,
             modified_at: entry.modified_at,
+            target_heading_slug: entry.target_heading_slug,
         }
     }
 }
@@ -80,9 +86,21 @@ pub enum PageResolution {
         title: String,
         body: String,
         html: String,
+        /// The target heading's slug (ticket 07), if the resolved `[[Link]]`
+        /// included a `#Heading` fragment -- the frontend uses this to
+        /// scroll to that heading after navigating to the page.
+        heading_slug: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
-    Dynamic { normalized_title: String },
+    Dynamic {
+        normalized_title: String,
+        /// Per the ticket: a link to a heading that doesn't (yet) exist
+        /// behaves like a page-level dynamic link -- there is no
+        /// heading-specific dynamic target, so this is carried through only
+        /// for consistency/debugging, never acted on by the frontend for a
+        /// dynamic page.
+        heading_slug: Option<String>,
+    },
 }
 
 fn derived_index_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -297,15 +315,31 @@ fn create_page_impl(state: &AppState, title: &str) -> Result<PageSummary, String
     })
 }
 
-/// Resolves a `[[Link]]`'s raw title (issue 05): finds an existing
-/// persisted page by case/whitespace-insensitive title match
-/// (`frontmatter::normalize_title`), or -- if none matches -- reports a
+/// Resolves a `[[Link]]`'s raw title (issue 05), which may carry a trailing
+/// `#Heading` fragment (ticket 07): finds an existing persisted page by
+/// case/whitespace-insensitive title match (`frontmatter::normalize_title`)
+/// against the part before the `#`, or -- if none matches -- reports a
 /// dynamic page identified by that normalized title. Used both for
 /// link-click navigation and by the editor's save path to decide whether a
 /// save must materialize the page first.
 #[tauri::command]
 fn resolve_page(state: State<AppState>, title: String) -> Result<PageResolution, String> {
     resolve_page_impl(&state, &title)
+}
+
+/// Splits a raw `[[Link]]` title into its page-level target text and (if
+/// present) its target heading's slug -- shared by `resolve_page_impl` so
+/// navigation and the underlying link-extraction logic (`links.rs`) treat
+/// the `#Heading` fragment identically.
+fn split_title_and_heading_slug(raw_title: &str) -> (&str, Option<String>) {
+    let mut parts = raw_title.splitn(2, '#');
+    let page_title = parts.next().unwrap_or("").trim();
+    let heading_slug = parts
+        .next()
+        .map(str::trim)
+        .filter(|fragment| !fragment.is_empty())
+        .map(heading_slug::slugify_heading);
+    (page_title, heading_slug)
 }
 
 /// Shared implementation behind `resolve_page`, split out (like
@@ -315,7 +349,8 @@ fn resolve_page_impl(state: &AppState, title: &str) -> Result<PageResolution, St
     let guard = state.db.lock().unwrap();
     let conn = guard.as_ref().ok_or("No vault is open")?;
 
-    let normalized = frontmatter::normalize_title(&title);
+    let (page_title, heading_slug) = split_title_and_heading_slug(title);
+    let normalized = frontmatter::normalize_title(page_title);
 
     let mut stmt = conn
         .prepare("SELECT id, title, body FROM pages")
@@ -333,12 +368,14 @@ fn resolve_page_impl(state: &AppState, title: &str) -> Result<PageResolution, St
                 title: page_title,
                 body,
                 html,
+                heading_slug,
             });
         }
     }
 
     Ok(PageResolution::Dynamic {
         normalized_title: normalized,
+        heading_slug,
     })
 }
 
@@ -474,7 +511,8 @@ mod tests {
         assert_eq!(
             resolution,
             PageResolution::Dynamic {
-                normalized_title: "some new thing".to_string()
+                normalized_title: "some new thing".to_string(),
+                heading_slug: None,
             }
         );
     }
@@ -490,7 +528,8 @@ mod tests {
         assert_eq!(
             resolution,
             PageResolution::Dynamic {
-                normalized_title: "nonexistent page".to_string()
+                normalized_title: "nonexistent page".to_string(),
+                heading_slug: None,
             }
         );
     }
@@ -620,6 +659,53 @@ mod tests {
         let updated = get_backlinks_impl(&state, "New Target").unwrap();
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].source_id, "s1");
+    }
+
+    #[test]
+    fn resolve_page_carries_the_heading_slug_for_a_persisted_target() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "hello.md", "---\nid: abc-123\ntitle: Hello World\n---\nBody.\n");
+        let state = setup_vault(&dir);
+
+        let resolution = resolve_page_impl(&state, "Hello World#Some Heading").unwrap();
+
+        match resolution {
+            PageResolution::Persisted { id, heading_slug, .. } => {
+                assert_eq!(id, "abc-123");
+                assert_eq!(heading_slug.as_deref(), Some("some-heading"));
+            }
+            PageResolution::Dynamic { .. } => panic!("expected a persisted match"),
+        }
+    }
+
+    #[test]
+    fn resolve_page_carries_the_heading_slug_for_a_dynamic_target() {
+        let dir = TempDir::new().unwrap();
+        let state = setup_vault(&dir);
+
+        let resolution = resolve_page_impl(&state, "Nonexistent#Setup").unwrap();
+
+        assert_eq!(
+            resolution,
+            PageResolution::Dynamic {
+                normalized_title: "nonexistent".to_string(),
+                heading_slug: Some("setup".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_page_without_a_heading_fragment_has_no_heading_slug() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "hello.md", "---\nid: abc-123\ntitle: Hello World\n---\nBody.\n");
+        let state = setup_vault(&dir);
+
+        let resolution = resolve_page_impl(&state, "Hello World").unwrap();
+
+        match resolution {
+            PageResolution::Persisted { heading_slug, .. } => assert_eq!(heading_slug, None),
+            PageResolution::Dynamic { .. } => panic!("expected a persisted match"),
+        }
     }
 
     #[test]

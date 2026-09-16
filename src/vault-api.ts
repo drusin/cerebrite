@@ -23,9 +23,16 @@ export interface PageContent {
 /// that has no backing file yet -- identified purely by its normalized
 /// title (see src-tauri/src/frontmatter.rs's `normalize_title` for the
 /// exact normalization rule).
+///
+/// `headingSlug` (ticket 07) is set when the resolved link included a
+/// `#Heading` fragment -- the caller uses it to scroll to that heading after
+/// navigating. Per the ticket, a heading-specific dynamic target isn't a
+/// thing (only whole pages materialize, ADR-0009), so `headingSlug` on a
+/// dynamic resolution is carried through for consistency only and never
+/// acted on.
 export type PageResolution =
-  | { kind: "persisted"; id: string; title: string; body: string; html: string }
-  | { kind: "dynamic"; normalizedTitle: string };
+  | { kind: "persisted"; id: string; title: string; body: string; html: string; headingSlug?: string | null }
+  | { kind: "dynamic"; normalizedTitle: string; headingSlug?: string | null };
 
 export function getRememberedVault(): Promise<string | null> {
   return invoke("get_remembered_vault");
@@ -71,12 +78,15 @@ export function resolvePage(title: string): Promise<PageResolution> {
 }
 
 /// One grouped-by-source-page backlink entry (issue 06), as returned by
-/// `get_backlinks`.
+/// `get_backlinks`. `targetHeadingSlug` (ticket 07) is set when the link that
+/// produced this entry targeted a heading (`[[Page#Heading]]`) rather than
+/// the page itself.
 export interface BacklinkEntry {
   sourceId: string;
   sourceTitle: string;
   snippet: string;
   modifiedAt: number;
+  targetHeadingSlug?: string | null;
 }
 
 /// Returns every backlink pointing at the page titled `title`, grouped by

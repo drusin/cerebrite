@@ -32,6 +32,10 @@ pub struct BacklinkEntry {
     pub source_title: String,
     pub snippet: String,
     pub modified_at: i64,
+    /// The target heading's slug (ticket 07), if the link that produced this
+    /// entry targeted a heading (`[[Page#Heading]]`) rather than the page
+    /// itself.
+    pub target_heading_slug: Option<String>,
 }
 
 /// Current wall-clock time as a unix-epoch second count, used to timestamp
@@ -126,7 +130,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE backlinks (
              source_id TEXT NOT NULL,
              target_normalized_title TEXT NOT NULL,
-             snippet TEXT NOT NULL
+             snippet TEXT NOT NULL,
+             target_heading_slug TEXT
          );
 
          CREATE INDEX idx_backlinks_target ON backlinks(target_normalized_title);
@@ -182,10 +187,11 @@ pub fn build_index(conn: &mut Connection, vault_path: &Path) -> Result<usize> {
 pub fn replace_page_links(conn: &Connection, source_id: &str, body: &str) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM backlinks WHERE source_id = ?1", params![source_id])?;
 
-    let mut insert =
-        conn.prepare("INSERT INTO backlinks (source_id, target_normalized_title, snippet) VALUES (?1, ?2, ?3)")?;
+    let mut insert = conn.prepare(
+        "INSERT INTO backlinks (source_id, target_normalized_title, snippet, target_heading_slug) VALUES (?1, ?2, ?3, ?4)",
+    )?;
     for link in links::extract_links(body) {
-        insert.execute(params![source_id, link.normalized_target, link.snippet])?;
+        insert.execute(params![source_id, link.normalized_target, link.snippet, link.heading_slug])?;
     }
     Ok(())
 }
@@ -198,7 +204,7 @@ pub fn replace_page_links(conn: &Connection, source_id: &str, body: &str) -> rus
 /// for the target itself.
 pub fn get_backlinks(conn: &Connection, normalized_target: &str) -> rusqlite::Result<Vec<BacklinkEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT b.source_id, p.title, b.snippet, p.modified_at
+        "SELECT b.source_id, p.title, b.snippet, p.modified_at, b.target_heading_slug
          FROM backlinks b
          JOIN pages p ON p.id = b.source_id
          WHERE b.target_normalized_title = ?1
@@ -210,6 +216,7 @@ pub fn get_backlinks(conn: &Connection, normalized_target: &str) -> rusqlite::Re
             source_title: row.get(1)?,
             snippet: row.get(2)?,
             modified_at: row.get(3)?,
+            target_heading_slug: row.get(4)?,
         })
     })?;
     rows.collect()
@@ -421,6 +428,27 @@ mod tests {
         assert!(entries[0].snippet.contains("[[B]]"));
 
         assert!(get_backlinks(&conn, "a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn backlinks_carry_the_target_heading_slug_when_present() {
+        let dir = tempdir().unwrap();
+        write_page(
+            dir.path(),
+            "a.md",
+            "---\nid: a\ntitle: A\n---\nSee [[B#Some Heading]] and also [[B]] plain.\n",
+        );
+        write_page(dir.path(), "b.md", "---\nid: b\ntitle: B\n---\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+
+        let mut entries = get_backlinks(&conn, "b").unwrap();
+        entries.sort_by(|a, b| a.target_heading_slug.cmp(&b.target_heading_slug));
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].target_heading_slug, None);
+        assert_eq!(entries[1].target_heading_slug.as_deref(), Some("some-heading"));
     }
 
     #[test]

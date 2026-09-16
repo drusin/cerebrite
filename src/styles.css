@@ -270,6 +270,13 @@ body {
   opacity: 1;
 }
 
+.backlink-heading-label {
+  display: block;
+  margin: 0 0 0 1.5em;
+  font-size: 0.85em;
+  opacity: 0.6;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;

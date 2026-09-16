@@ -9,9 +9,10 @@
 //
 // Two edge cases the ticket calls out explicitly:
 //   - A trailing `#heading` fragment (`[[Page#Heading]]`, ticket 07 syntax)
-//     is tolerated by only taking the text before the first `#` as the
-//     target title, rather than crashing or treating the whole `Page#Heading`
-//     string as a literal (and never-matching) target.
+//     is split off: the text before the first `#` is the target page title,
+//     and the text after it is slugified (`heading_slug::slugify_heading`,
+//     ADR-0005) into the target heading's slug, carried alongside the page
+//     target rather than discarded.
 //   - Incidental double-bracket text: the pattern requires two literal `[`
 //     immediately followed eventually by two literal `]` with nothing but a
 //     single line of non-bracket text in between, so unmatched brackets
@@ -22,6 +23,7 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 use crate::frontmatter::normalize_title;
+use crate::heading_slug::slugify_heading;
 
 /// One `[[...]]` occurrence found in a page's body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +33,9 @@ pub struct LinkOccurrence {
     /// and a target page's own title compare equal regardless of casing or
     /// whitespace.
     pub normalized_target: String,
+    /// The target heading's slug (ticket 07), if the link included a
+    /// `#Heading` fragment -- `None` for a plain page-level link.
+    pub heading_slug: Option<String>,
     /// ~80-100 characters of surrounding plain text from the source body,
     /// for display in the target page's Backlinks section.
     pub snippet: String,
@@ -55,15 +60,25 @@ pub fn extract_links(body: &str) -> Vec<LinkOccurrence> {
         let whole = capture.get(0).expect("capture group 0 always matches");
         let raw_title = capture.get(1).expect("capture group 1 always matches").as_str();
 
-        // Strip a trailing `#heading` fragment (ticket 07 syntax), if any --
-        // this ticket only tracks page-level targets.
-        let target_text = raw_title.split('#').next().unwrap_or("").trim();
+        // Split off a trailing `#heading` fragment (ticket 07 syntax), if
+        // any: the part before the first `#` is the page-level target, the
+        // part after it (if non-empty once trimmed) is the target heading's
+        // slug.
+        let mut parts = raw_title.splitn(2, '#');
+        let target_text = parts.next().unwrap_or("").trim();
+        let heading_slug = parts
+            .next()
+            .map(str::trim)
+            .filter(|fragment| !fragment.is_empty())
+            .map(slugify_heading);
+
         if target_text.is_empty() {
             continue;
         }
 
         out.push(LinkOccurrence {
             normalized_target: normalize_title(target_text),
+            heading_slug,
             snippet: build_snippet(body, whole.start(), whole.end()),
         });
     }
@@ -120,6 +135,7 @@ mod tests {
         let links = extract_links(body);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].normalized_target, "target page");
+        assert_eq!(links[0].heading_slug, None);
         assert!(links[0].snippet.contains("[[Target Page]]"));
     }
 
@@ -132,11 +148,29 @@ mod tests {
     }
 
     #[test]
-    fn strips_trailing_heading_fragment() {
+    fn captures_trailing_heading_fragment_as_a_slug() {
         let body = "See [[Some Page#A Heading]] for more.";
         let links = extract_links(body);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].normalized_target, "some page");
+        assert_eq!(links[0].heading_slug.as_deref(), Some("a-heading"));
+    }
+
+    #[test]
+    fn page_only_link_has_no_heading_slug() {
+        let body = "See [[Some Page]] for more.";
+        let links = extract_links(body);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].heading_slug, None);
+    }
+
+    #[test]
+    fn empty_heading_fragment_is_treated_as_a_page_only_link() {
+        let body = "See [[Some Page#]] for more.";
+        let links = extract_links(body);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].normalized_target, "some page");
+        assert_eq!(links[0].heading_slug, None);
     }
 
     #[test]

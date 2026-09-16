@@ -13,6 +13,7 @@ import {
   type PageResolution,
 } from "./vault-api";
 import { PageEditor } from "./page-editor";
+import { humanizeHeadingSlug } from "./heading-slug";
 
 // Autosave debounce: fires this long after the last edit with no further
 // typing, rather than on every keystroke or requiring an explicit "save"
@@ -171,12 +172,30 @@ async function renderBacklinks(title: string) {
     snippetButton.textContent = entry.snippet;
     snippetButton.addEventListener("click", () => void selectPage(entry.sourceId));
     item.appendChild(snippetButton);
+
+    // Per-entry target-heading label (ticket 07): shown only when the link
+    // that produced this entry targeted a heading rather than the page
+    // itself. The label is a best-effort reversal of the stored slug (see
+    // heading-slug.ts's `humanizeHeadingSlug`) since only the slug, not the
+    // original heading text, is persisted.
+    if (entry.targetHeadingSlug) {
+      const headingLabel = document.createElement("span");
+      headingLabel.className = "backlink-heading-label";
+      headingLabel.textContent = `→ ${humanizeHeadingSlug(entry.targetHeadingSlug)}`;
+      item.appendChild(headingLabel);
+    }
+
     backlinksListEl.appendChild(item);
   }
 }
 
-/** Renders the title/body into the article view and (re)loads them into the editor. */
-async function renderPageArticle(title: string, body: string) {
+/**
+ * Renders the title/body into the article view and (re)loads them into the
+ * editor. `headingSlug` (ticket 07), if given, is the target heading of the
+ * `[[Page#Heading]]` link that navigated here -- once the fresh content is
+ * mounted, the matching heading (if any) is scrolled into view.
+ */
+async function renderPageArticle(title: string, body: string, headingSlug?: string | null) {
   if (pageTitleEl) pageTitleEl.textContent = title;
   pageViewEmptyEl?.setAttribute("hidden", "");
   pageArticleEl?.removeAttribute("hidden");
@@ -194,6 +213,14 @@ async function renderPageArticle(title: string, body: string) {
       );
     }
     await pageEditor.load(body);
+
+    // Click-through-to-heading (ticket 07): a link to a heading that
+    // doesn't (yet) exist on the target page is simply a no-op scroll here
+    // -- the page itself still opens normally, per the ticket's "behaves
+    // like a dynamic-page link at the page level" acceptance criterion.
+    if (headingSlug) {
+      pageEditor.scrollToHeading(headingSlug);
+    }
   }
 
   // Always appended at the bottom of the page's rendered content (issue 06),
@@ -209,7 +236,12 @@ async function openResolution(resolution: PageResolution) {
     (resolution.kind === "dynamic" &&
       currentPage?.kind === "dynamic" &&
       currentPage.title === resolution.normalizedTitle);
-  if (alreadyOpen) return;
+  // Even when the page is already open, a heading-targeted link still needs
+  // to scroll -- only skip the (re)load, not the scroll.
+  if (alreadyOpen) {
+    if (resolution.headingSlug) pageEditor?.scrollToHeading(resolution.headingSlug);
+    return;
+  }
 
   // Persist any unsaved edit on the page we're leaving before switching.
   await flushPendingSaveForCurrentPage();
@@ -217,11 +249,13 @@ async function openResolution(resolution: PageResolution) {
   if (resolution.kind === "persisted") {
     currentPage = { kind: "persisted", id: resolution.id };
     highlightActivePage();
-    await renderPageArticle(resolution.title, resolution.body);
+    await renderPageArticle(resolution.title, resolution.body, resolution.headingSlug);
   } else {
     // Dynamic page (ADR-0009): UI-identical to a persisted page, but merely
     // viewing it must not create a file -- no id, no file, just its
-    // normalized title, until the first write materializes it.
+    // normalized title, until the first write materializes it. Per the
+    // ticket, a heading-specific dynamic target isn't a thing, so
+    // `resolution.headingSlug` is intentionally not passed through here.
     currentPage = { kind: "dynamic", title: resolution.normalizedTitle };
     highlightActivePage();
     await renderPageArticle(resolution.normalizedTitle, "");
