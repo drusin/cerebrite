@@ -13,9 +13,11 @@ import {
   restorePage,
   emptyTrash,
   listTrashedPages,
+  searchPages,
   type PageSummary,
   type PageResolution,
   type TrashedPageSummary,
+  type SearchResult,
 } from "./vault-api";
 import { PageEditor } from "./page-editor";
 import { humanizeHeadingSlug } from "./heading-slug";
@@ -53,6 +55,12 @@ const pageTrashBannerEl = document.querySelector<HTMLElement>("#page-trash-banne
 const restorePageButtonEl = document.querySelector<HTMLButtonElement>("#restore-page-button");
 const trashListEl = document.querySelector<HTMLUListElement>("#trash-list");
 const emptyTrashButtonEl = document.querySelector<HTMLButtonElement>("#empty-trash-button");
+
+const searchModalOverlayEl = document.querySelector<HTMLElement>("#search-modal-overlay");
+const searchInputEl = document.querySelector<HTMLInputElement>("#search-input");
+const searchIncludeTrashEl = document.querySelector<HTMLInputElement>("#search-include-trash");
+const searchResultsListEl = document.querySelector<HTMLUListElement>("#search-results-list");
+const searchEmptyHintEl = document.querySelector<HTMLElement>("#search-empty-hint");
 
 // The page currently loaded in the editor: either a persisted page (has an
 // id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
@@ -565,13 +573,232 @@ async function handleSelectVaultClick() {
   }
 }
 
+// --- Search modal (ticket 13) --------------------------------------------
+//
+// A single quick-switcher-style overlay (per the referenced prototype spec,
+// issue 11): one query against title/tags/body, results in three strict
+// tiers, one row per page. Opened via the sidebar's Search button and
+// Ctrl/Cmd+K; closed by Escape or clicking outside the modal card.
+
+/** One rendered row in the search results list: either a real search hit, or the trailing "Create page" action. */
+type SearchEntry = { kind: "result"; result: SearchResult } | { kind: "create"; query: string };
+
+let searchEntries: SearchEntry[] = [];
+let searchSelectedIndex = -1;
+let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+/** Guards against a slow, now-stale search response overwriting a newer one. */
+let searchRequestId = 0;
+
+const SEARCH_DEBOUNCE_MS = 120;
+
+/** Splits an FTS5 snippet built with ``/`` markers (search.rs's `body_fts_matches`) into DOM nodes, wrapping the marked span(s) in `<mark>` without ever using `innerHTML` on vault-derived text. */
+function renderHighlightedSnippet(container: HTMLElement, snippet: string) {
+  const parts = snippet.split("");
+  container.appendChild(document.createTextNode(parts[0] ?? ""));
+  for (const part of parts.slice(1)) {
+    const [marked, ...restParts] = part.split("");
+    const mark = document.createElement("mark");
+    mark.textContent = marked ?? "";
+    container.appendChild(mark);
+    container.appendChild(document.createTextNode(restParts.join("")));
+  }
+}
+
+/** Opens the resolved search result the same way clicking any `[[Link]]` chip or a Trash-list entry would -- `resolve_page` already handles the "in trash" state, so this works identically for a persisted or a trashed hit. */
+async function openSearchResult(result: SearchResult) {
+  closeSearchModal();
+  await openPageByTitle(result.title);
+}
+
+/** Empty-state action (ticket 13 point 6): creates the typed query as a brand-new page and opens it straight into the editor, reusing the exact same action as the "New page" button. */
+async function handleCreatePageFromSearch(query: string) {
+  try {
+    const summary = await createPage(query);
+    closeSearchModal();
+    await loadPages();
+    await selectPage(summary.id);
+  } catch (err) {
+    window.alert(String(err));
+  }
+}
+
+function searchResultRowLabel(result: SearchResult): string {
+  return result.inTrash ? `${result.title} (in trash)` : result.title;
+}
+
+function renderSearchEntries() {
+  if (!searchResultsListEl) return;
+  searchResultsListEl.innerHTML = "";
+
+  const query = searchInputEl?.value.trim() ?? "";
+  if (searchEmptyHintEl) {
+    if (query === "") {
+      searchEmptyHintEl.textContent = "Type to search.";
+      searchEmptyHintEl.removeAttribute("hidden");
+    } else if (searchEntries.length === 0) {
+      searchEmptyHintEl.textContent = "No results.";
+      searchEmptyHintEl.removeAttribute("hidden");
+    } else {
+      searchEmptyHintEl.setAttribute("hidden", "");
+    }
+  }
+
+  searchEntries.forEach((entry, index) => {
+    const li = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "search-result";
+    button.classList.toggle("active", index === searchSelectedIndex);
+
+    if (entry.kind === "result") {
+      const { result } = entry;
+      const titleRow = document.createElement("span");
+      titleRow.className = "search-result-title";
+      const titleText = document.createElement("span");
+      titleText.textContent = searchResultRowLabel(result);
+      titleRow.appendChild(titleText);
+      if (result.inTrash) {
+        const badge = document.createElement("span");
+        badge.className = "search-result-in-trash-badge";
+        badge.textContent = "In trash";
+        titleRow.appendChild(badge);
+      }
+      button.appendChild(titleRow);
+
+      if (result.tier === 2 && result.matchedTag) {
+        const chip = document.createElement("span");
+        chip.className = "search-result-tag-chip";
+        chip.textContent = `#${result.matchedTag}`;
+        button.appendChild(chip);
+      } else if (result.tier === 3 && result.snippet) {
+        const snippetEl = document.createElement("span");
+        snippetEl.className = "search-result-snippet";
+        renderHighlightedSnippet(snippetEl, result.snippet);
+        button.appendChild(snippetEl);
+      }
+
+      button.addEventListener("click", () => void openSearchResult(result));
+    } else {
+      button.classList.add("create-page-action");
+      button.textContent = `Create page: '${entry.query}'`;
+      button.addEventListener("click", () => void handleCreatePageFromSearch(entry.query));
+    }
+
+    li.appendChild(button);
+    searchResultsListEl.appendChild(li);
+  });
+}
+
 /**
- * Search entry point (issue 12): reserves the sidebar UI slot the ticket
- * calls for. Ticket 13 owns the actual search modal/UX -- this is a stub
- * placeholder only.
+ * Runs one search for whatever's currently in the input, builds the
+ * strict-tier results into `searchEntries`, and appends the "Create page"
+ * action (ticket 13 point 6) whenever there's no exact title match among the
+ * results -- not only when there are zero results, per the prototype spec.
  */
-function handleSearchStub() {
-  window.alert("Search is coming soon (ticket 13).");
+async function runSearch() {
+  const query = searchInputEl?.value ?? "";
+  const trimmed = query.trim();
+  const includeTrash = searchIncludeTrashEl?.checked ?? false;
+
+  if (trimmed === "") {
+    searchEntries = [];
+    searchSelectedIndex = -1;
+    renderSearchEntries();
+    return;
+  }
+
+  const requestId = ++searchRequestId;
+  let results: SearchResult[];
+  try {
+    results = await searchPages(trimmed, includeTrash);
+  } catch (err) {
+    console.error("Search failed", err);
+    results = [];
+  }
+  if (requestId !== searchRequestId) return; // a newer search has since started
+
+  const trimmedLower = trimmed.toLowerCase();
+  const hasExactTitleMatch = results.some((r) => r.title.toLowerCase() === trimmedLower);
+
+  searchEntries = results.map((result): SearchEntry => ({ kind: "result", result }));
+  if (!hasExactTitleMatch) {
+    searchEntries.push({ kind: "create", query: trimmed });
+  }
+  searchSelectedIndex = searchEntries.length > 0 ? 0 : -1;
+  renderSearchEntries();
+}
+
+function scheduleSearch() {
+  if (searchDebounceTimer !== null) clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => {
+    searchDebounceTimer = null;
+    void runSearch();
+  }, SEARCH_DEBOUNCE_MS);
+}
+
+function isSearchModalOpen(): boolean {
+  return searchModalOverlayEl ? !searchModalOverlayEl.hasAttribute("hidden") : false;
+}
+
+function openSearchModal() {
+  if (!searchModalOverlayEl) return;
+  searchModalOverlayEl.removeAttribute("hidden");
+  if (searchInputEl) {
+    searchInputEl.value = "";
+    searchInputEl.focus();
+  }
+  if (searchIncludeTrashEl) searchIncludeTrashEl.checked = false;
+  searchEntries = [];
+  searchSelectedIndex = -1;
+  renderSearchEntries();
+}
+
+function closeSearchModal() {
+  if (searchDebounceTimer !== null) {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
+  }
+  searchModalOverlayEl?.setAttribute("hidden", "");
+  searchInputEl?.blur();
+}
+
+function moveSearchSelection(delta: number) {
+  if (searchEntries.length === 0) return;
+  const next = searchSelectedIndex < 0 ? 0 : searchSelectedIndex + delta;
+  searchSelectedIndex = Math.max(0, Math.min(searchEntries.length - 1, next));
+  renderSearchEntries();
+  const rows = searchResultsListEl?.querySelectorAll<HTMLButtonElement>(".search-result");
+  rows?.[searchSelectedIndex]?.scrollIntoView({ block: "nearest" });
+}
+
+function activateSelectedSearchEntry() {
+  const index = searchSelectedIndex >= 0 ? searchSelectedIndex : 0;
+  const entry = searchEntries[index];
+  if (!entry) return;
+  if (entry.kind === "result") void openSearchResult(entry.result);
+  else void handleCreatePageFromSearch(entry.query);
+}
+
+function handleSearchModalKeydown(event: KeyboardEvent) {
+  switch (event.key) {
+    case "Escape":
+      event.preventDefault();
+      event.stopPropagation();
+      closeSearchModal();
+      break;
+    case "ArrowDown":
+      event.preventDefault();
+      moveSearchSelection(1);
+      break;
+    case "ArrowUp":
+      event.preventDefault();
+      moveSearchSelection(-1);
+      break;
+    case "Enter":
+      event.preventDefault();
+      activateSelectedSearchEntry();
+      break;
+  }
 }
 
 /**
@@ -607,13 +834,24 @@ async function init() {
   todayButtonEl?.addEventListener("click", () => void handleTodayClick());
   emptyTrashButtonEl?.addEventListener("click", () => void handleEmptyTrashClick());
 
-  searchButtonEl?.addEventListener("click", handleSearchStub);
-  // TODO(ticket 13): wire this to actually open the search UI instead of the stub.
+  searchButtonEl?.addEventListener("click", openSearchModal);
   window.addEventListener("keydown", (event) => {
     const isSearchShortcut = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k";
     if (!isSearchShortcut) return;
     event.preventDefault();
-    handleSearchStub();
+    if (isSearchModalOpen()) {
+      searchInputEl?.focus();
+    } else {
+      openSearchModal();
+    }
+  });
+
+  searchInputEl?.addEventListener("input", scheduleSearch);
+  searchIncludeTrashEl?.addEventListener("change", () => void runSearch());
+  searchModalOverlayEl?.addEventListener("keydown", handleSearchModalKeydown);
+  // Clicking the dimmed backdrop (not the modal card itself) closes it.
+  searchModalOverlayEl?.addEventListener("click", (event) => {
+    if (event.target === searchModalOverlayEl) closeSearchModal();
   });
 
   sidebarCollapseToggleEl?.addEventListener("click", () => {

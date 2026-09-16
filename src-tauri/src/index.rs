@@ -116,6 +116,15 @@ pub fn collect_pages(vault_path: &Path) -> Result<Vec<PageRecord>> {
 /// link's target may be a dynamic page with no row in `pages` at all. This
 /// is a deliberate change from issue 02's original placeholder schema
 /// (`source_id`/`target_id`, both ids), which couldn't represent that case.
+///
+/// `pages.tags` (ticket 13) carries this page's own frontmatter `tags:` list,
+/// JSON-encoded, so search's tag tier can check "does this page's own tags
+/// mention X" without re-parsing every file's frontmatter from disk on every
+/// keystroke. This is a separate concern from `backlinks`, which records tags
+/// as *outbound links* (issue 09) -- a page's tags are simultaneously "this
+/// page is taggable content for tier-2 search" and "this page links to the
+/// page titled by that tag," and both readings are backed by their own
+/// column/table now.
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "DROP TABLE IF EXISTS pages_fts;
@@ -127,7 +136,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              title TEXT NOT NULL,
              path TEXT NOT NULL,
              body TEXT NOT NULL,
-             modified_at INTEGER NOT NULL DEFAULT 0
+             modified_at INTEGER NOT NULL DEFAULT 0,
+             tags TEXT NOT NULL DEFAULT '[]'
          );
 
          CREATE VIRTUAL TABLE pages_fts USING fts5(id UNINDEXED, title, body);
@@ -155,18 +165,20 @@ pub fn build_index(conn: &mut Connection, vault_path: &Path) -> Result<usize> {
     let tx = conn.transaction()?;
     {
         let mut insert_page = tx.prepare(
-            "INSERT INTO pages (id, title, path, body, modified_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO pages (id, title, path, body, modified_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         let mut insert_fts =
             tx.prepare("INSERT INTO pages_fts (id, title, body) VALUES (?1, ?2, ?3)")?;
 
         for page in &pages {
+            let tags_json = serde_json::to_string(&page.tags).unwrap_or_else(|_| "[]".to_string());
             insert_page.execute(params![
                 page.id,
                 page.title,
                 page.path.to_string_lossy(),
                 page.body,
-                page.modified_at
+                page.modified_at,
+                tags_json,
             ])?;
             insert_fts.execute(params![page.id, page.title, page.body])?;
         }
@@ -246,9 +258,10 @@ pub fn update_page_content(
     body: &str,
     tags: &[String],
 ) -> rusqlite::Result<()> {
+    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
-        "UPDATE pages SET title = ?1, body = ?2, modified_at = ?3 WHERE id = ?4",
-        params![title, body, now_epoch(), id],
+        "UPDATE pages SET title = ?1, body = ?2, modified_at = ?3, tags = ?4 WHERE id = ?5",
+        params![title, body, now_epoch(), tags_json, id],
     )?;
     conn.execute(
         "UPDATE pages_fts SET title = ?1, body = ?2 WHERE id = ?3",
@@ -299,9 +312,10 @@ pub fn insert_restored_page(
     body: &str,
     tags: &[String],
 ) -> rusqlite::Result<()> {
+    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
-        "INSERT INTO pages (id, title, path, body, modified_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, title, path.to_string_lossy(), body, now_epoch()],
+        "INSERT INTO pages (id, title, path, body, modified_at, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, title, path.to_string_lossy(), body, now_epoch(), tags_json],
     )?;
     conn.execute(
         "INSERT INTO pages_fts (id, title, body) VALUES (?1, ?2, ?3)",

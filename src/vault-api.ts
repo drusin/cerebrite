@@ -154,3 +154,26 @@ export function emptyTrash(): Promise<void> {
 export function listTrashedPages(): Promise<TrashedPageSummary[]> {
   return invoke("list_trashed_pages");
 }
+
+/// One search result row (ticket 13), as returned by `searchPages`: one per
+/// page, tagged with which strict tier matched it (1 = title, 2 = tag, 3 =
+/// BM25 body). `matchedTag` is set only for a tier-2 hit (the frontend
+/// renders it as a chip); `snippet` otherwise holds the title (tier 1) or a
+/// best-matching-section body excerpt with ``/`` marking the
+/// highlighted span (tier 3) -- see search.rs's `body_fts_matches`.
+export interface SearchResult {
+  id: string;
+  title: string;
+  tier: 1 | 2 | 3;
+  snippet: string;
+  inTrash: boolean;
+  matchedTag?: string | null;
+}
+
+/// Full search (ticket 13): one query against title, tags, and body, ranked
+/// in three strict tiers with one row per page. `includeTrash`, when true,
+/// also searches trashed pages directly (they aren't indexed) and flags them
+/// `inTrash` in the results.
+export function searchPages(query: string, includeTrash: boolean): Promise<SearchResult[]> {
+  return invoke("search_pages", { query, includeTrash });
+}

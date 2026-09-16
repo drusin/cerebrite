@@ -4,6 +4,7 @@ mod index;
 mod links;
 mod markdown;
 mod redirects;
+mod search;
 mod trash;
 mod vault;
 
@@ -143,6 +144,32 @@ pub enum PageResolution {
         /// dynamic page.
         heading_slug: Option<String>,
     },
+}
+
+/// One search result row (ticket 13), as returned to the frontend's search
+/// modal by `search_pages`.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    id: String,
+    title: String,
+    tier: u8,
+    snippet: String,
+    in_trash: bool,
+    matched_tag: Option<String>,
+}
+
+impl From<search::SearchResult> for SearchResult {
+    fn from(result: search::SearchResult) -> Self {
+        SearchResult {
+            id: result.id,
+            title: result.title,
+            tier: result.tier,
+            snippet: result.snippet,
+            in_trash: result.in_trash,
+            matched_tag: result.matched_tag,
+        }
+    }
 }
 
 fn derived_index_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -714,6 +741,26 @@ fn list_trashed_pages(state: State<AppState>) -> Result<Vec<TrashedPageSummary>,
         .map_err(|e| e.to_string())
 }
 
+/// Full search (ticket 13): one query against title, tags, and body, ranked
+/// in three strict tiers (see search.rs). `include_trash`, when true, also
+/// searches trashed pages directly off disk (they aren't indexed) and flags
+/// them `in_trash` in the results.
+#[tauri::command]
+fn search_pages(state: State<AppState>, query: String, include_trash: bool) -> Result<Vec<SearchResult>, String> {
+    search_pages_impl(&state, &query, include_trash)
+}
+
+fn search_pages_impl(state: &AppState, query: &str, include_trash: bool) -> Result<Vec<SearchResult>, String> {
+    let vault_path = state.vault_path.lock().unwrap().clone();
+
+    let guard = state.db.lock().unwrap();
+    let conn = guard.as_ref().ok_or("No vault is open")?;
+
+    search::search_pages(conn, vault_path.as_deref(), query, include_trash)
+        .map(|results| results.into_iter().map(SearchResult::from).collect())
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -735,6 +782,7 @@ pub fn run() {
             restore_page,
             empty_trash,
             list_trashed_pages,
+            search_pages,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1192,6 +1240,26 @@ mod tests {
 
         assert!(!dir.path().join(".cerebrite/trash/hello.md").exists());
         assert!(list_trashed_pages_impl(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_pages_impl_ranks_tiers_and_excludes_trash_by_default() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "widget.md", "---\nid: w\ntitle: Widget\n---\nBody.\n");
+        write_page(&dir, "hidden.md", "---\nid: h\ntitle: Hidden Widget Note\n---\nBody.\n");
+        let state = setup_vault(&dir);
+
+        trash_page_impl(&state, "h").unwrap();
+
+        let default_results = search_pages_impl(&state, "widget", false).unwrap();
+        assert_eq!(default_results.len(), 1);
+        assert_eq!(default_results[0].id, "w");
+        assert_eq!(default_results[0].tier, 1);
+
+        let with_trash = search_pages_impl(&state, "widget", true).unwrap();
+        assert_eq!(with_trash.len(), 2);
+        let hidden = with_trash.iter().find(|r| r.id == "h").unwrap();
+        assert!(hidden.in_trash);
     }
 
     // Small `_impl`-free wrappers, mirroring the pattern used elsewhere in

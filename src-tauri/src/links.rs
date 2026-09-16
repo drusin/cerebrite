@@ -262,7 +262,11 @@ fn build_snippet(body: &str, match_start: usize, match_end: usize) -> String {
 
 /// Rounds `idx` down to the nearest valid UTF-8 char boundary in `s` (the
 /// stable-Rust equivalent of the still-nightly-only `str::floor_char_boundary`).
-fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+///
+/// `pub(crate)` so search.rs's naive trashed-page snippet fallback (ticket
+/// 13) can reuse the exact same char-boundary-safe slicing rather than
+/// duplicating it.
+pub(crate) fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
     if idx >= s.len() {
         return s.len();
     }
@@ -273,7 +277,7 @@ fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
 }
 
 /// Rounds `idx` up to the nearest valid UTF-8 char boundary in `s`.
-fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+pub(crate) fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
     if idx >= s.len() {
         return s.len();
     }
