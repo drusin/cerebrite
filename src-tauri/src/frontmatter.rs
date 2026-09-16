@@ -61,7 +61,7 @@ fn parse_content(content: &str, default_title: &str) -> (ParsedPage, Option<Stri
     let (id, needs_rewrite) = match existing_id {
         Some(id) if !id.is_empty() => (id, false),
         _ => {
-            let generated = uuid::Uuid::new_v4().to_string();
+            let generated = generate_id();
             mapping.insert(id_key, Value::String(generated.clone()));
             (generated, true)
         }
@@ -118,6 +118,58 @@ pub fn write_body(path: &Path, new_body: &str) -> Result<()> {
     fs::write(path, new_content)
         .with_context(|| format!("writing updated body to {}", path.display()))?;
     Ok(())
+}
+
+/// Mints a fresh, stable page id. Shared by both "fill in a missing id on an
+/// existing file" (`parse_and_ensure_id`) and "mint an id for a brand-new
+/// page" (issue 04's explicit "new page" action).
+pub fn generate_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Converts a page title into a filesystem-safe slug: lowercased, with any
+/// run of non-alphanumeric characters (spaces, punctuation, ...) collapsed
+/// into a single hyphen, and no leading/trailing hyphen. Unicode letters are
+/// lowercased and kept (via `char::is_alphanumeric`) rather than stripped.
+///
+/// A title that slugifies to nothing (empty, or punctuation/whitespace only)
+/// falls back to `"untitled"` so callers always get a usable filename stem.
+pub fn slugify(title: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_was_hyphen = true; // seed true so we never emit a leading hyphen
+
+    for ch in title.trim().chars() {
+        if ch.is_alphanumeric() {
+            slug.extend(ch.to_lowercase());
+            prev_was_hyphen = false;
+        } else if !prev_was_hyphen {
+            slug.push('-');
+            prev_was_hyphen = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "untitled".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Builds the full file content for a brand-new, explicitly-created page
+/// (issue 04): YAML frontmatter with just `id` and `title`, and an
+/// intentionally empty body -- no auto-inserted `# Title` heading, per the
+/// ticket and CONTEXT.md's clean-markdown rule (ADR-0003).
+pub fn new_page_content(id: &str, title: &str) -> String {
+    let mut mapping = serde_yaml::Mapping::new();
+    mapping.insert(Value::String("id".to_string()), Value::String(id.to_string()));
+    mapping.insert(Value::String("title".to_string()), Value::String(title.to_string()));
+    let yaml_str =
+        serde_yaml::to_string(&Value::Mapping(mapping)).unwrap_or_else(|_| String::new());
+    format!("---\n{yaml_str}---\n")
 }
 
 /// Reads `path`, parses its frontmatter, generating and persisting a stable
@@ -272,6 +324,42 @@ mod tests {
 
         let content_after = fs::read_to_string(&path).unwrap();
         assert_eq!(content_after, "Replaced plain content.\n");
+    }
+
+    #[test]
+    fn slugify_lowercases_and_hyphenates_spaces_and_punctuation() {
+        assert_eq!(slugify("Hello, World!"), "hello-world");
+        assert_eq!(slugify("  Trim Me  "), "trim-me");
+        assert_eq!(slugify("Multiple   Spaces--and--dashes"), "multiple-spaces-and-dashes");
+    }
+
+    #[test]
+    fn slugify_handles_unicode_letters() {
+        assert_eq!(slugify("Café Déjà Vu"), "café-déjà-vu");
+        assert_eq!(slugify("Über Cool"), "über-cool");
+    }
+
+    #[test]
+    fn slugify_falls_back_to_untitled_for_punctuation_only_or_empty_titles() {
+        assert_eq!(slugify("!!!???"), "untitled");
+        assert_eq!(slugify(""), "untitled");
+        assert_eq!(slugify("   "), "untitled");
+    }
+
+    #[test]
+    fn new_page_content_has_frontmatter_only_and_empty_body_no_heading() {
+        let content = new_page_content("abc-123", "My New Page");
+
+        assert_eq!(content, "---\nid: abc-123\ntitle: My New Page\n---\n");
+        assert!(!content.contains('#'));
+
+        // Round-trips through the normal parser: id/title recovered, body empty.
+        let dir = tempdir().unwrap();
+        let path = write_file(dir.path(), "my-new-page.md", &content);
+        let parsed = parse_and_ensure_id(&path).unwrap();
+        assert_eq!(parsed.id, "abc-123");
+        assert_eq!(parsed.title, "My New Page");
+        assert_eq!(parsed.body, "");
     }
 
     #[test]

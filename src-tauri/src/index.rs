@@ -132,6 +132,27 @@ pub fn update_page_content(
     Ok(())
 }
 
+/// Inserts a brand-new page's row into the derived index's `pages` and
+/// `pages_fts` tables -- used by the explicit "new page" action (issue 04) so
+/// a freshly created file shows up without a full vault rebuild.
+pub fn insert_page(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    path: &Path,
+    body: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO pages (id, title, path, body) VALUES (?1, ?2, ?3, ?4)",
+        params![id, title, path.to_string_lossy(), body],
+    )?;
+    conn.execute(
+        "INSERT INTO pages_fts (id, title, body) VALUES (?1, ?2, ?3)",
+        params![id, title, body],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +257,35 @@ mod tests {
         let hits: i64 = conn
             .query_row(
                 "SELECT count(*) FROM pages_fts WHERE pages_fts MATCH 'newword'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn insert_page_adds_a_new_row_to_pages_and_fts_without_full_rebuild() {
+        let dir = tempdir().unwrap();
+        write_page(dir.path(), "one.md", "---\nid: one\ntitle: One\n---\nOriginal body.\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+
+        let new_path = dir.path().join("brand-new.md");
+        insert_page(&conn, "two", "Brand New", &new_path, "").unwrap();
+
+        let count: i64 = conn.query_row("SELECT count(*) FROM pages", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 2);
+
+        let title: String = conn
+            .query_row("SELECT title FROM pages WHERE id = 'two'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "Brand New");
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pages_fts WHERE pages_fts MATCH 'Brand'",
                 [],
                 |row| row.get(0),
             )

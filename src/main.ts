@@ -5,6 +5,7 @@ import {
   listPages,
   getPage,
   savePage,
+  createPage,
   type PageSummary,
 } from "./vault-api";
 import { PageEditor } from "./page-editor";
@@ -20,6 +21,7 @@ const selectVaultButtonEl = document.querySelector<HTMLButtonElement>("#select-v
 
 const workspaceEl = document.querySelector<HTMLElement>("#workspace");
 const pageListEl = document.querySelector<HTMLUListElement>("#page-list");
+const newPageButtonEl = document.querySelector<HTMLButtonElement>("#new-page-button");
 
 const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
@@ -127,6 +129,31 @@ async function loadPages() {
   renderPageList(pages);
 }
 
+/**
+ * Explicit "new page" action (issue 04): prompts for a title, persists a
+ * real file immediately via the `create_page` command, refreshes the "All
+ * pages" list (alphabetical re-sort happens server-side), and opens the new
+ * page straight into the editor.
+ */
+async function handleNewPageClick() {
+  const title = window.prompt("Title for the new page:");
+  if (title === null) return; // user cancelled
+
+  const trimmed = title.trim();
+  if (!trimmed) {
+    window.alert("Title cannot be empty.");
+    return;
+  }
+
+  try {
+    const summary = await createPage(trimmed);
+    await loadPages();
+    await selectPage(summary.id);
+  } catch (err) {
+    window.alert(String(err));
+  }
+}
+
 async function openVaultAndLoad(path: string) {
   await openVault(path);
   showWorkspace();
@@ -146,6 +173,7 @@ async function handleSelectVaultClick() {
 
 async function init() {
   selectVaultButtonEl?.addEventListener("click", handleSelectVaultClick);
+  newPageButtonEl?.addEventListener("click", () => void handleNewPageClick());
 
   const remembered = await getRememberedVault();
   if (remembered) {

@@ -44,3 +44,11 @@ export function getPage(id: string): Promise<PageContent> {
 export function savePage(id: string, markdownBody: string): Promise<void> {
   return invoke("save_page", { id, markdownBody });
 }
+
+/// Explicit "new page" action (issue 04): mints a frontmatter id, derives a
+/// slugified filename from `title`, and writes a frontmatter-only file
+/// (empty body). Rejects with an in-app error message (not auto-suffixed) if
+/// a page with that title already exists.
+export function createPage(title: string): Promise<PageSummary> {
+  return invoke("create_page", { title });
+}

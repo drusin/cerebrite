@@ -176,6 +176,65 @@ fn save_page(state: State<AppState>, id: String, markdown_body: String) -> Resul
     Ok(())
 }
 
+/// Explicit "new page" action (issue 04): given a title, immediately mints a
+/// frontmatter id, derives a slug-of-the-title filename, writes a
+/// frontmatter-only file (empty body, no auto-inserted heading), auto-commits
+/// it to the vault's local git repo like any other save, and adds it to the
+/// derived index in place (no full rebuild).
+///
+/// Per the ticket and its referenced prototype spec (07), a title collision
+/// with an existing persisted page is blocked with an in-app error rather
+/// than silently disambiguated -- so this only touches the filesystem/index
+/// once it's confirmed neither the title nor the derived filename is already
+/// taken.
+#[tauri::command]
+fn create_page(state: State<AppState>, title: String) -> Result<PageSummary, String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("Title cannot be empty".to_string());
+    }
+
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+
+    let mut db_guard = state.db.lock().unwrap();
+    let conn = db_guard.as_mut().ok_or("No vault is open")?;
+
+    let existing_titles: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM pages WHERE title = ?1",
+            params![trimmed],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if existing_titles > 0 {
+        return Err(format!("A page titled '{trimmed}' already exists"));
+    }
+
+    let slug = frontmatter::slugify(trimmed);
+    let file_path = vault_path.join(format!("{slug}.md"));
+    if file_path.exists() {
+        return Err(format!(
+            "A page file for '{trimmed}' already exists ({slug}.md)"
+        ));
+    }
+
+    let id = frontmatter::generate_id();
+    let content = frontmatter::new_page_content(&id, trimmed);
+    std::fs::write(&file_path, &content).map_err(|e| e.to_string())?;
+
+    vault::commit_all(&vault_path, &format!("Create {trimmed}")).map_err(|e| e.to_string())?;
+
+    index::insert_page(conn, &id, trimmed, &file_path, "").map_err(|e| e.to_string())?;
+
+    Ok(PageSummary {
+        id,
+        title: trimmed.to_string(),
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -189,6 +248,7 @@ pub fn run() {
             list_pages,
             get_page,
             save_page,
+            create_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
