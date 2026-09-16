@@ -144,7 +144,8 @@ body {
   margin: 0.5em 0;
 }
 
-#new-page-button {
+#new-page-button,
+#today-button {
   padding: 0.3em 0.6em;
   font-size: 0.8em;
   box-shadow: none;

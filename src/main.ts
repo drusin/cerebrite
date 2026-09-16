@@ -32,6 +32,7 @@ const selectVaultButtonEl = document.querySelector<HTMLButtonElement>("#select-v
 const workspaceEl = document.querySelector<HTMLElement>("#workspace");
 const pageListEl = document.querySelector<HTMLUListElement>("#page-list");
 const newPageButtonEl = document.querySelector<HTMLButtonElement>("#new-page-button");
+const todayButtonEl = document.querySelector<HTMLButtonElement>("#today-button");
 
 const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
@@ -325,6 +326,32 @@ async function openPageByTitle(rawTitle: string) {
   await openResolution(resolution);
 }
 
+/**
+ * Today's date as an ISO-8601 `YYYY-MM-DD` string, per issue 11 / the "Daily
+ * note" glossary entry -- built from the *local* calendar date
+ * (getFullYear/getMonth/getDate), not `toISOString()`, which reports the UTC
+ * date and would land on the wrong day whenever local time is far enough
+ * from UTC (e.g. any time after ~4pm PST or before ~2am CEST).
+ */
+function todaysDateTitle(): string {
+  const now = new Date();
+  const year = String(now.getFullYear()).padStart(4, "0");
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Sidebar "Today" shortcut (issue 11): navigates to today's date-titled page
+ * through the exact same `resolve_page` flow a `[[YYYY-MM-DD]]` link chip
+ * would use -- no distinct "daily note" code path. If a page with that exact
+ * title already exists, it opens normally; otherwise it opens as an ordinary
+ * dynamic page (ADR-0009), materializing only on first write.
+ */
+async function handleTodayClick() {
+  await openPageByTitle(todaysDateTitle());
+}
+
 async function loadPages() {
   const pages = await listPages();
   renderPageList(pages);
@@ -447,6 +474,7 @@ async function handleSelectVaultClick() {
 async function init() {
   selectVaultButtonEl?.addEventListener("click", handleSelectVaultClick);
   newPageButtonEl?.addEventListener("click", () => void handleNewPageClick());
+  todayButtonEl?.addEventListener("click", () => void handleTodayClick());
   emptyTrashButtonEl?.addEventListener("click", () => void handleEmptyTrashClick());
 
   const remembered = await getRememberedVault();
