@@ -16,6 +16,10 @@ _Avoid_: Note, document; "real page" (implies a dynamic page is somehow fake, wh
 A page that exists only because a link or tag reaches it, with no backing file and no frontmatter id yet — identified purely by the normalized text of that link. Renders with identical UI to a persisted page, and is included in search/navigation the same way once the derived index has been built. Becomes a persisted page automatically the instant it receives its first write (merely viewing it does not); needs no explicit deletion, since it simply ceases to exist once nothing references it any more. See [ADR-0009](docs/adr/0009-dynamic-pages-materialize-on-first-write.md).
 _Avoid_: Stub, placeholder, ghost page (all suggest a lesser or temporary UI, when the UI is identical to a persisted page's)
 
+**Daily note**:
+An ordinary [page](#language) whose title happens to exactly match ISO-8601 date format (`YYYY-MM-DD`). Carries no distinct identity, frontmatter flag, or storage — recognized purely by title-pattern match, used only to power the sidebar's "Today" shortcut (which navigates to the current date's title as a normal dynamic page, materializing on first write per [ADR-0009](docs/adr/0009-dynamic-pages-materialize-on-first-write.md)). A page titled e.g. "Sep 16, 2026" is not a daily note; only the exact `YYYY-MM-DD` string is recognized.
+_Avoid_: implying a separate page type or stored flag — a daily note is a plain persisted/dynamic page like any other, distinguished only by what its title looks like.
+
 **Linkable entity**:
 The unit of granularity a link can target. Fixed at page, heading, and sub-heading for the MVP. Paragraph-level linking is not yet decided — see the open question below.
 _Avoid_: Block (implies arbitrary/nested granularity broader than what's supported)
