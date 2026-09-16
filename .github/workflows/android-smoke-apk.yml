@@ -55,6 +55,13 @@ jobs:
         run: |
           sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          # openssl-src's Configure/Makefile invoke the triple-prefixed
+          # binutils wrappers (aarch64-linux-android-ranlib, -ar, -as, ...)
+          # via CROSS_COMPILE, resolved off PATH — not via AR/RANLIB env
+          # vars. The NDK ships these as symlinks to llvm-ranlib/llvm-ar in
+          # its unified toolchain bin dir, which must be on PATH for them
+          # to be found.
+          echo "$ANDROID_SDK_ROOT/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
