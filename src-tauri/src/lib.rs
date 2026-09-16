@@ -5,20 +5,23 @@ mod links;
 mod markdown;
 mod redirects;
 mod search;
+mod sync;
 mod trash;
 mod vault;
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 /// Shared app state: the currently open vault path and its derived-index
 /// connection. `None` until a vault has been opened.
-#[derive(Default)]
 pub struct AppState {
     vault_path: Mutex<Option<PathBuf>>,
     db: Mutex<Option<Connection>>,
@@ -27,6 +30,29 @@ pub struct AppState {
     /// open (or, in tests that construct `AppState` directly, always --
     /// callers fall back to a placeholder id in that case).
     device_id: Mutex<Option<String>>,
+    /// Latest known background-sync status (issue 14), polled by the
+    /// frontend via `get_sync_status` and also best-effort emitted as a
+    /// `sync-status-changed` event. Starts `NoRemote` (the honest default
+    /// before a vault -- and its remote, if any -- has even been checked).
+    sync_status: Mutex<sync::SyncStatus>,
+    /// Sender the background sync loop listens on: every local auto-commit
+    /// sends a ping (see `notify_sync`), which the loop debounces/coalesces;
+    /// it also wakes on its own periodic timer regardless. Replacing this
+    /// (on a fresh `open_vault`) drops the old sender, which cleanly stops
+    /// the previous vault's loop thread.
+    sync_tx: Mutex<Option<Sender<()>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        AppState {
+            vault_path: Mutex::new(None),
+            db: Mutex::new(None),
+            device_id: Mutex::new(None),
+            sync_status: Mutex::new(sync::SyncStatus::NoRemote),
+            sync_tx: Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,10 +251,96 @@ fn open_vault(app: AppHandle, state: State<AppState>, path: String) -> Result<Va
     *state.db.lock().unwrap() = Some(conn);
     *state.device_id.lock().unwrap() = Some(device_id);
 
+    // (Re)start the background sync loop for this vault (issue 14). Storing
+    // the new sender drops the previous one, if any, which cleanly stops
+    // whatever loop was running for a previously-open vault.
+    let (tx, rx) = mpsc::channel();
+    *state.sync_tx.lock().unwrap() = Some(tx);
+    spawn_sync_loop(app.clone(), vault_path.clone(), rx);
+
     Ok(VaultInfo {
         path: vault_path.to_string_lossy().to_string(),
         page_count,
     })
+}
+
+/// Pings the background sync loop after a local auto-commit. Fire-and-forget:
+/// a missing sender (no vault open yet, or sync loop not started, e.g. in
+/// plain `_impl` unit tests that build `AppState` directly) is not an error.
+fn notify_sync(state: &AppState) {
+    if let Some(tx) = state.sync_tx.lock().unwrap().as_ref() {
+        let _ = tx.send(());
+    }
+}
+
+/// Runs the background sync loop for one open vault (issue 14): wakes either
+/// when `rx` receives a ping (a local auto-commit just happened) or after a
+/// fixed 60s timeout (so incoming remote changes are still picked up while
+/// the user is idle), whichever comes first.
+///
+/// A ping wakeup debounces briefly and drains any further pings that arrive
+/// in that window, so several commits in quick succession (e.g. a burst of
+/// saves) coalesce into a single sync attempt rather than one per commit.
+///
+/// Exits cleanly once `rx` disconnects, which happens when `open_vault`
+/// replaces `state.sync_tx` (e.g. a different vault is opened) and drops the
+/// only sender this loop was listening on.
+fn spawn_sync_loop(app: AppHandle, vault_path: PathBuf, rx: std::sync::mpsc::Receiver<()>) {
+    thread::spawn(move || loop {
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => {
+                // Debounce/coalesce: a burst of saves should trigger one
+                // sync, not one per commit.
+                thread::sleep(Duration::from_millis(500));
+                while rx.try_recv().is_ok() {}
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Periodic tick -- catches incoming remote changes even when
+                // the user isn't actively editing.
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+
+        perform_sync(&app, &vault_path);
+    });
+}
+
+/// Runs one sync attempt and reconciles its outcome into `AppState`: updates
+/// `sync_status` (polled by the frontend via `get_sync_status`), best-effort
+/// emits a `sync-status-changed` event, and rebuilds the derived index
+/// (ADR-0008) when the sync actually changed files on disk.
+fn perform_sync(app: &AppHandle, vault_path: &Path) {
+    let state = app.state::<AppState>();
+    *state.sync_status.lock().unwrap() = sync::SyncStatus::Syncing;
+    let _ = app.emit("sync-status-changed", &sync::SyncStatus::Syncing);
+
+    let outcome = match sync::run_sync(vault_path) {
+        Ok(outcome) => outcome,
+        Err(e) => sync::SyncOutcome {
+            status: sync::SyncStatus::Error { detail: e.to_string() },
+            index_rebuild_needed: false,
+        },
+    };
+
+    if outcome.index_rebuild_needed {
+        let mut db_guard = state.db.lock().unwrap();
+        if let Some(conn) = db_guard.as_mut() {
+            let _ = index::build_index(conn, vault_path);
+        }
+    }
+
+    *state.sync_status.lock().unwrap() = outcome.status.clone();
+    let _ = app.emit("sync-status-changed", &outcome.status);
+}
+
+/// Polled by the frontend for a lightweight sync-status indicator (issue
+/// 14): "synced" / "syncing" / "no remote configured" / "sync needs
+/// attention". A `sync-status-changed` event is also emitted on every
+/// transition for a frontend that prefers to react immediately rather than
+/// poll.
+#[tauri::command]
+fn get_sync_status(state: State<AppState>) -> sync::SyncStatus {
+    state.sync_status.lock().unwrap().clone()
 }
 
 /// Lists every persisted page's id/title, flat and alphabetical.
@@ -342,6 +454,7 @@ fn save_page_impl(state: &AppState, id: &str, markdown_body: &str) -> Result<(),
     }
 
     vault::commit_all(&vault_path, &format!("Update {title}")).map_err(|e| e.to_string())?;
+    notify_sync(state);
 
     index::update_page_content(conn, id, &parsed.title, &parsed.body, &parsed.tags).map_err(|e| e.to_string())?;
 
@@ -407,6 +520,7 @@ fn create_page_impl(state: &AppState, title: &str) -> Result<PageSummary, String
     std::fs::write(&file_path, &content).map_err(|e| e.to_string())?;
 
     vault::commit_all(&vault_path, &format!("Create {trimmed}")).map_err(|e| e.to_string())?;
+    notify_sync(state);
 
     index::insert_page(conn, &id, trimmed, &file_path, "").map_err(|e| e.to_string())?; // no frontmatter tags on a brand-new page
 
@@ -674,6 +788,7 @@ fn trash_page_impl(state: &AppState, id: &str) -> Result<(), String> {
 
     let page_path = PathBuf::from(&path);
     trash::trash_page(&vault_path, &page_path, id, &format!("Trash {title}")).map_err(|e| e.to_string())?;
+    notify_sync(state);
 
     // Only drop the DB rows once the filesystem move + commit succeeded.
     index::remove_page(conn, id).map_err(|e| e.to_string())?;
@@ -702,6 +817,7 @@ fn restore_page_impl(state: &AppState, trashed_filename: &str) -> Result<PageSum
     let restored_path =
         trash::restore_page(&vault_path, trashed_filename, &format!("Restore {}", parsed.title))
             .map_err(|e| e.to_string())?;
+    notify_sync(state);
 
     let mut db_guard = state.db.lock().unwrap();
     let conn = db_guard.as_mut().ok_or("No vault is open")?;
@@ -725,7 +841,9 @@ fn empty_trash(state: State<AppState>) -> Result<(), String> {
         let guard = state.vault_path.lock().unwrap();
         guard.as_ref().ok_or("No vault is open")?.clone()
     };
-    trash::empty_trash(&vault_path).map_err(|e| e.to_string())
+    trash::empty_trash(&vault_path).map_err(|e| e.to_string())?;
+    notify_sync(&state);
+    Ok(())
 }
 
 /// Lists every page currently sitting in `.cerebrite/trash/` (issue 10), for
@@ -783,6 +901,7 @@ pub fn run() {
             empty_trash,
             list_trashed_pages,
             search_pages,
+            get_sync_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -808,6 +927,8 @@ mod tests {
             vault_path: Mutex::new(Some(dir.path().to_path_buf())),
             db: Mutex::new(Some(conn)),
             device_id: Mutex::new(Some("test-device".to_string())),
+            sync_status: Mutex::new(sync::SyncStatus::NoRemote),
+            sync_tx: Mutex::new(None),
         }
     }
 
