@@ -91,7 +91,7 @@ jobs:
           if "rusqlite" not in src:
               src = re.sub(
                   r'(\[dependencies\]\n)',
-                  r'\1rusqlite = { version = "0.31", features = ["bundled", "fts5"] }\ngit2 = "0.19"\n',
+                  r'\1rusqlite = { version = "0.31", features = ["bundled"] }\ngit2 = "0.19"\n',
                   src,
                   count=1,
               )
