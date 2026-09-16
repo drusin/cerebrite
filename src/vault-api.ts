@@ -70,6 +70,24 @@ export function resolvePage(title: string): Promise<PageResolution> {
   return invoke("resolve_page", { title });
 }
 
+/// One grouped-by-source-page backlink entry (issue 06), as returned by
+/// `get_backlinks`.
+export interface BacklinkEntry {
+  sourceId: string;
+  sourceTitle: string;
+  snippet: string;
+  modifiedAt: number;
+}
+
+/// Returns every backlink pointing at the page titled `title`, grouped by
+/// source page (most-recently-modified source first). Works identically for
+/// a persisted page's own title and a dynamic page's normalized title (issue
+/// 06) -- the lookup happens purely by normalized title text on the Rust
+/// side, so a dynamic page (no id, no file) can still have backlinks.
+export function getBacklinks(title: string): Promise<BacklinkEntry[]> {
+  return invoke("get_backlinks", { title });
+}
+
 /// Materializes a dynamic page into a real persisted file the instant it
 /// receives its first write (ADR-0009): mints an id, derives a slug
 /// filename, writes frontmatter, then writes `markdownBody` as the body --

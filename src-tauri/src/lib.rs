@@ -1,5 +1,6 @@
 mod frontmatter;
 mod index;
+mod links;
 mod markdown;
 mod vault;
 
@@ -38,6 +39,28 @@ pub struct PageContent {
     title: String,
     body: String,
     html: String,
+}
+
+/// A single grouped-by-source-page backlink entry, as returned to the
+/// frontend by `get_backlinks` (issue 06).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BacklinkEntry {
+    source_id: String,
+    source_title: String,
+    snippet: String,
+    modified_at: i64,
+}
+
+impl From<index::BacklinkEntry> for BacklinkEntry {
+    fn from(entry: index::BacklinkEntry) -> Self {
+        BacklinkEntry {
+            source_id: entry.source_id,
+            source_title: entry.source_title,
+            snippet: entry.snippet,
+            modified_at: entry.modified_at,
+        }
+    }
 }
 
 /// Result of resolving a `[[Link]]` title to a page (issue 05 / ADR-0009).
@@ -319,6 +342,31 @@ fn resolve_page_impl(state: &AppState, title: &str) -> Result<PageResolution, St
     })
 }
 
+/// Returns every backlink pointing at the page identified by `title`,
+/// grouped by source page (most-recently-modified source first) with a
+/// snippet of surrounding text per entry (issue 06).
+///
+/// `title` is normalized the same way for a persisted page's own title and
+/// for a dynamic page's title-only identity, so this works identically for
+/// both: a dynamic page has no row in `pages` at all, but its backlinks are
+/// simply whatever rows in `backlinks` already carry its normalized title as
+/// their target -- no `pages` lookup for the target side is needed.
+#[tauri::command]
+fn get_backlinks(state: State<AppState>, title: String) -> Result<Vec<BacklinkEntry>, String> {
+    get_backlinks_impl(&state, &title)
+}
+
+/// Shared implementation behind `get_backlinks`, split out for direct unit
+/// testing against a plain `AppState`.
+fn get_backlinks_impl(state: &AppState, title: &str) -> Result<Vec<BacklinkEntry>, String> {
+    let guard = state.db.lock().unwrap();
+    let conn = guard.as_ref().ok_or("No vault is open")?;
+
+    let normalized = frontmatter::normalize_title(title);
+    let entries = index::get_backlinks(conn, &normalized).map_err(|e| e.to_string())?;
+    Ok(entries.into_iter().map(BacklinkEntry::from).collect())
+}
+
 /// Materializes a dynamic page into a real persisted file the instant it
 /// receives its first write (ADR-0009): reuses `create_page_impl` (mint id,
 /// slug filename, frontmatter-only body -- identical to the explicit "new
@@ -361,6 +409,7 @@ pub fn run() {
             save_page,
             create_page,
             resolve_page,
+            get_backlinks,
             materialize_and_save_page,
         ])
         .run(tauri::generate_context!())
@@ -489,6 +538,103 @@ mod tests {
 
         let err = materialize_and_save_page_impl(&state, "Taken", "New content\n").unwrap_err();
         assert!(err.contains("already exists"));
+    }
+
+    #[test]
+    fn get_backlinks_groups_by_source_most_recently_modified_first() {
+        let dir = TempDir::new().unwrap();
+        // Older mtime.
+        write_page(&dir, "old-note.md", "---\nid: old\ntitle: Old Note\n---\nSee [[Target Page]] here.\n");
+        let old_path = dir.path().join("old-note.md");
+        let old_time = filetime::FileTime::from_unix_time(1_000_000, 0);
+        filetime::set_file_mtime(&old_path, old_time).unwrap();
+
+        // Newer mtime, and links to Target Page twice.
+        write_page(
+            &dir,
+            "new-note.md",
+            "---\nid: new\ntitle: New Note\n---\nFirst [[Target Page]] and again [[Target Page]].\n",
+        );
+        let new_path = dir.path().join("new-note.md");
+        let new_time = filetime::FileTime::from_unix_time(2_000_000, 0);
+        filetime::set_file_mtime(&new_path, new_time).unwrap();
+
+        write_page(&dir, "target.md", "---\nid: target\ntitle: Target Page\n---\nNothing links from here.\n");
+
+        let state = setup_vault(&dir);
+
+        let entries = get_backlinks_impl(&state, "Target Page").unwrap();
+
+        assert_eq!(entries.len(), 3, "expected 2 links from New Note + 1 from Old Note");
+        // Most-recently-modified source page first.
+        assert_eq!(entries[0].source_id, "new");
+        assert_eq!(entries[1].source_id, "new");
+        assert_eq!(entries[2].source_id, "old");
+        assert!(entries[0].snippet.contains("[[Target Page]]"));
+    }
+
+    #[test]
+    fn get_backlinks_works_for_a_dynamic_unmatched_target_title() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "source.md", "---\nid: s1\ntitle: Source\n---\nLinks to [[Not Yet Created]].\n");
+        let state = setup_vault(&dir);
+
+        // "Not Yet Created" has no persisted page/row -- resolve_page would
+        // report it as Dynamic -- but its backlinks must still be found.
+        assert!(matches!(
+            resolve_page_impl(&state, "Not Yet Created").unwrap(),
+            PageResolution::Dynamic { .. }
+        ));
+
+        let entries = get_backlinks_impl(&state, "Not Yet Created").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "s1");
+    }
+
+    #[test]
+    fn get_backlinks_is_empty_when_nothing_links_here() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "lonely.md", "---\nid: l1\ntitle: Lonely\n---\nNo links at all.\n");
+        let state = setup_vault(&dir);
+
+        let entries = get_backlinks_impl(&state, "Lonely").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn incremental_save_updates_backlinks_without_a_full_rebuild() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "source.md", "---\nid: s1\ntitle: Source\n---\nOriginally links to [[Old Target]].\n");
+        write_page(&dir, "old-target.md", "---\nid: ot\ntitle: Old Target\n---\n");
+        write_page(&dir, "new-target.md", "---\nid: nt\ntitle: New Target\n---\n");
+        let state = setup_vault(&dir);
+
+        assert_eq!(get_backlinks_impl(&state, "Old Target").unwrap().len(), 1);
+        assert_eq!(get_backlinks_impl(&state, "New Target").unwrap().len(), 0);
+
+        // Edit Source's body (as an ordinary save_page would) to link
+        // elsewhere instead -- no full rebuild, just update_page_content.
+        save_page_impl(&state, "s1", "Now links to [[New Target]] instead.\n").unwrap();
+
+        assert_eq!(get_backlinks_impl(&state, "Old Target").unwrap().len(), 0);
+        let updated = get_backlinks_impl(&state, "New Target").unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].source_id, "s1");
+    }
+
+    #[test]
+    fn newly_created_page_with_links_is_immediately_a_backlink_source() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "target.md", "---\nid: t1\ntitle: Target\n---\n");
+        let state = setup_vault(&dir);
+
+        assert_eq!(get_backlinks_impl(&state, "Target").unwrap().len(), 0);
+
+        let summary = materialize_and_save_page_impl(&state, "Fresh Source", "Links to [[Target]].\n").unwrap();
+
+        let entries = get_backlinks_impl(&state, "Target").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, summary.id);
     }
 
     #[test]

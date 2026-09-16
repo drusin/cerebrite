@@ -4,12 +4,14 @@
 // index (CONTEXT.md), not part of the git-synced source of truth (ADR-0001).
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use walkdir::WalkDir;
 
 use crate::frontmatter;
+use crate::links;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRecord {
@@ -17,6 +19,45 @@ pub struct PageRecord {
     pub title: String,
     pub path: PathBuf,
     pub body: String,
+    pub modified_at: i64,
+}
+
+/// One grouped-by-source-page backlink entry (issue 06): a page whose body
+/// contains a `[[Link]]` (or `#tag`, per CONTEXT.md's "Tag" definition --
+/// though tags aren't parsed yet as of this ticket) targeting the page whose
+/// backlinks were requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BacklinkEntry {
+    pub source_id: String,
+    pub source_title: String,
+    pub snippet: String,
+    pub modified_at: i64,
+}
+
+/// Current wall-clock time as a unix-epoch second count, used to timestamp
+/// `modified_at` on every index write that isn't the initial full rebuild
+/// (which instead uses each file's on-disk mtime -- see `collect_pages`).
+/// Falls back to `0` in the (practically impossible) case the system clock
+/// reads before the epoch, rather than panicking.
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A file's last-modified time as a unix-epoch second count, used as the
+/// initial `modified_at` baseline when the index is rebuilt from files that
+/// were never touched through this session (so a full rebuild still reflects
+/// real edit recency for "most-recently-modified source first" ordering).
+/// Falls back to "now" if the filesystem doesn't report a mtime.
+fn file_modified_at(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(now_epoch)
 }
 
 /// Walks `vault_path` for `.md` files (skipping dot-directories such as
@@ -52,6 +93,7 @@ pub fn collect_pages(vault_path: &Path) -> Result<Vec<PageRecord>> {
             title: parsed.title,
             path: path.to_path_buf(),
             body: parsed.body,
+            modified_at: file_modified_at(path),
         });
     }
 
@@ -59,6 +101,12 @@ pub fn collect_pages(vault_path: &Path) -> Result<Vec<PageRecord>> {
 }
 
 /// Drops and recreates the derived-index schema on `conn`.
+///
+/// `backlinks` tracks, per link occurrence, its source page and the
+/// *normalized title* of its target (issue 06) -- not a target id, since a
+/// link's target may be a dynamic page with no row in `pages` at all. This
+/// is a deliberate change from issue 02's original placeholder schema
+/// (`source_id`/`target_id`, both ids), which couldn't represent that case.
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "DROP TABLE IF EXISTS pages_fts;
@@ -69,15 +117,20 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              id TEXT PRIMARY KEY,
              title TEXT NOT NULL,
              path TEXT NOT NULL,
-             body TEXT NOT NULL
+             body TEXT NOT NULL,
+             modified_at INTEGER NOT NULL DEFAULT 0
          );
 
          CREATE VIRTUAL TABLE pages_fts USING fts5(id UNINDEXED, title, body);
 
          CREATE TABLE backlinks (
              source_id TEXT NOT NULL,
-             target_id TEXT NOT NULL
-         );",
+             target_normalized_title TEXT NOT NULL,
+             snippet TEXT NOT NULL
+         );
+
+         CREATE INDEX idx_backlinks_target ON backlinks(target_normalized_title);
+         CREATE INDEX idx_backlinks_source ON backlinks(source_id);",
     )
 }
 
@@ -91,8 +144,9 @@ pub fn build_index(conn: &mut Connection, vault_path: &Path) -> Result<usize> {
 
     let tx = conn.transaction()?;
     {
-        let mut insert_page =
-            tx.prepare("INSERT INTO pages (id, title, path, body) VALUES (?1, ?2, ?3, ?4)")?;
+        let mut insert_page = tx.prepare(
+            "INSERT INTO pages (id, title, path, body, modified_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
         let mut insert_fts =
             tx.prepare("INSERT INTO pages_fts (id, title, body) VALUES (?1, ?2, ?3)")?;
 
@@ -101,14 +155,64 @@ pub fn build_index(conn: &mut Connection, vault_path: &Path) -> Result<usize> {
                 page.id,
                 page.title,
                 page.path.to_string_lossy(),
-                page.body
+                page.body,
+                page.modified_at
             ])?;
             insert_fts.execute(params![page.id, page.title, page.body])?;
         }
     }
+    // Link extraction (issue 06) runs as its own pass, after every page row
+    // exists, so `replace_page_links` (which only needs the `backlinks`
+    // table) doesn't have to worry about insert ordering relative to targets
+    // -- a link's target is stored/matched purely by normalized title text,
+    // never a foreign key into `pages`.
+    for page in &pages {
+        replace_page_links(&tx, &page.id, &page.body)?;
+    }
     tx.commit()?;
 
     Ok(pages.len())
+}
+
+/// Re-extracts every `[[Link]]` occurrence out of `body` and replaces
+/// `source_id`'s rows in the `backlinks` table with the fresh set -- run
+/// every time a page's body changes (full rebuild, single-page save, or
+/// page creation) so other pages' Backlinks sections stay correct without a
+/// full rebuild (issue 06).
+pub fn replace_page_links(conn: &Connection, source_id: &str, body: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM backlinks WHERE source_id = ?1", params![source_id])?;
+
+    let mut insert =
+        conn.prepare("INSERT INTO backlinks (source_id, target_normalized_title, snippet) VALUES (?1, ?2, ?3)")?;
+    for link in links::extract_links(body) {
+        insert.execute(params![source_id, link.normalized_target, link.snippet])?;
+    }
+    Ok(())
+}
+
+/// Looks up every backlink whose target normalized title matches
+/// `normalized_target`, grouped by source page (most-recently-modified
+/// source first, entries within a group in document order) -- works
+/// identically whether `normalized_target` belongs to a persisted page or a
+/// dynamic (unmatched) one, since the lookup never requires a `pages` row
+/// for the target itself.
+pub fn get_backlinks(conn: &Connection, normalized_target: &str) -> rusqlite::Result<Vec<BacklinkEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.source_id, p.title, b.snippet, p.modified_at
+         FROM backlinks b
+         JOIN pages p ON p.id = b.source_id
+         WHERE b.target_normalized_title = ?1
+         ORDER BY p.modified_at DESC, p.id ASC, b.rowid ASC",
+    )?;
+    let rows = stmt.query_map(params![normalized_target], |row| {
+        Ok(BacklinkEntry {
+            source_id: row.get(0)?,
+            source_title: row.get(1)?,
+            snippet: row.get(2)?,
+            modified_at: row.get(3)?,
+        })
+    })?;
+    rows.collect()
 }
 
 /// Updates the derived index's `pages` and `pages_fts` rows for a single
@@ -122,13 +226,17 @@ pub fn update_page_content(
     body: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE pages SET title = ?1, body = ?2 WHERE id = ?3",
-        params![title, body, id],
+        "UPDATE pages SET title = ?1, body = ?2, modified_at = ?3 WHERE id = ?4",
+        params![title, body, now_epoch(), id],
     )?;
     conn.execute(
         "UPDATE pages_fts SET title = ?1, body = ?2 WHERE id = ?3",
         params![title, body, id],
     )?;
+    // Keep the derived link graph in sync with this page's new body (issue
+    // 06) -- other pages' Backlinks sections must reflect this save without
+    // a full index rebuild.
+    replace_page_links(conn, id, body)?;
     Ok(())
 }
 
@@ -143,13 +251,14 @@ pub fn insert_page(
     body: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO pages (id, title, path, body) VALUES (?1, ?2, ?3, ?4)",
-        params![id, title, path.to_string_lossy(), body],
+        "INSERT INTO pages (id, title, path, body, modified_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, title, path.to_string_lossy(), body, now_epoch()],
     )?;
     conn.execute(
         "INSERT INTO pages_fts (id, title, body) VALUES (?1, ?2, ?3)",
         params![id, title, body],
     )?;
+    replace_page_links(conn, id, body)?;
     Ok(())
 }
 
@@ -291,6 +400,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn build_index_populates_backlinks_from_wiki_links_in_bodies() {
+        let dir = tempdir().unwrap();
+        write_page(
+            dir.path(),
+            "a.md",
+            "---\nid: a\ntitle: A\n---\nA links to [[B]] right here.\n",
+        );
+        write_page(dir.path(), "b.md", "---\nid: b\ntitle: B\n---\nNo outgoing links.\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+
+        let entries = get_backlinks(&conn, "b").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "a");
+        assert!(entries[0].snippet.contains("[[B]]"));
+
+        assert!(get_backlinks(&conn, "a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn replace_page_links_updates_backlinks_in_place() {
+        let dir = tempdir().unwrap();
+        write_page(dir.path(), "a.md", "---\nid: a\ntitle: A\n---\nLinks to [[B]].\n");
+        write_page(dir.path(), "b.md", "---\nid: b\ntitle: B\n---\n");
+        write_page(dir.path(), "c.md", "---\nid: c\ntitle: C\n---\n");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        build_index(&mut conn, dir.path()).unwrap();
+        assert_eq!(get_backlinks(&conn, "b").unwrap().len(), 1);
+
+        replace_page_links(&conn, "a", "Now links to [[C]] instead.\n").unwrap();
+
+        assert!(get_backlinks(&conn, "b").unwrap().is_empty());
+        let entries = get_backlinks(&conn, "c").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_id, "a");
     }
 
     #[test]

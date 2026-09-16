@@ -8,6 +8,7 @@ import {
   createPage,
   resolvePage,
   materializeAndSavePage,
+  getBacklinks,
   type PageSummary,
   type PageResolution,
 } from "./vault-api";
@@ -30,6 +31,8 @@ const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
 const pageTitleEl = document.querySelector<HTMLElement>("#page-title");
 const pageBodyEl = document.querySelector<HTMLElement>("#page-body");
+const backlinksListEl = document.querySelector<HTMLUListElement>("#backlinks-list");
+const backlinksEmptyEl = document.querySelector<HTMLElement>("#backlinks-empty");
 
 // The page currently loaded in the editor: either a persisted page (has an
 // id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
@@ -126,6 +129,52 @@ function renderPageList(pages: PageSummary[]) {
   }
 }
 
+/**
+ * Renders the "Backlinks" section always appended at the bottom of a page's
+ * rendered content (issue 06): every other page's `[[Link]]` occurrences
+ * whose normalized target matches `title`, grouped by source page
+ * (most-recently-modified source first, per `get_backlinks`'s ordering),
+ * with a plain-text snippet per entry. Renders identically for persisted and
+ * dynamic pages -- always present, "No backlinks yet" rather than hidden
+ * when empty.
+ */
+async function renderBacklinks(title: string) {
+  if (!backlinksListEl) return;
+
+  const entries = await getBacklinks(title);
+  backlinksListEl.innerHTML = "";
+
+  if (entries.length === 0) {
+    backlinksEmptyEl?.removeAttribute("hidden");
+    return;
+  }
+  backlinksEmptyEl?.setAttribute("hidden", "");
+
+  let lastSourceId: string | null = null;
+  for (const entry of entries) {
+    if (entry.sourceId !== lastSourceId) {
+      const header = document.createElement("li");
+      header.className = "backlink-group-header";
+      const headerButton = document.createElement("button");
+      headerButton.type = "button";
+      headerButton.textContent = entry.sourceTitle;
+      headerButton.addEventListener("click", () => void selectPage(entry.sourceId));
+      header.appendChild(headerButton);
+      backlinksListEl.appendChild(header);
+      lastSourceId = entry.sourceId;
+    }
+
+    const item = document.createElement("li");
+    item.className = "backlink-snippet";
+    const snippetButton = document.createElement("button");
+    snippetButton.type = "button";
+    snippetButton.textContent = entry.snippet;
+    snippetButton.addEventListener("click", () => void selectPage(entry.sourceId));
+    item.appendChild(snippetButton);
+    backlinksListEl.appendChild(item);
+  }
+}
+
 /** Renders the title/body into the article view and (re)loads them into the editor. */
 async function renderPageArticle(title: string, body: string) {
   if (pageTitleEl) pageTitleEl.textContent = title;
@@ -146,6 +195,11 @@ async function renderPageArticle(title: string, body: string) {
     }
     await pageEditor.load(body);
   }
+
+  // Always appended at the bottom of the page's rendered content (issue 06),
+  // for both persisted and dynamic pages, since both render identically
+  // (ADR-0009).
+  await renderBacklinks(title);
 }
 
 /** Opens whatever `resolution` points to: an existing persisted page, or a dynamic (unmaterialized) one. */
