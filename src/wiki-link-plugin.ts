@@ -52,8 +52,11 @@
 // page-editor.ts and the existing visual style both apply to tags for free.
 import { findAndReplace } from "mdast-util-find-and-replace";
 import type { Root as MdastRoot } from "mdast";
-import { $inputRule, $nodeSchema, $remark } from "@milkdown/kit/utils";
+import { $inputRule, $nodeSchema, $prose, $remark } from "@milkdown/kit/utils";
 import { InputRule } from "@milkdown/kit/prose/inputrules";
+import { splitBlock } from "@milkdown/kit/prose/commands";
+import type { EditorState } from "@milkdown/kit/prose/state";
+import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
 
 /** The mdast node "type" used for a parsed `[[...]]` / `#tag` / `#[[...]]` run. */
 const MDAST_TYPE = "wikiLink";
@@ -90,14 +93,14 @@ const HASH_BRACKET_TAG_PATTERN = /#\[\[([^[\]\n]+)\]\]/g;
 const HASH_TAG_PATTERN = /#([\w/-]+)/g;
 
 /**
- * Live-typing counterpart of `HASH_TAG_PATTERN`: since a bare tag has no
- * closing delimiter, the input rule instead fires on the first "boundary"
- * character typed after the tag's word-ish run (whitespace or a punctuation
- * mark that can't be part of a title), converting everything before it into
- * a chip and leaving the boundary character in the document as ordinary
- * text right after the chip.
+ * The single characters (beyond Enter, handled separately) that can end a
+ * bare `#tagname` run -- whitespace or a punctuation mark that can't be part
+ * of a title, i.e. the same boundary set `HASH_TAG_PATTERN` implicitly stops
+ * at. Kept as individual characters (rather than folded into one regex, as
+ * the old `HASH_TAG_INPUT_PATTERN` was) because `hashTagBoundaryPlugin` below
+ * matches them directly against `KeyboardEvent.key` in `handleKeyDown`.
  */
-const HASH_TAG_INPUT_PATTERN = /#([\w/-]+)([ \t.,;:!?)\]}"'])$/;
+const HASH_TAG_BOUNDARY_CHARS = new Set([" ", "\t", ".", ",", ";", ":", "!", "?", ")", "]", "}", '"', "'"]);
 
 /** Node types whose text content should never be treated as a wiki-link/tag source. */
 const IGNORED_ANCESTOR_TYPES = ["code", "inlineCode"];
@@ -266,19 +269,94 @@ export const hashBracketTagInputRule = $inputRule(
 );
 
 /**
- * Converts a just-typed `#tagname` into a chip node live, as the user types
- * the boundary character right after it (see `HASH_TAG_INPUT_PATTERN`) --
- * the boundary character itself is left in the document, untouched, right
- * after the new chip.
+ * Finds a bare `#tagname` run ending exactly at the cursor, if any -- used by
+ * `hashTagBoundaryPlugin` below to decide whether a just-pressed key should
+ * convert it into a chip. Mirrors `IGNORED_ANCESTOR_TYPES`'s intent (never
+ * inside a code block/span): `spec.code` is the same signal
+ * prosemirror-inputrules itself uses to suppress input rules there.
  */
-export const hashTagInputRule = $inputRule(
+function findTrailingTag(state: EditorState): { start: number; end: number; rawTag: string } | null {
+  const { $from } = state.selection;
+  if (!$from.parent.isTextblock) return null;
+  if ($from.parent.type.spec.code) return null;
+  if ($from.marks().some((mark) => mark.type.spec.code)) return null;
+
+  const textBeforeCursor = $from.parent.textContent.slice(0, $from.parentOffset);
+  const match = /#([\w/-]+)$/.exec(textBeforeCursor);
+  const rawTag = match?.[1];
+  if (!match || rawTag === undefined) return null;
+
+  return { start: $from.pos - match[0].length, end: $from.pos, rawTag };
+}
+
+/**
+ * Converts a just-typed `#tagname` into a chip the moment a boundary
+ * character (whitespace/punctuation, `HASH_TAG_BOUNDARY_CHARS`) or Enter
+ * would otherwise end it -- both live, as the tag is completed, not only on
+ * the next full reparse (see `wikiLinkRemarkAttacher`, which is otherwise the
+ * only thing that ever converts a bare tag, e.g. after switching pages away
+ * and back).
+ *
+ * Implemented via `handleKeyDown` rather than an `InputRule` (an `InputRule`
+ * only ever sees literal typed text, via ProseMirror's `handleTextInput`,
+ * which Milkdown's own input-rule engine -- `customInputRules` in
+ * `@milkdown/prose` -- gates on `view.composing`: see its `run()`, `if
+ * (view.composing) return false`). That gate is meant to defer to IME
+ * composition, but WebKitGTK (this app's Linux webview) has been observed to
+ * leave `view.composing` stuck `true` for perfectly ordinary typing, which
+ * silently and unpredictably disables every `InputRule` in the app -- this
+ * was the actual cause of "tags don't turn into links" bug reports, not
+ * anything about *when* the conversion is attempted. `handleKeyDown` fires
+ * before any of that: it's a genuine `keydown` handler, entirely outside the
+ * text-input/composition pipeline, so it isn't affected by that flag.
+ *
+ * Each matched key is fully owned here (both the tag conversion *and*
+ * inserting the actual character are done in one dispatch, then
+ * `event.preventDefault()` + returning `true`) rather than dispatching a
+ * transaction and returning `false` to let the browser insert the character
+ * normally afterwards -- `preventDefault`ing a `keydown` suppresses the
+ * native insertion that would otherwise follow it, so that character has to
+ * be added back in manually or it's silently dropped.
+ *
+ * Enter is scoped to plain paragraphs only (checked before touching
+ * anything): list items, headings, blockquotes and code blocks all have
+ * their own Enter behavior (list continuation, exiting a heading, etc., see
+ * the sibling `node/*.ts` keymaps in `@milkdown/preset-commonmark`) that this
+ * doesn't attempt to replicate. Outside a plain paragraph this returns
+ * `false` without dispatching anything, so Enter falls through to those
+ * unchanged. The boundary characters have no such structural side effect
+ * (they just insert ordinary text), so those apply in any textblock.
+ */
+export const hashTagBoundaryPlugin = $prose(
   (ctx) =>
-    new InputRule(HASH_TAG_INPUT_PATTERN, (state, match, start, end) => {
-      const rawTag = match[1];
-      const boundary = match[2];
-      if (rawTag === undefined || boundary === undefined) return null;
-      const node = wikiLinkSchema.type(ctx).create({ title: rawTag, form: "hash" satisfies LinkForm });
-      return state.tr.replaceWith(start, end - boundary.length, node);
+    new Plugin({
+      key: new PluginKey("hashTagBoundary"),
+      props: {
+        handleKeyDown(view, event) {
+          if (event.key === "Enter") {
+            const { $from } = view.state.selection;
+            if ($from.parent.type.name !== "paragraph") return false;
+            const found = findTrailingTag(view.state);
+            if (!found) return false;
+
+            const node = wikiLinkSchema.type(ctx).create({ title: found.rawTag, form: "hash" satisfies LinkForm });
+            view.dispatch(view.state.tr.replaceWith(found.start, found.end, node));
+            splitBlock(view.state, view.dispatch, view);
+            event.preventDefault();
+            return true;
+          }
+
+          if (event.key.length !== 1 || !HASH_TAG_BOUNDARY_CHARS.has(event.key)) return false;
+          const found = findTrailingTag(view.state);
+          if (!found) return false;
+
+          const node = wikiLinkSchema.type(ctx).create({ title: found.rawTag, form: "hash" satisfies LinkForm });
+          const tr = view.state.tr.replaceWith(found.start, found.end, node).insertText(event.key, found.start + 1);
+          view.dispatch(tr);
+          event.preventDefault();
+          return true;
+        },
+      },
     })
 );
 
@@ -287,6 +365,6 @@ export const wikiLinkPlugins = [
   wikiLinkSchema,
   wikiLinkInputRule,
   hashBracketTagInputRule,
-  hashTagInputRule,
+  hashTagBoundaryPlugin,
   wikiLinkRemarkPlugin,
 ].flat();
