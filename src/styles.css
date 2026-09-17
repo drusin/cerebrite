@@ -426,6 +426,10 @@ body {
 /* Full search modal (ticket 13): a single quick-switcher-style overlay, per
    the referenced prototype spec -- generously sized, scrollable results
    list, no separate "content search" surface. */
+.search-modal-overlay[hidden] {
+  display: none;
+}
+
 .search-modal-overlay {
   position: fixed;
   inset: 0;
