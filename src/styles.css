@@ -116,6 +116,10 @@ body {
   align-items: stretch;
 }
 
+.workspace[hidden] {
+  display: none;
+}
+
 .sidebar {
   width: 240px;
   flex-shrink: 0;
@@ -321,6 +325,10 @@ body {
   display: flex;
   align-items: center;
   gap: 0.75em;
+}
+
+.page-trash-banner[hidden] {
+  display: none;
 }
 
 .page-view {
