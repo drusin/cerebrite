@@ -529,14 +529,8 @@ fn create_page_impl(state: &AppState, title: &str) -> Result<PageSummary, String
     let mut db_guard = state.db.lock().unwrap();
     let conn = db_guard.as_mut().ok_or("No vault is open")?;
 
-    let existing_titles: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM pages WHERE title = ?1",
-            params![trimmed],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if existing_titles > 0 {
+    let normalized = frontmatter::normalize_title(trimmed);
+    if find_page_by_normalized_title(conn, &normalized).is_some() {
         return Err(format!("A page titled '{trimmed}' already exists"));
     }
 
@@ -1066,6 +1060,16 @@ mod tests {
         let state = setup_vault(&dir);
 
         let err = materialize_and_save_page_impl(&state, "Taken", "New content\n").unwrap_err();
+        assert!(err.contains("already exists"));
+    }
+
+    #[test]
+    fn create_page_rejects_a_title_collision_that_only_differs_by_case_or_whitespace() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "taken.md", "---\nid: x\ntitle: Taken\n---\n");
+        let state = setup_vault(&dir);
+
+        let err = create_page_impl(&state, "  taken  ").unwrap_err();
         assert!(err.contains("already exists"));
     }
 
