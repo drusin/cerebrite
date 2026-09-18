@@ -22,8 +22,11 @@ the full diff. Not urgent bugs unless marked **bug**.
   project, not a quick fix.
 - **Frontend sync-status indicator**: ticket 14 built `get_sync_status` and a
   `sync-status-changed` event on the Rust side, but no UI reads either of
-  them. A user currently has no visual indication of whether sync is
-  running, succeeded, or needs attention.
+  them (checked `src/main.ts` again after the Settings UI commit — neither
+  symbol appears there). A user still has no visual indication of whether
+  sync is running, succeeded, or needs attention, even though the new
+  Settings modal (`src/main.ts`, commit `0155130`) would have been a natural
+  place to surface it.
 
 ## Bugs / correctness gaps
 
@@ -38,9 +41,9 @@ the full diff. Not urgent bugs unless marked **bug**.
 - A couple of code comments assert end-to-end scenarios as "verified" that
   were never actually exercised by a test: ticket 08's multi-hop redirect
   chain colliding with a real two-device git merge, and ticket 14's redirect
-  log (`redirects.tsv`) surviving a real sync conflict (its conflict tests
-  only cover ordinary page files, never `redirects.tsv`). Worth either
-  writing the real test or correcting the comment.
+  log (`redirects.tsv`) surviving a real sync conflict — `src-tauri/src/sync.rs`
+  still has no test that touches `redirects.tsv`, only ordinary page files.
+  Worth either writing the real test or correcting the comment.
 
 ## Simplifications worth revisiting
 
@@ -76,20 +79,28 @@ the full diff. Not urgent bugs unless marked **bug**.
 
 ## Code-health follow-ups (from `/code-review`)
 
-- `src-tauri/src/lib.rs` (1400+ lines) and `src/main.ts` (~900 lines) grew
-  into single-file dumping grounds touched by nearly every ticket — a
-  departure from the pattern set by early tickets, which did extract
-  cohesive frontend concerns into their own modules (`vault-api.ts`,
-  `page-editor.ts`, `wiki-link-plugin.ts`, `heading-slug.ts`). Worth
-  splitting `lib.rs` by feature area (pages, search, sync, trash) and pulling
-  the sidebar/search-modal/trash-view logic out of `main.ts`.
-- `lib.rs` has the same "scan `pages`, normalize each title, compare" shape
-  written three separate times (`resolve_page_impl`, the trashed-page loop
-  inside it, and `find_page_by_normalized_title`) instead of consistently
-  reusing one helper — three different tickets each reinvented it.
-- `get_backlinks_impl` re-derives redirect-chain heading-slug resolution
-  inline instead of delegating to the existing `resolve_heading_slug`-style
-  helper a few lines above it.
+- **(done)** `src-tauri/src/lib.rs` has since been split by feature area —
+  it now declares `mod frontmatter; mod heading_slug; mod index; mod links;
+  mod markdown; mod redirects; mod search; mod settings; mod sync; mod
+  trash; mod vault;` and each lives in its own file (`sync.rs`, `search.rs`,
+  `trash.rs`, `index.rs`, `redirects.rs`, `links.rs`, `frontmatter.rs`,
+  `settings.rs`, `vault.rs`, `markdown.rs`, `heading_slug.rs`). `lib.rs`
+  itself is down to ~1445 lines of `AppState`/Tauri-command glue, which is
+  what's left after the split — not a monolith anymore.
+- **(done)** `get_backlinks_impl` (`src-tauri/src/lib.rs`) now calls the
+  shared `redirects::resolve_heading_slug` helper directly instead of
+  re-deriving redirect-chain resolution inline.
+- `src/main.ts` (~1010 lines) is still a single-file dumping ground — the
+  sidebar/search-modal/trash-view/settings-modal logic added by tickets
+  12–16 and the later Settings UI commit all still live there, unlike the
+  frontend concerns tickets 06–08 did extract into their own modules
+  (`vault-api.ts`, `page-editor.ts`, `wiki-link-plugin.ts`,
+  `heading-slug.ts`). Worth pulling those out now that `lib.rs` has shown
+  the pattern works.
+- `lib.rs` still has the same "scan `pages`, normalize each title, compare"
+  shape written three separate times (`resolve_page_impl`, the trashed-page
+  loop inside it, and `find_page_by_normalized_title`) instead of
+  consistently reusing one helper.
 
 ## Verification gaps (nothing wrong found, just untested with real hardware)
 
