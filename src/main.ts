@@ -132,6 +132,15 @@ function recordRecentOpen(entry: RecentEntry) {
   renderRecentList();
 }
 
+/** Drops any Recent entries pointing at pages that are no longer valid (trashed or purged), then re-renders. */
+function pruneRecentEntries(removedPageIds: Iterable<string>) {
+  const removed = new Set(removedPageIds);
+  if (removed.size === 0) return;
+  const before = recentPages.length;
+  recentPages = recentPages.filter((entry) => !(entry.kind === "persisted" && entry.pageId && removed.has(entry.pageId)));
+  if (recentPages.length !== before) renderRecentList();
+}
+
 function renderRecentList() {
   if (!recentListEl) return;
   recentListEl.innerHTML = "";
@@ -401,12 +410,17 @@ async function openResolution(resolution: PageResolution) {
   // Recent (issue 12) tracks last-*opened*, so every navigation here counts
   // as an open -- including re-opening the already-active page (e.g. a
   // different heading target on the same page) -- and moves it to the top
-  // rather than duplicating it.
-  recordRecentOpen(
-    resolution.kind === "persisted"
-      ? { key: `p:${resolution.id}`, title: resolution.title, kind: "persisted", pageId: resolution.id }
-      : { key: `d:${resolution.normalizedTitle}`, title: resolution.normalizedTitle, kind: "dynamic" }
-  );
+  // rather than duplicating it. Trashed pages are excluded: they're reached
+  // only from the Trash list itself, and recording them would leave a dead
+  // link behind in Recent once the page is later purged.
+  const isTrashedPage = resolution.kind === "persisted" && resolution.inTrash === true;
+  if (!isTrashedPage) {
+    recordRecentOpen(
+      resolution.kind === "persisted"
+        ? { key: `p:${resolution.id}`, title: resolution.title, kind: "persisted", pageId: resolution.id }
+        : { key: `d:${resolution.normalizedTitle}`, title: resolution.normalizedTitle, kind: "dynamic" }
+    );
+  }
 
   const alreadyOpen =
     (resolution.kind === "persisted" && currentPage?.kind === "persisted" && currentPage.id === resolution.id) ||
@@ -523,6 +537,7 @@ async function handleDeletePageClick(id: string) {
     currentPage = null;
     pageArticleEl?.setAttribute("hidden", "");
     pageViewEmptyEl?.removeAttribute("hidden");
+    pruneRecentEntries([id]);
     await loadPages();
     await loadTrash();
   } catch (err) {
@@ -608,7 +623,9 @@ async function handleEmptyTrashClick() {
   if (!(await confirmDialog("Permanently delete all trashed pages? This cannot be undone."))) return;
 
   try {
+    const purgedIds = (await listTrashedPages()).map((page) => page.id);
     await emptyTrash();
+    pruneRecentEntries(purgedIds);
     if (currentPage?.kind === "persisted" && currentPage.inTrash) {
       currentPage = null;
       pageArticleEl?.setAttribute("hidden", "");
