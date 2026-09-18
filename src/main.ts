@@ -22,6 +22,16 @@ import {
   type SearchResult,
   type Theme,
 } from "./vault-api";
+// `confirm`/`message` from the dialog plugin, not `window.confirm`/`window.alert`:
+// tauri-plugin-dialog's auto-injected webview shim (init-iife.js in the 2.7.3
+// crate) overrides those globals to call a `plugin:dialog|confirm` IPC
+// command that plugin version never actually registers (only `message` is),
+// so `window.confirm()` always rejects with "Command not found" and
+// `window.alert()` fires-and-forgets without blocking. The plugin's own JS
+// API calls the correct `plugin:dialog|message` command under the hood and
+// actually works. `window.prompt()` is untouched by that shim and still
+// works natively, so it's used as-is elsewhere in this file.
+import { confirm as confirmDialog, message as messageDialog } from "@tauri-apps/plugin-dialog";
 import { PageEditor } from "./page-editor";
 import { humanizeHeadingSlug } from "./heading-slug";
 
@@ -506,7 +516,7 @@ async function loadTrash() {
  * page view, since the page is no longer an ordinary persisted page.
  */
 async function handleDeletePageClick(id: string) {
-  if (!window.confirm("Move this page to trash?")) return;
+  if (!(await confirmDialog("Move this page to trash?"))) return;
 
   try {
     await trashPage(id);
@@ -516,7 +526,7 @@ async function handleDeletePageClick(id: string) {
     await loadPages();
     await loadTrash();
   } catch (err) {
-    window.alert(String(err));
+    await messageDialog(String(err));
   }
 }
 
@@ -539,7 +549,7 @@ async function handleRenamePageClick(id: string, currentTitle: string) {
 
   const trimmed = newTitle.trim();
   if (!trimmed) {
-    window.alert("Title cannot be empty.");
+    await messageDialog("Title cannot be empty.");
     return;
   }
   if (trimmed === currentTitle) return;
@@ -552,7 +562,7 @@ async function handleRenamePageClick(id: string, currentTitle: string) {
   }
   if (affectedCount > 0) {
     const linkWord = affectedCount === 1 ? "link" : "links";
-    if (!window.confirm(`This will also update ${affectedCount} ${linkWord} in other pages. Continue?`)) {
+    if (!(await confirmDialog(`This will also update ${affectedCount} ${linkWord} in other pages. Continue?`))) {
       return;
     }
   }
@@ -576,7 +586,7 @@ async function handleRenamePageClick(id: string, currentTitle: string) {
       await renderBacklinks(page.title);
     }
   } catch (err) {
-    window.alert(String(err));
+    await messageDialog(String(err));
   }
 }
 
@@ -589,13 +599,13 @@ async function handleRestoreClick(trashedFilename: string) {
     currentPage = null; // force a fresh render so the trash banner/button clear
     await selectPage(summary.id);
   } catch (err) {
-    window.alert(String(err));
+    await messageDialog(String(err));
   }
 }
 
 /** Explicit "empty trash" action (issue 10): permanently deletes every trashed page. There is no other purge path. */
 async function handleEmptyTrashClick() {
-  if (!window.confirm("Permanently delete all trashed pages? This cannot be undone.")) return;
+  if (!(await confirmDialog("Permanently delete all trashed pages? This cannot be undone."))) return;
 
   try {
     await emptyTrash();
@@ -606,7 +616,7 @@ async function handleEmptyTrashClick() {
     }
     await loadTrash();
   } catch (err) {
-    window.alert(String(err));
+    await messageDialog(String(err));
   }
 }
 
@@ -622,7 +632,7 @@ async function handleNewPageClick() {
 
   const trimmed = title.trim();
   if (!trimmed) {
-    window.alert("Title cannot be empty.");
+    await messageDialog("Title cannot be empty.");
     return;
   }
 
@@ -631,7 +641,7 @@ async function handleNewPageClick() {
     await loadPages();
     await selectPage(summary.id);
   } catch (err) {
-    window.alert(String(err));
+    await messageDialog(String(err));
   }
 }
 
@@ -704,7 +714,7 @@ async function handleCreatePageFromSearch(query: string) {
     await loadPages();
     await selectPage(summary.id);
   } catch (err) {
-    window.alert(String(err));
+    await messageDialog(String(err));
   }
 }
 
@@ -930,7 +940,7 @@ async function handleChangeVaultFolderClick() {
   try {
     path = await pickVaultFolder();
   } catch (err) {
-    window.alert(String(err));
+    await messageDialog(String(err));
     return;
   }
   if (!path) return; // user cancelled
@@ -946,7 +956,7 @@ async function handleChangeVaultFolderClick() {
     closeSettingsModal();
     await openVaultAndLoad(path);
   } catch (err) {
-    window.alert(String(err));
+    await messageDialog(String(err));
   }
 }
 
