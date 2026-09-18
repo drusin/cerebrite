@@ -48,8 +48,25 @@ export type PageResolution =
     }
   | { kind: "dynamic"; normalizedTitle: string; headingSlug?: string | null };
 
-export function getRememberedVault(): Promise<string | null> {
-  return invoke("get_remembered_vault");
+/// Forced color-scheme preference (Settings UI): "system" defers to
+/// `prefers-color-scheme`, "light"/"dark" override it.
+export type Theme = "system" | "light" | "dark";
+
+/// The app's persisted settings (Settings UI): `vaultPath` is the remembered
+/// vault folder (`null` on first run), `theme` the forced color scheme.
+export interface Settings {
+  vaultPath: string | null;
+  theme: Theme;
+}
+
+export function getSettings(): Promise<Settings> {
+  return invoke("get_settings");
+}
+
+/// Persists the forced color-scheme preference. Applying it to the page is
+/// the caller's job (see `applyTheme` in main.ts).
+export function setTheme(theme: Theme): Promise<void> {
+  return invoke("set_theme", { theme });
 }
 
 export function pickVaultFolder(): Promise<string | null> {

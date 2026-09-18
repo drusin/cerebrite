@@ -5,6 +5,7 @@ mod links;
 mod markdown;
 mod redirects;
 mod search;
+mod settings;
 mod sync;
 mod trash;
 mod vault;
@@ -205,11 +206,19 @@ fn derived_index_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Returns the previously remembered vault path, if any, so the frontend can
-/// auto-open it instead of prompting the user again.
+/// Returns the app's persisted settings (remembered vault path, forced color
+/// scheme) so the frontend can auto-open the vault and apply the theme
+/// without prompting the user again.
 #[tauri::command]
-fn get_remembered_vault(app: AppHandle) -> Option<String> {
-    vault::load_remembered_vault(&app).map(|p| p.to_string_lossy().to_string())
+fn get_settings(app: AppHandle) -> settings::Settings {
+    settings::load(&app)
+}
+
+/// Persists the forced color-scheme preference (Settings UI). Applying it to
+/// the page is the frontend's job; this only saves it for next launch.
+#[tauri::command]
+fn set_theme(app: AppHandle, theme: settings::Theme) -> Result<(), String> {
+    settings::set_theme(&app, theme).map_err(|e| e.to_string())
 }
 
 /// Opens a native folder picker and returns the chosen path, or `None` if the
@@ -264,7 +273,7 @@ fn open_vault(app: AppHandle, state: State<AppState>, path: String) -> Result<Va
     }
 
     vault::ensure_git_repo(&vault_path).map_err(|e| e.to_string())?;
-    vault::persist_vault_path(&app, &vault_path).map_err(|e| e.to_string())?;
+    settings::set_vault_path(&app, &vault_path).map_err(|e| e.to_string())?;
     let device_id = vault::load_or_create_device_id(&app).map_err(|e| e.to_string())?;
 
     let db_file = derived_index_path(&app)?;
@@ -913,7 +922,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
-            get_remembered_vault,
+            get_settings,
+            set_theme,
             pick_vault_folder,
             open_vault,
             list_pages,

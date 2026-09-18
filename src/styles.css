@@ -11,8 +11,35 @@
   line-height: 24px;
   font-weight: 400;
 
-  color: #0f0f0f;
-  background-color: #f6f6f6;
+  /* Light-mode values for everything that differs between color schemes.
+     The dark-mode block below overrides these same variables -- either via
+     `prefers-color-scheme` (system default) or `[data-theme="dark"]` (an
+     explicit override from Settings) -- rather than duplicating every rule
+     that uses them. */
+  --fg: #0f0f0f;
+  --bg: #f6f6f6;
+  --link-hover: #535bf2;
+  --input-fg: #0f0f0f;
+  --input-bg: #ffffff;
+  --button-active-bg: #e8e8e8;
+  --sidebar-border: rgba(0, 0, 0, 0.1);
+  --compact-sidebar-bg: #f6f6f6;
+  --page-list-hover-bg: rgba(0, 0, 0, 0.06);
+  --wiki-chip-bg: rgba(57, 108, 216, 0.15);
+  --wiki-chip-fg: #396cd8;
+  --wiki-chip-hover-bg: rgba(57, 108, 216, 0.28);
+  --backlinks-border: rgba(0, 0, 0, 0.1);
+  --backlink-header-fg: #396cd8;
+  --backlink-hover-bg: rgba(0, 0, 0, 0.06);
+  --modal-bg: #f6f6f6;
+  --modal-border: rgba(0, 0, 0, 0.1);
+  --result-active-bg: rgba(57, 108, 216, 0.15);
+  --tag-chip-bg: rgba(57, 108, 216, 0.15);
+  --tag-chip-fg: #396cd8;
+  --snippet-mark-bg: rgba(255, 213, 79, 0.6);
+
+  color: var(--fg);
+  background-color: var(--bg);
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -53,7 +80,7 @@ a {
 }
 
 a:hover {
-  color: #535bf2;
+  color: var(--link-hover);
 }
 
 h1 {
@@ -68,8 +95,8 @@ button {
   font-size: 1em;
   font-weight: 500;
   font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
+  color: var(--input-fg);
+  background-color: var(--input-bg);
   transition: border-color 0.25s;
   box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
 }
@@ -83,7 +110,7 @@ button:hover {
 }
 button:active {
   border-color: #396cd8;
-  background-color: #e8e8e8;
+  background-color: var(--button-active-bg);
 }
 
 input,
@@ -124,7 +151,7 @@ body {
   width: 240px;
   flex-shrink: 0;
   overflow-y: auto;
-  border-right: 1px solid rgba(0, 0, 0, 0.1);
+  border-right: 1px solid var(--sidebar-border);
   padding: 0.5em 0.75em;
   box-sizing: border-box;
   transition: width 0.15s ease, padding 0.15s ease;
@@ -142,7 +169,8 @@ body {
   text-align: left;
 }
 
-.sidebar-collapse-toggle {
+.sidebar-collapse-toggle,
+.sidebar-icon-button {
   padding: 0.3em 0.6em;
   box-shadow: none;
 }
@@ -233,7 +261,7 @@ body {
   max-width: 320px;
   transform: translateX(-100%);
   transition: transform 0.2s ease;
-  background-color: #f6f6f6;
+  background-color: var(--compact-sidebar-bg);
   box-shadow: 2px 0 12px rgba(0, 0, 0, 0.2);
 }
 
@@ -321,7 +349,7 @@ body {
 }
 
 .page-list button:hover {
-  background: rgba(0, 0, 0, 0.06);
+  background: var(--page-list-hover-bg);
 }
 
 .page-list button.active {
@@ -392,19 +420,19 @@ body {
   display: inline-block;
   padding: 0.05em 0.5em;
   border-radius: 1em;
-  background: rgba(57, 108, 216, 0.15);
-  color: #396cd8;
+  background: var(--wiki-chip-bg);
+  color: var(--wiki-chip-fg);
   cursor: pointer;
 }
 
 .wiki-link-chip:hover {
-  background: rgba(57, 108, 216, 0.28);
+  background: var(--wiki-chip-hover-bg);
 }
 
 .backlinks-section {
   margin-top: 3em;
   padding-top: 1em;
-  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  border-top: 1px solid var(--backlinks-border);
 }
 
 .backlinks-section h2 {
@@ -434,7 +462,7 @@ body {
   padding: 0.2em 0;
   font-weight: 600;
   cursor: pointer;
-  color: #396cd8;
+  color: var(--backlink-header-fg);
 }
 
 .backlink-snippet {
@@ -455,7 +483,7 @@ body {
 }
 
 .backlink-snippet button:hover {
-  background: rgba(0, 0, 0, 0.06);
+  background: var(--backlink-hover-bg);
   opacity: 1;
 }
 
@@ -487,7 +515,7 @@ body {
 .search-modal {
   width: min(640px, 90vw);
   max-height: 70vh;
-  background: #f6f6f6;
+  background: var(--modal-bg);
   border-radius: 10px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
   display: flex;
@@ -500,7 +528,7 @@ body {
   align-items: center;
   gap: 0.75em;
   padding: 0.75em;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  border-bottom: 1px solid var(--modal-border);
 }
 
 .search-input {
@@ -544,7 +572,7 @@ body {
 
 .search-result:hover,
 .search-result.active {
-  background: rgba(57, 108, 216, 0.15);
+  background: var(--result-active-bg);
 }
 
 .search-result-title {
@@ -568,8 +596,8 @@ body {
   margin-top: 0.25em;
   padding: 0.05em 0.5em;
   border-radius: 1em;
-  background: rgba(57, 108, 216, 0.15);
-  color: #396cd8;
+  background: var(--tag-chip-bg);
+  color: var(--tag-chip-fg);
   font-size: 0.85em;
 }
 
@@ -581,7 +609,7 @@ body {
 }
 
 .search-result-snippet mark {
-  background: rgba(255, 213, 79, 0.6);
+  background: var(--snippet-mark-bg);
   color: inherit;
   border-radius: 3px;
   padding: 0 0.1em;
@@ -600,77 +628,126 @@ body {
   font-style: italic;
 }
 
+/* Settings modal: same overlay/card treatment as the search modal (shared
+   `--modal-*` variables), plus its own sections/theme-radio layout. */
+.settings-modal-overlay[hidden] {
+  display: none;
+}
+
+.settings-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 10vh;
+}
+
+.settings-modal {
+  width: min(420px, 90vw);
+  max-height: 70vh;
+  overflow-y: auto;
+  background: var(--modal-bg);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  padding: 0.5em 1.25em 1.25em;
+  box-sizing: border-box;
+}
+
+.settings-modal-header {
+  padding: 0.75em 0;
+  border-bottom: 1px solid var(--modal-border);
+  margin-bottom: 1em;
+}
+
+.settings-modal-header h2 {
+  margin: 0;
+}
+
+.settings-section {
+  margin-bottom: 1.5em;
+}
+
+.settings-section h3 {
+  font-size: 0.9em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.6;
+  margin: 0 0 0.5em;
+}
+
+.settings-vault-path {
+  font-family: monospace;
+  font-size: 0.85em;
+  word-break: break-all;
+  opacity: 0.8;
+  margin: 0 0 0.75em;
+}
+
+.settings-theme-options {
+  display: flex;
+  gap: 1em;
+}
+
+.settings-theme-options label {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  cursor: pointer;
+}
+
+/* Forced color scheme (Settings): `[data-theme="dark"]` overrides the same
+   variables the `prefers-color-scheme` block below sets, and `:not([data-
+   theme="light"])` keeps the OS-driven default working for "System" (no
+   attribute) without a third, separate variable block. */
 @media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+  :root:not([data-theme="light"]) {
+    --fg: #f6f6f6;
+    --bg: #2f2f2f;
+    --link-hover: #24c8db;
+    --input-fg: #ffffff;
+    --input-bg: #0f0f0f98;
+    --button-active-bg: #0f0f0f69;
+    --sidebar-border: rgba(255, 255, 255, 0.15);
+    --compact-sidebar-bg: #2f2f2f;
+    --page-list-hover-bg: rgba(255, 255, 255, 0.08);
+    --wiki-chip-bg: rgba(36, 200, 219, 0.2);
+    --wiki-chip-fg: #24c8db;
+    --wiki-chip-hover-bg: rgba(36, 200, 219, 0.32);
+    --backlinks-border: rgba(255, 255, 255, 0.15);
+    --backlink-header-fg: #24c8db;
+    --backlink-hover-bg: rgba(255, 255, 255, 0.08);
+    --modal-bg: #2f2f2f;
+    --modal-border: rgba(255, 255, 255, 0.15);
+    --result-active-bg: rgba(36, 200, 219, 0.18);
+    --tag-chip-bg: rgba(36, 200, 219, 0.2);
+    --tag-chip-fg: #24c8db;
+    --snippet-mark-bg: rgba(255, 213, 79, 0.35);
   }
+}
 
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-
-  .sidebar {
-    border-right-color: rgba(255, 255, 255, 0.15);
-  }
-
-  .workspace.compact .sidebar {
-    background-color: #2f2f2f;
-  }
-
-  .page-list button:hover {
-    background: rgba(255, 255, 255, 0.08);
-  }
-
-  .wiki-link-chip {
-    background: rgba(36, 200, 219, 0.2);
-    color: #24c8db;
-  }
-
-  .wiki-link-chip:hover {
-    background: rgba(36, 200, 219, 0.32);
-  }
-
-  .backlinks-section {
-    border-top-color: rgba(255, 255, 255, 0.15);
-  }
-
-  .backlink-group-header button {
-    color: #24c8db;
-  }
-
-  .backlink-snippet button:hover {
-    background: rgba(255, 255, 255, 0.08);
-  }
-
-  .search-modal {
-    background: #2f2f2f;
-  }
-
-  .search-modal-header {
-    border-bottom-color: rgba(255, 255, 255, 0.15);
-  }
-
-  .search-result:hover,
-  .search-result.active {
-    background: rgba(36, 200, 219, 0.18);
-  }
-
-  .search-result-tag-chip {
-    background: rgba(36, 200, 219, 0.2);
-    color: #24c8db;
-  }
-
-  .search-result-snippet mark {
-    background: rgba(255, 213, 79, 0.35);
-  }
+:root[data-theme="dark"] {
+  --fg: #f6f6f6;
+  --bg: #2f2f2f;
+  --link-hover: #24c8db;
+  --input-fg: #ffffff;
+  --input-bg: #0f0f0f98;
+  --button-active-bg: #0f0f0f69;
+  --sidebar-border: rgba(255, 255, 255, 0.15);
+  --compact-sidebar-bg: #2f2f2f;
+  --page-list-hover-bg: rgba(255, 255, 255, 0.08);
+  --wiki-chip-bg: rgba(36, 200, 219, 0.2);
+  --wiki-chip-fg: #24c8db;
+  --wiki-chip-hover-bg: rgba(36, 200, 219, 0.32);
+  --backlinks-border: rgba(255, 255, 255, 0.15);
+  --backlink-header-fg: #24c8db;
+  --backlink-hover-bg: rgba(255, 255, 255, 0.08);
+  --modal-bg: #2f2f2f;
+  --modal-border: rgba(255, 255, 255, 0.15);
+  --result-active-bg: rgba(36, 200, 219, 0.18);
+  --tag-chip-bg: rgba(36, 200, 219, 0.2);
+  --tag-chip-fg: #24c8db;
+  --snippet-mark-bg: rgba(255, 213, 79, 0.35);
 }

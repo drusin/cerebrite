@@ -1,5 +1,6 @@
 import {
-  getRememberedVault,
+  getSettings,
+  setTheme,
   pickVaultFolder,
   openVault,
   listPages,
@@ -18,6 +19,7 @@ import {
   type PageResolution,
   type TrashedPageSummary,
   type SearchResult,
+  type Theme,
 } from "./vault-api";
 import { PageEditor } from "./page-editor";
 import { humanizeHeadingSlug } from "./heading-slug";
@@ -46,6 +48,8 @@ const sidebarOverlayEl = document.querySelector<HTMLElement>("#sidebar-overlay")
 const sidebarRailExpandButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-expand");
 const sidebarRailSearchButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-search");
 const sidebarRailNewPageButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-new-page");
+const settingsButtonEl = document.querySelector<HTMLButtonElement>("#settings-button");
+const sidebarRailSettingsButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-settings");
 
 const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
@@ -65,6 +69,11 @@ const searchIncludeTrashEl = document.querySelector<HTMLInputElement>("#search-i
 const searchResultsListEl = document.querySelector<HTMLUListElement>("#search-results-list");
 const searchEmptyHintEl = document.querySelector<HTMLElement>("#search-empty-hint");
 
+const settingsModalOverlayEl = document.querySelector<HTMLElement>("#settings-modal-overlay");
+const settingsVaultPathEl = document.querySelector<HTMLElement>("#settings-vault-path");
+const settingsChangeFolderButtonEl = document.querySelector<HTMLButtonElement>("#settings-change-folder-button");
+const settingsThemeRadios = document.querySelectorAll<HTMLInputElement>('input[name="settings-theme"]');
+
 // The page currently loaded in the editor: either a persisted page (has an
 // id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
 // backing file until the first write materializes it. A persisted page may
@@ -78,6 +87,8 @@ type OpenPage =
 let currentPage: OpenPage | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pageEditor: PageEditor | null = null;
+/** The currently open vault's folder path, shown in the Settings modal. */
+let currentVaultPath: string | null = null;
 
 // --- Recent (issue 12) ---------------------------------------------------
 //
@@ -560,6 +571,8 @@ async function handleNewPageClick() {
 
 async function openVaultAndLoad(path: string) {
   await openVault(path);
+  currentVaultPath = path;
+  if (settingsVaultPathEl) settingsVaultPathEl.textContent = path;
   showWorkspace();
   await loadPages();
   await loadTrash();
@@ -808,6 +821,83 @@ function handleSearchModalKeydown(event: KeyboardEvent) {
   }
 }
 
+// --- Settings modal --------------------------------------------------------
+//
+// Opened via the sidebar's gear button (both expanded and collapsed-rail
+// states) and Cmd/Ctrl+,. Everything in it applies live -- no Save/Cancel --
+// since each setting is independent and low-risk.
+
+/** Applies `theme` to the page: "system" defers to `prefers-color-scheme` (no attribute), "light"/"dark" force it via `:root[data-theme]` overrides in styles.css. */
+function applyTheme(theme: Theme) {
+  if (theme === "system") {
+    document.documentElement.removeAttribute("data-theme");
+  } else {
+    document.documentElement.setAttribute("data-theme", theme);
+  }
+}
+
+async function handleThemeRadioChange(event: Event) {
+  const theme = (event.target as HTMLInputElement).value as Theme;
+  applyTheme(theme);
+  try {
+    await setTheme(theme);
+  } catch (err) {
+    console.error("Failed to persist theme", err);
+  }
+}
+
+function setThemeRadioValue(theme: Theme) {
+  settingsThemeRadios.forEach((radio) => {
+    radio.checked = radio.value === theme;
+  });
+}
+
+/**
+ * "Change vault folder" action: a heavy, one-shot operation (full
+ * index/git-repo rebuild against the new path, same as first-run
+ * `open_vault`), so the native folder picker is the only confirmation --
+ * no extra in-app dialog. Flushes any pending autosave first, and clears the
+ * currently open page since it belongs to the vault being left.
+ */
+async function handleChangeVaultFolderClick() {
+  let path: string | null;
+  try {
+    path = await pickVaultFolder();
+  } catch (err) {
+    window.alert(String(err));
+    return;
+  }
+  if (!path) return; // user cancelled
+
+  await flushPendingSaveForCurrentPage();
+  currentPage = null;
+  pageArticleEl?.setAttribute("hidden", "");
+  pageViewEmptyEl?.removeAttribute("hidden");
+  recentPages = [];
+  renderRecentList();
+
+  try {
+    closeSettingsModal();
+    await openVaultAndLoad(path);
+  } catch (err) {
+    window.alert(String(err));
+  }
+}
+
+function openSettingsModal() {
+  if (!settingsModalOverlayEl) return;
+  if (settingsVaultPathEl) settingsVaultPathEl.textContent = currentVaultPath ?? "";
+  settingsModalOverlayEl.removeAttribute("hidden");
+}
+
+function closeSettingsModal() {
+  settingsModalOverlayEl?.setAttribute("hidden", "");
+}
+
+function isSettingsModalOpen(): boolean {
+  return settingsModalOverlayEl ? !settingsModalOverlayEl.hasAttribute("hidden") : false;
+}
+
 /**
  * Compact-mode layout (issue 12): Desktop (Windows/Linux) gets a persistent,
  * user-collapsible sidebar; Android gets a hamburger-triggered drawer,
@@ -844,13 +934,33 @@ async function init() {
   searchButtonEl?.addEventListener("click", openSearchModal);
   window.addEventListener("keydown", (event) => {
     const isSearchShortcut = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k";
-    if (!isSearchShortcut) return;
-    event.preventDefault();
-    if (isSearchModalOpen()) {
-      searchInputEl?.focus();
-    } else {
-      openSearchModal();
+    const isSettingsShortcut = (event.ctrlKey || event.metaKey) && event.key === ",";
+    if (isSearchShortcut) {
+      event.preventDefault();
+      if (isSearchModalOpen()) {
+        searchInputEl?.focus();
+      } else {
+        openSearchModal();
+      }
+    } else if (isSettingsShortcut) {
+      event.preventDefault();
+      if (isSettingsModalOpen()) {
+        closeSettingsModal();
+      } else {
+        openSettingsModal();
+      }
+    } else if (event.key === "Escape" && isSettingsModalOpen()) {
+      closeSettingsModal();
     }
+  });
+
+  settingsButtonEl?.addEventListener("click", openSettingsModal);
+  sidebarRailSettingsButtonEl?.addEventListener("click", openSettingsModal);
+  settingsChangeFolderButtonEl?.addEventListener("click", () => void handleChangeVaultFolderClick());
+  settingsThemeRadios.forEach((radio) => radio.addEventListener("change", (e) => void handleThemeRadioChange(e)));
+  // Clicking the dimmed backdrop (not the modal card itself) closes it.
+  settingsModalOverlayEl?.addEventListener("click", (event) => {
+    if (event.target === settingsModalOverlayEl) closeSettingsModal();
   });
 
   searchInputEl?.addEventListener("input", scheduleSearch);
@@ -878,10 +988,13 @@ async function init() {
   COMPACT_MEDIA_QUERY.addEventListener("change", applyLayoutMode);
   applyLayoutMode();
 
-  const remembered = await getRememberedVault();
-  if (remembered) {
+  const settings = await getSettings();
+  applyTheme(settings.theme);
+  setThemeRadioValue(settings.theme);
+
+  if (settings.vaultPath) {
     try {
-      await openVaultAndLoad(remembered);
+      await openVaultAndLoad(settings.vaultPath);
       return;
     } catch (err) {
       showVaultPicker(String(err));

@@ -29,6 +29,7 @@
                slot per issue 08. No search UI/modal here -- that's ticket
                13's job. -->
           <button id="search-button" class="search-button" type="button">🔍 Search</button>
+          <button id="settings-button" class="sidebar-icon-button" type="button" aria-label="Settings" title="Settings (Ctrl/Cmd+,)">⚙</button>
           <button id="sidebar-collapse-toggle" class="sidebar-collapse-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">←</button>
           <button id="sidebar-close-button" class="sidebar-close-button" type="button" aria-label="Close sidebar">✕</button>
         </div>
@@ -69,6 +70,7 @@
         <button id="sidebar-rail-expand" class="sidebar-rail-button" type="button" aria-label="Expand sidebar" title="Expand sidebar">→</button>
         <button id="sidebar-rail-search" class="sidebar-rail-button" type="button" aria-label="Search" title="Search">🔍</button>
         <button id="sidebar-rail-new-page" class="sidebar-rail-button" type="button" aria-label="New page" title="New page">+</button>
+        <button id="sidebar-rail-settings" class="sidebar-rail-button" type="button" aria-label="Settings" title="Settings (Ctrl/Cmd+,)">⚙</button>
       </div>
 
       <main id="page-view" class="page-view">
@@ -112,6 +114,41 @@
           </div>
           <ul id="search-results-list" class="search-results-list"></ul>
           <p id="search-empty-hint" class="search-empty-hint" hidden>Type to search.</p>
+        </div>
+      </div>
+
+      <!-- Settings modal: opened via the sidebar's gear button (expanded and
+           collapsed-rail states) and Ctrl/Cmd+,, closed by Escape or
+           clicking outside the modal card. Every setting applies live. -->
+      <div id="settings-modal-overlay" class="settings-modal-overlay" hidden>
+        <div id="settings-modal" class="settings-modal" role="dialog" aria-modal="true" aria-label="Settings">
+          <div class="settings-modal-header">
+            <h2>Settings</h2>
+          </div>
+
+          <div class="settings-section">
+            <h3>Vault folder</h3>
+            <p id="settings-vault-path" class="settings-vault-path"></p>
+            <button id="settings-change-folder-button" type="button">Change folder…</button>
+          </div>
+
+          <div class="settings-section">
+            <h3>Color scheme</h3>
+            <div class="settings-theme-options">
+              <label>
+                <input type="radio" name="settings-theme" value="system" checked />
+                System
+              </label>
+              <label>
+                <input type="radio" name="settings-theme" value="light" />
+                Light
+              </label>
+              <label>
+                <input type="radio" name="settings-theme" value="dark" />
+                Dark
+              </label>
+            </div>
+          </div>
         </div>
       </div>
     </div>
