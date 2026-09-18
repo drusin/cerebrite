@@ -27,7 +27,10 @@ Every ticket inherits these; they are settled, not open for relitigation.
 
 <!-- one line per resolved ticket; zoom the link for the detail -->
 
-_(none yet — charting session only)_
+- [HTTPS credential landscape across git providers](issues/01-https-credential-landscape.md): Password auth is dead/dying everywhere; ship "paste a token over HTTP Basic auth" as the primary generic path for non-GitHub/GitLab providers — `Cred::userpass_plaintext` needs no new code, works unchanged on Android, but GitLab/Bitbucket tokens expire non-negotiably within a year with no browser-less renewal.
+- [Secret-free OAuth flows for GitHub and GitLab](issues/02-secretless-oauth-flows.md): Both providers have genuine secret-free OAuth paths. Device Authorization Grant is the constraint-safest choice for both (no redirect plumbing, Android-safe); register as a GitHub App (not OAuth App) for GitHub. The resulting OAuth token is directly usable as the git HTTPS credential — OAuth and HTTPS-token auth are the same mechanism, two ways of acquiring the credential. GitLab OAuth tokens need the broad `api` scope, not `write_repository`, to push.
+- [SSH key management on desktop and Android](issues/03-ssh-key-management.md): SSH is viable but never as the sole mechanism — agent auth is opportunistic-only (inconsistent across platforms, absent on Android). Requires enabling the `ssh_key_from_memory` git2 feature, in-app ed25519 keygen via the `ssh-key` crate, no passphrase on generated keys (store raw key in OS secure storage instead), and explicit host-key verification (pin known providers, TOFU+dialog for others — libssh2 does not verify safely by default).
+- [Secret storage options at rest](issues/04-secret-storage-options.md): No option is free of trade-offs. Recommend OS-native keychain (via `keyring-core` + explicit store crates) as default, with an explicit, user-visible fallback to permission-protected plaintext when the keychain is unavailable (a real, non-hypothetical gap on headless/minimal-WM Linux, this project's own target user base) — never a silent degrade. App-managed encryption without a keychain- or passphrase-derived key is security theater.
 
 ## Not yet specified
 
