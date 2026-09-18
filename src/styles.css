@@ -179,6 +179,41 @@ body {
   display: none;
 }
 
+/* Collapsed-state rail: hidden (width 0) while the sidebar is expanded, and
+   grows in via the same width transition the sidebar collapses with, so the
+   two feel like one continuous motion rather than a jarring swap. */
+.sidebar-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 0;
+  flex-shrink: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  padding: 0.5em 0;
+  gap: 0.4em;
+  border-right: 1px solid rgba(0, 0, 0, 0.1);
+  transition: width 0.15s ease;
+}
+
+.workspace.sidebar-collapsed:not(.compact) .sidebar-rail {
+  width: 2.75em;
+}
+
+.workspace.compact .sidebar-rail {
+  display: none;
+}
+
+.sidebar-rail-button {
+  width: 2em;
+  height: 2em;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: none;
+}
+
 /* Android-proxy compact mode (issue 12): hamburger-triggered drawer, hidden
    by default, instead of the desktop's persistent sidebar. Compact mode is
    detected via a viewport-width media query as a *proxy* for "phone-sized

@@ -25,11 +25,11 @@
 
       <aside id="sidebar" class="sidebar">
         <div class="sidebar-top">
-          <button id="sidebar-collapse-toggle" class="sidebar-collapse-toggle" type="button" aria-label="Collapse sidebar">☰</button>
           <!-- Ticket 13 stub: reserves the "prominent Search entry point" UI
                slot per issue 08. No search UI/modal here -- that's ticket
                13's job. -->
           <button id="search-button" class="search-button" type="button">🔍 Search</button>
+          <button id="sidebar-collapse-toggle" class="sidebar-collapse-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">←</button>
           <button id="sidebar-close-button" class="sidebar-close-button" type="button" aria-label="Close sidebar">✕</button>
         </div>
 
@@ -44,7 +44,7 @@
         <div class="sidebar-section">
           <div class="sidebar-header">
             <h2>All pages</h2>
-            <button id="new-page-button" type="button">New page</button>
+            <button id="new-page-button" type="button">+ New page</button>
           </div>
           <ul id="page-list" class="page-list"></ul>
         </div>
@@ -61,6 +61,16 @@
           <ul id="trash-list" class="page-list trash-list"></ul>
         </div>
       </aside>
+
+      <!-- Collapsed-state rail (desktop only): shown in place of the full
+           sidebar once it's collapsed, so there's always a visible way back
+           in plus quick access to the two most common actions. -->
+      <div id="sidebar-rail" class="sidebar-rail">
+        <button id="sidebar-rail-expand" class="sidebar-rail-button" type="button" aria-label="Expand sidebar" title="Expand sidebar">→</button>
+        <button id="sidebar-rail-search" class="sidebar-rail-button" type="button" aria-label="Search" title="Search">🔍</button>
+        <button id="sidebar-rail-new-page" class="sidebar-rail-button" type="button" aria-label="New page" title="New page">+</button>
+      </div>
+
       <main id="page-view" class="page-view">
         <p id="page-view-empty" class="page-view-empty">Select a page from the list.</p>
         <article id="page-article" hidden>

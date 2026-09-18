@@ -43,6 +43,9 @@ const sidebarOpenButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-
 const sidebarCloseButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-close-button");
 const sidebarCollapseToggleEl = document.querySelector<HTMLButtonElement>("#sidebar-collapse-toggle");
 const sidebarOverlayEl = document.querySelector<HTMLElement>("#sidebar-overlay");
+const sidebarRailExpandButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-expand");
+const sidebarRailSearchButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-search");
+const sidebarRailNewPageButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-new-page");
 
 const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
@@ -859,8 +862,13 @@ async function init() {
   });
 
   sidebarCollapseToggleEl?.addEventListener("click", () => {
-    workspaceEl?.classList.toggle("sidebar-collapsed");
+    workspaceEl?.classList.add("sidebar-collapsed");
   });
+  sidebarRailExpandButtonEl?.addEventListener("click", () => {
+    workspaceEl?.classList.remove("sidebar-collapsed");
+  });
+  sidebarRailSearchButtonEl?.addEventListener("click", openSearchModal);
+  sidebarRailNewPageButtonEl?.addEventListener("click", () => void handleNewPageClick());
   sidebarOpenButtonEl?.addEventListener("click", () => {
     sidebarEl?.classList.add("drawer-open");
     sidebarOverlayEl?.removeAttribute("hidden");
