@@ -8,10 +8,6 @@ the full diff. Not urgent bugs unless marked **bug**.
 
 ## Missing features
 
-- **Page rename**: there is no way to rename a persisted page's title (and
-  re-slugify its filename) from inside the app — ticket 04's checklist asked
-  for this and it was never built. A page's title, once created, is
-  effectively permanent without hand-editing the file and its filename.
 - **In-app git remote configuration**: ticket 14's automatic sync only works
   once a vault's git repo already has a remote configured via external git
   tooling. There is no "add a remote" UI anywhere in the app.

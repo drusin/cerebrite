@@ -7,6 +7,7 @@ import {
   getPage,
   savePage,
   createPage,
+  renamePage,
   resolvePage,
   materializeAndSavePage,
   getBacklinks,
@@ -57,6 +58,7 @@ const pageTitleEl = document.querySelector<HTMLElement>("#page-title");
 const pageBodyEl = document.querySelector<HTMLElement>("#page-body");
 const backlinksListEl = document.querySelector<HTMLUListElement>("#backlinks-list");
 const backlinksEmptyEl = document.querySelector<HTMLElement>("#backlinks-empty");
+const renamePageButtonEl = document.querySelector<HTMLButtonElement>("#rename-page-button");
 const deletePageButtonEl = document.querySelector<HTMLButtonElement>("#delete-page-button");
 const pageTrashBannerEl = document.querySelector<HTMLElement>("#page-trash-banner");
 const restorePageButtonEl = document.querySelector<HTMLButtonElement>("#restore-page-button");
@@ -339,6 +341,10 @@ async function renderPageArticle(
   const deletable = (options?.deletable ?? false) && !inTrash;
   const pageId = options?.pageId ?? null;
 
+  if (renamePageButtonEl) {
+    renamePageButtonEl.hidden = !deletable;
+    renamePageButtonEl.onclick = deletable && pageId ? () => void handleRenamePageClick(pageId, title) : null;
+  }
   if (deletePageButtonEl) {
     deletePageButtonEl.hidden = !deletable;
     deletePageButtonEl.onclick = deletable && pageId ? () => void handleDeletePageClick(pageId) : null;
@@ -509,6 +515,66 @@ async function handleDeletePageClick(id: string) {
     pageViewEmptyEl?.removeAttribute("hidden");
     await loadPages();
     await loadTrash();
+  } catch (err) {
+    window.alert(String(err));
+  }
+}
+
+/**
+ * Explicit "rename page" action (the checklist item ticket 04 left undone,
+ * see `docs/known-gaps.md`): prompts for a new title pre-filled with the
+ * current one, warns first if other pages have inbound links that will be
+ * rewritten (a rename's blast radius isn't limited to this one file, unlike
+ * every other mutation in this app), then renames.
+ *
+ * If the currently-open page's content was touched by the rewrite (either
+ * because it's the page being renamed, or because it was one of the
+ * `affectedPageIds`), its title/body are reloaded from the backend and
+ * pushed back into the editor -- otherwise a pending autosave on that page
+ * would overwrite the just-rewritten file with its stale in-memory content.
+ */
+async function handleRenamePageClick(id: string, currentTitle: string) {
+  const newTitle = window.prompt("New title for this page:", currentTitle);
+  if (newTitle === null) return; // user cancelled
+
+  const trimmed = newTitle.trim();
+  if (!trimmed) {
+    window.alert("Title cannot be empty.");
+    return;
+  }
+  if (trimmed === currentTitle) return;
+
+  let affectedCount = 0;
+  try {
+    affectedCount = (await getBacklinks(currentTitle)).length;
+  } catch (err) {
+    console.error("Failed to look up backlinks before renaming", err);
+  }
+  if (affectedCount > 0) {
+    const linkWord = affectedCount === 1 ? "link" : "links";
+    if (!window.confirm(`This will also update ${affectedCount} ${linkWord} in other pages. Continue?`)) {
+      return;
+    }
+  }
+
+  try {
+    const result = await renamePage(id, trimmed);
+    await loadPages();
+
+    recentPages = recentPages.map((entry) =>
+      entry.kind === "persisted" && entry.pageId === id ? { ...entry, title: result.title } : entry
+    );
+    renderRecentList();
+
+    const currentPageNeedsReload =
+      currentPage?.kind === "persisted" &&
+      (currentPage.id === id || result.affectedPageIds.includes(currentPage.id));
+    if (currentPageNeedsReload && currentPage?.kind === "persisted") {
+      const page = await getPage(currentPage.id);
+      if (pageTitleEl) pageTitleEl.textContent = page.title;
+      await pageEditor?.load(page.body);
+      await renderBacklinks(page.title);
+    }
   } catch (err) {
     window.alert(String(err));
   }

@@ -11,6 +11,17 @@ export interface PageSummary {
   title: string;
 }
 
+/// Result of an explicit "rename page" action: the renamed page's fresh
+/// `PageSummary`, plus the ids of every *other* page whose body was rewritten
+/// to keep its inbound `[[Old Title]]`-style links pointing at the new
+/// title -- used to decide whether the currently-open page (if any) needs its
+/// in-memory editor content reloaded.
+export interface RenamePageResult {
+  id: string;
+  title: string;
+  affectedPageIds: string[];
+}
+
 export interface PageContent {
   id: string;
   title: string;
@@ -98,6 +109,15 @@ export function savePage(id: string, markdownBody: string): Promise<void> {
 /// a page with that title already exists.
 export function createPage(title: string): Promise<PageSummary> {
   return invoke("create_page", { title });
+}
+
+/// Explicit "rename page" action: re-slugifies `newTitle` into a new
+/// filename and rewrites every other page's (and this page's own)
+/// `[[Old Title]]`-style links to the new title, all committed together.
+/// Rejects with an in-app error message (not auto-suffixed) if a *different*
+/// page already has that title.
+export function renamePage(id: string, newTitle: string): Promise<RenamePageResult> {
+  return invoke("rename_page", { id, newTitle });
 }
 
 /// Resolves a clicked `[[Link]]`'s raw title to either an existing

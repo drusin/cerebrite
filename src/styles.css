@@ -374,10 +374,44 @@ body {
   gap: 0.75em;
 }
 
-#delete-page-button {
+.page-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+}
+
+#rename-page-button {
   padding: 0.3em 0.6em;
   font-size: 0.8em;
   box-shadow: none;
+}
+
+/* Icon-only, borderless, and red -- a delete action doesn't need a labeled
+   button taking up as much visual weight as "Rename page" next to it; the
+   trash-bin glyph plus its danger color are the label. Same padding/font-size
+   box as the button used to have when it read "Delete page", just filled
+   with an icon instead of text. */
+#delete-page-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.3em 0.6em;
+  font-size: 0.8em;
+  line-height: 1;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  color: #c0392b;
+}
+
+#delete-page-button:hover {
+  border-color: #c0392b;
+  background: rgba(192, 57, 43, 0.1);
+}
+
+#delete-page-button:active {
+  border-color: #c0392b;
+  background: rgba(192, 57, 43, 0.18);
 }
 
 .page-trash-banner {

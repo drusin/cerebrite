@@ -138,6 +138,34 @@ pub fn write_body(path: &Path, new_body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rewrites `path`'s frontmatter `title:` field in place, preserving every
+/// other existing frontmatter field and the body byte-for-byte. Unlike
+/// `write_body` (which splices a new body into the existing raw YAML text
+/// verbatim), this must actually change a value *inside* that YAML, so it
+/// re-serializes the whole mapping through `serde_yaml` -- the same fallback
+/// `parse_content` already uses when it has to mint a missing id, just
+/// triggered by a rename instead.
+pub fn write_title(path: &Path, new_title: &str) -> Result<()> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("reading page file {}", path.display()))?;
+    let (yaml_block, body) = split_frontmatter(&content);
+
+    let mut mapping = match yaml_block {
+        Some(yaml) => match serde_yaml::from_str::<Value>(yaml) {
+            Ok(Value::Mapping(m)) => m,
+            _ => serde_yaml::Mapping::new(),
+        },
+        None => serde_yaml::Mapping::new(),
+    };
+    mapping.insert(Value::String("title".to_string()), Value::String(new_title.to_string()));
+
+    let yaml_str = serde_yaml::to_string(&Value::Mapping(mapping)).unwrap_or_else(|_| String::new());
+    let new_content = format!("---\n{yaml_str}---\n{body}");
+    fs::write(path, new_content)
+        .with_context(|| format!("writing renamed title to {}", path.display()))?;
+    Ok(())
+}
+
 /// Mints a fresh, stable page id. Shared by both "fill in a missing id on an
 /// existing file" (`parse_and_ensure_id`) and "mint an id for a brand-new
 /// page" (issue 04's explicit "new page" action).
@@ -360,6 +388,24 @@ mod tests {
 
         let content_after = fs::read_to_string(&path).unwrap();
         assert_eq!(content_after, "Replaced plain content.\n");
+    }
+
+    #[test]
+    fn write_title_updates_title_and_preserves_other_frontmatter_fields_and_body() {
+        let dir = tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            "hello.md",
+            "---\nid: abc-123\ntitle: Hello World\ntags:\n  - foo\n---\nOriginal body.\n",
+        );
+
+        write_title(&path, "Goodbye World").unwrap();
+
+        let parsed = parse_and_ensure_id(&path).unwrap();
+        assert_eq!(parsed.id, "abc-123");
+        assert_eq!(parsed.title, "Goodbye World");
+        assert_eq!(parsed.body, "Original body.\n");
+        assert_eq!(parsed.tags, vec!["foo".to_string()]);
     }
 
     #[test]

@@ -244,6 +244,80 @@ pub fn find_heading_link_spans(body: &str) -> Vec<HeadingLinkSpan> {
     out
 }
 
+/// Rewrites every occurrence in `body` that targets `old_title` (matched via
+/// `normalize_title`, exactly like `extract_links`) so it targets
+/// `new_title` instead -- the page-rename feature's fix-up pass for inbound
+/// (and self-referential) links, run once per page whose body might mention
+/// the renamed page. Returns the possibly-unchanged body and whether
+/// anything was actually rewritten, so callers can skip a write when
+/// nothing matched.
+///
+/// Per the page-rename design:
+///   - `[[Old Title]]` / `[[Old Title#Heading]]`: only the pre-`#` title
+///     span is replaced (mirroring `find_heading_link_spans`'s span
+///     computation), so any heading fragment survives untouched.
+///   - `#[[Old Title]]` (bracketed tag sugar): same title-span replacement.
+///   - `#oldtag` (bare tag sugar): replaced with the literal new title if it
+///     fits the bare-tag word class (`TAG_WORD_CLASS`, no spaces or other
+///     punctuation), otherwise converted to bracket form (`#[[New Title]]`)
+///     since a bare tag can't losslessly hold an arbitrary title.
+pub fn rewrite_links_to_title(body: &str, old_title: &str, new_title: &str) -> (String, bool) {
+    let normalized_old = normalize_title(old_title);
+    let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+
+    for capture in combined_link_regex().captures_iter(body) {
+        let whole = capture.get(0).expect("capture group 0 always matches");
+
+        if let Some(bracket) = capture.name("bracket") {
+            let raw_title = bracket.as_str();
+            let group_start = bracket.start();
+            let title_part = match raw_title.find('#') {
+                Some(idx) => &raw_title[..idx],
+                None => raw_title,
+            };
+            if normalize_title(title_part) != normalized_old {
+                continue;
+            }
+            // Replace the *entire* pre-`#` span (not just its trimmed
+            // interior) so stray padding whitespace from the old link text
+            // (e.g. `[[  old title  ]]`) doesn't survive the rewrite.
+            let start = group_start;
+            let end = start + title_part.len();
+            replacements.push((start..end, new_title.to_string()));
+        } else if let Some(hash_bracket) = capture.name("hash_bracket") {
+            let raw_title = hash_bracket.as_str();
+            let group_start = hash_bracket.start();
+            if normalize_title(raw_title) != normalized_old {
+                continue;
+            }
+            replacements.push((group_start..group_start + raw_title.len(), new_title.to_string()));
+        } else if let Some(hash_tag) = capture.name("hash_tag") {
+            let target_text = hash_tag.as_str();
+            if normalize_title(target_text) != normalized_old {
+                continue;
+            }
+            let fits_bare_tag = !new_title.is_empty()
+                && new_title.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '/');
+            let replacement_body = if fits_bare_tag {
+                new_title.to_string()
+            } else {
+                format!("[[{new_title}]]")
+            };
+            replacements.push((whole.start()..whole.end(), format!("#{replacement_body}")));
+        }
+    }
+
+    if replacements.is_empty() {
+        return (body.to_string(), false);
+    }
+
+    let mut new_body = body.to_string();
+    for (range, text) in replacements.into_iter().rev() {
+        new_body.replace_range(range, &text);
+    }
+    (new_body, true)
+}
+
 /// Builds a plain-text snippet of `body` around the byte range
 /// `[match_start, match_end)`, expanded by `SNIPPET_RADIUS` characters on
 /// each side, with whitespace/newlines collapsed to single spaces and an
@@ -503,6 +577,73 @@ mod tests {
         let occurrences = extract_all_links(body, &tags);
         let targets: Vec<&str> = occurrences.iter().map(|l| l.normalized_target.as_str()).collect();
         assert_eq!(targets, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn rewrite_links_to_title_replaces_a_plain_bracket_link() {
+        let (body, changed) = rewrite_links_to_title("See [[Old Title]] here.", "Old Title", "New Title");
+        assert!(changed);
+        assert_eq!(body, "See [[New Title]] here.");
+    }
+
+    #[test]
+    fn rewrite_links_to_title_preserves_a_heading_fragment() {
+        let (body, changed) =
+            rewrite_links_to_title("See [[Old Title#Some Heading]] here.", "Old Title", "New Title");
+        assert!(changed);
+        assert_eq!(body, "See [[New Title#Some Heading]] here.");
+    }
+
+    #[test]
+    fn rewrite_links_to_title_matches_case_and_whitespace_insensitively() {
+        let (body, changed) = rewrite_links_to_title("See [[  old   title  ]] here.", "Old Title", "New Title");
+        assert!(changed);
+        assert_eq!(body, "See [[New Title]] here.");
+    }
+
+    #[test]
+    fn rewrite_links_to_title_ignores_unrelated_links() {
+        let (body, changed) = rewrite_links_to_title("See [[Something Else]] here.", "Old Title", "New Title");
+        assert!(!changed);
+        assert_eq!(body, "See [[Something Else]] here.");
+    }
+
+    #[test]
+    fn rewrite_links_to_title_updates_a_bracketed_tag() {
+        let (body, changed) = rewrite_links_to_title("Filed under #[[Old Title]].", "Old Title", "New Title");
+        assert!(changed);
+        assert_eq!(body, "Filed under #[[New Title]].");
+    }
+
+    #[test]
+    fn rewrite_links_to_title_updates_a_bare_tag_when_the_new_title_still_fits() {
+        let (body, changed) = rewrite_links_to_title("Filed under #oldtag.", "oldtag", "newtag");
+        assert!(changed);
+        assert_eq!(body, "Filed under #newtag.");
+    }
+
+    #[test]
+    fn rewrite_links_to_title_converts_a_bare_tag_to_bracket_form_when_the_new_title_has_a_space() {
+        let (body, changed) = rewrite_links_to_title("Filed under #todo.", "todo", "to do");
+        assert!(changed);
+        assert_eq!(body, "Filed under #[[to do]].");
+    }
+
+    #[test]
+    fn rewrite_links_to_title_handles_multiple_occurrences_without_byte_offset_drift() {
+        // Sanity check that an earlier replacement (shorter or longer than
+        // the original match) doesn't shift byte ranges computed for a
+        // later match -- replacements are applied back-to-front.
+        let (body, changed) = rewrite_links_to_title(
+            "First [[Unrelated]] then [[Old Title]] then #[[Old Title]] too.",
+            "Old Title",
+            "New Longer Title",
+        );
+        assert!(changed);
+        assert_eq!(
+            body,
+            "First [[Unrelated]] then [[New Longer Title]] then #[[New Longer Title]] too."
+        );
     }
 
     #[test]

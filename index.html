@@ -78,7 +78,17 @@
         <article id="page-article" hidden>
           <div class="page-title-row">
             <h1 id="page-title"></h1>
-            <button id="delete-page-button" type="button" hidden>Delete page</button>
+            <div class="page-title-actions">
+              <button id="rename-page-button" type="button" hidden>Rename page</button>
+              <button id="delete-page-button" type="button" hidden aria-label="Delete page" title="Delete page">
+                <svg viewBox="0 0 24 24" width="1em" height="1em" aria-hidden="true" focusable="false">
+                  <path
+                    d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-3 6h12l-1 12a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 9Zm3 2v8h1v-8H9Zm3 0v8h1v-8h-1Zm3 0v8h1v-8h-1Z"
+                    fill="currentColor"
+                  />
+                </svg>
+              </button>
+            </div>
           </div>
           <p id="page-trash-banner" class="page-trash-banner" hidden>
             This page is in trash.

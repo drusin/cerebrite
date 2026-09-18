@@ -274,6 +274,31 @@ pub fn update_page_content(
     Ok(())
 }
 
+/// Updates a page's row for a rename (issue 04's rename feature): like
+/// `update_page_content`, but also updates `path` -- the one other column a
+/// rename can change (the file moved to a new slugified filename) that an
+/// ordinary save never touches.
+pub fn update_page_path_and_title(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    path: &Path,
+    body: &str,
+    tags: &[String],
+) -> rusqlite::Result<()> {
+    let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "UPDATE pages SET title = ?1, path = ?2, body = ?3, modified_at = ?4, tags = ?5 WHERE id = ?6",
+        params![title, path.to_string_lossy(), body, now_epoch(), tags_json, id],
+    )?;
+    conn.execute(
+        "UPDATE pages_fts SET title = ?1, body = ?2 WHERE id = ?3",
+        params![title, body, id],
+    )?;
+    replace_page_links(conn, id, body, tags)?;
+    Ok(())
+}
+
 /// Inserts a brand-new page's row into the derived index's `pages` and
 /// `pages_fts` tables -- used by the explicit "new page" action (issue 04) so
 /// a freshly created file shows up without a full vault rebuild.

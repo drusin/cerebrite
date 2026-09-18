@@ -70,6 +70,21 @@ pub struct PageSummary {
     title: String,
 }
 
+/// Result of an explicit "rename page" action (the checklist item ticket 04
+/// left undone, see `docs/known-gaps.md`): the renamed page's fresh
+/// `PageSummary`, plus the ids of every *other* page whose body was rewritten
+/// to keep its inbound `[[Old Title]]`-style links pointing at the new
+/// title. The frontend uses `affected_page_ids` to know whether the
+/// currently-open page (if any) needs its in-memory editor content reloaded
+/// so a pending autosave doesn't silently revert the rewrite.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamePageResult {
+    id: String,
+    title: String,
+    affected_page_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PageContent {
     id: String,
@@ -566,6 +581,133 @@ fn create_page_impl(state: &AppState, title: &str) -> Result<PageSummary, String
     })
 }
 
+/// Explicit "rename page" action (the checklist item ticket 04 left undone --
+/// see `docs/known-gaps.md`): re-slugifies the title into a new filename,
+/// rewrites every other page's (and this page's own) `[[Old Title]]`-style
+/// links to the new title so nothing is silently left dangling, and commits
+/// every touched file in one commit.
+///
+/// A title/filename collision is blocked with an in-app error exactly like
+/// `create_page`, excluding the page being renamed itself so a pure
+/// case/whitespace change to its own title (e.g. "My Page" -> "my page")
+/// isn't mistaken for a collision with itself.
+#[tauri::command]
+fn rename_page(state: State<AppState>, id: String, new_title: String) -> Result<RenamePageResult, String> {
+    rename_page_impl(&state, &id, &new_title)
+}
+
+/// Shared implementation behind `rename_page`, split out for direct unit
+/// testing against a plain `AppState`.
+fn rename_page_impl(state: &AppState, id: &str, new_title: &str) -> Result<RenamePageResult, String> {
+    let trimmed = new_title.trim();
+    if trimmed.is_empty() {
+        return Err("Title cannot be empty".to_string());
+    }
+
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+
+    let mut db_guard = state.db.lock().unwrap();
+    let conn = db_guard.as_mut().ok_or("No vault is open")?;
+
+    let (old_title, old_path): (String, String) = conn
+        .query_row(
+            "SELECT title, path FROM pages WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let normalized_new = frontmatter::normalize_title(trimmed);
+    if let Some((existing_id, _)) = find_page_by_normalized_title(conn, &normalized_new) {
+        if existing_id != id {
+            return Err(format!("A page titled '{trimmed}' already exists"));
+        }
+    }
+
+    let old_page_path = PathBuf::from(&old_path);
+    let new_slug = frontmatter::slugify(trimmed);
+    let new_file_path = vault_path.join(format!("{new_slug}.md"));
+    if new_file_path != old_page_path && new_file_path.exists() {
+        return Err(format!(
+            "A page file for '{trimmed}' already exists ({new_slug}.md)"
+        ));
+    }
+
+    // Snapshot every page's current id/title/path/body/tags before mutating
+    // anything, so the link-rewrite pass below operates on a consistent view
+    // even though it (and the frontmatter/filesystem writes before it) will
+    // change several of these rows as it goes.
+    let pages: Vec<(String, String, PathBuf, String, Vec<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, title, path, body, tags FROM pages")
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map([], |row| {
+                let tags_json: String = row.get(4)?;
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, tags_json))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in mapped {
+            let (page_id, page_title, page_path, page_body, tags_json): (String, String, String, String, String) =
+                row.map_err(|e| e.to_string())?;
+            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            out.push((page_id, page_title, PathBuf::from(page_path), page_body, tags));
+        }
+        out
+    };
+
+    // Rewrite this page's own frontmatter title, then move its file if the
+    // slug changed.
+    frontmatter::write_title(&old_page_path, trimmed).map_err(|e| e.to_string())?;
+    if new_file_path != old_page_path {
+        std::fs::rename(&old_page_path, &new_file_path).map_err(|e| e.to_string())?;
+    }
+
+    // Fix up the renamed page's own self-referential links (if any), then
+    // update its index row for the new title/path regardless of whether its
+    // body actually changed.
+    let (_, _, _, self_body, self_tags) = pages
+        .iter()
+        .find(|(page_id, ..)| page_id == id)
+        .cloned()
+        .expect("the page being renamed must be present in its own snapshot");
+    let (new_self_body, self_changed) = links::rewrite_links_to_title(&self_body, &old_title, trimmed);
+    if self_changed {
+        frontmatter::write_body(&new_file_path, &new_self_body).map_err(|e| e.to_string())?;
+    }
+    index::update_page_path_and_title(conn, id, trimmed, &new_file_path, &new_self_body, &self_tags)
+        .map_err(|e| e.to_string())?;
+
+    // Rewrite inbound links in every other page whose body mentions the old
+    // title, on disk and in the index.
+    let mut affected_page_ids = Vec::new();
+    for (page_id, page_title, page_path, page_body, tags) in &pages {
+        if page_id == id {
+            continue;
+        }
+        let (new_body, changed) = links::rewrite_links_to_title(page_body, &old_title, trimmed);
+        if !changed {
+            continue;
+        }
+        frontmatter::write_body(page_path, &new_body).map_err(|e| e.to_string())?;
+        index::update_page_content(conn, page_id, page_title, &new_body, tags).map_err(|e| e.to_string())?;
+        affected_page_ids.push(page_id.clone());
+    }
+
+    vault::commit_all(&vault_path, &format!("Rename {old_title} to {trimmed}")).map_err(|e| e.to_string())?;
+    notify_sync(state);
+
+    Ok(RenamePageResult {
+        id: id.to_string(),
+        title: trimmed.to_string(),
+        affected_page_ids,
+    })
+}
+
 /// Resolves a `[[Link]]`'s raw title (issue 05), which may carry a trailing
 /// `#Heading` fragment (ticket 07): finds an existing persisted page by
 /// case/whitespace-insensitive title match (`frontmatter::normalize_title`)
@@ -930,6 +1072,7 @@ pub fn run() {
             get_page,
             save_page,
             create_page,
+            rename_page,
             resolve_page,
             get_backlinks,
             materialize_and_save_page,
@@ -1408,6 +1551,125 @@ mod tests {
 
         assert!(!dir.path().join(".cerebrite/trash/hello.md").exists());
         assert!(list_trashed_pages_impl(&state).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_page_updates_title_slug_and_frontmatter() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "old-title.md", "---\nid: p1\ntitle: Old Title\n---\nBody.\n");
+        let state = setup_vault(&dir);
+
+        let result = rename_page_impl(&state, "p1", "New Title").unwrap();
+
+        assert_eq!(result.id, "p1");
+        assert_eq!(result.title, "New Title");
+        assert!(result.affected_page_ids.is_empty());
+
+        assert!(!dir.path().join("old-title.md").exists());
+        let new_path = dir.path().join("new-title.md");
+        assert!(new_path.exists());
+        let content = fs::read_to_string(&new_path).unwrap();
+        assert!(content.contains("id: p1"));
+        assert!(content.contains("title: New Title"));
+        assert!(content.ends_with("Body.\n"));
+
+        let resolution = resolve_page_impl(&state, "New Title").unwrap();
+        match resolution {
+            PageResolution::Persisted { id, title, .. } => {
+                assert_eq!(id, "p1");
+                assert_eq!(title, "New Title");
+            }
+            PageResolution::Dynamic { .. } => panic!("expected the renamed page"),
+        }
+    }
+
+    #[test]
+    fn rename_page_rewrites_inbound_links_in_other_pages() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "target.md", "---\nid: t1\ntitle: Old Title\n---\n");
+        write_page(
+            &dir,
+            "source.md",
+            "---\nid: s1\ntitle: Source\n---\nSee [[Old Title]] and [[Old Title#Some Heading]] and #[[Old Title]].\n",
+        );
+        let state = setup_vault(&dir);
+
+        let result = rename_page_impl(&state, "t1", "New Title").unwrap();
+        assert_eq!(result.affected_page_ids, vec!["s1".to_string()]);
+
+        let content = fs::read_to_string(dir.path().join("source.md")).unwrap();
+        assert!(content.contains("See [[New Title]] and [[New Title#Some Heading]] and #[[New Title]]."));
+
+        // The index reflects the rewrite too -- old title has no more
+        // backlinks, new title does.
+        assert!(get_backlinks_impl(&state, "Old Title").unwrap().is_empty());
+        // Three occurrences in source.md: the plain link, the heading link,
+        // and the bracket-tag form -- each is its own backlink row.
+        assert_eq!(get_backlinks_impl(&state, "New Title").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn rename_page_rewrites_its_own_self_referential_links() {
+        let dir = TempDir::new().unwrap();
+        write_page(
+            &dir,
+            "old-title.md",
+            "---\nid: p1\ntitle: Old Title\n---\nSee also [[Old Title]] (itself).\n",
+        );
+        let state = setup_vault(&dir);
+
+        rename_page_impl(&state, "p1", "New Title").unwrap();
+
+        let content = fs::read_to_string(dir.path().join("new-title.md")).unwrap();
+        assert!(content.contains("See also [[New Title]] (itself).\n"));
+    }
+
+    #[test]
+    fn rename_page_converts_a_bare_tag_to_bracket_form_when_needed() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "todo.md", "---\nid: t1\ntitle: Todo\n---\n");
+        write_page(&dir, "source.md", "---\nid: s1\ntitle: Source\n---\nFiled under #todo.\n");
+        let state = setup_vault(&dir);
+
+        rename_page_impl(&state, "t1", "To Do").unwrap();
+
+        let content = fs::read_to_string(dir.path().join("source.md")).unwrap();
+        assert_eq!(content, "---\nid: s1\ntitle: Source\n---\nFiled under #[[To Do]].\n");
+    }
+
+    #[test]
+    fn rename_page_rejects_a_title_collision_with_a_different_page() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "one.md", "---\nid: p1\ntitle: One\n---\n");
+        write_page(&dir, "two.md", "---\nid: p2\ntitle: Two\n---\n");
+        let state = setup_vault(&dir);
+
+        let err = rename_page_impl(&state, "p1", "  two  ").unwrap_err();
+        assert!(err.contains("already exists"));
+        // Nothing should have moved.
+        assert!(dir.path().join("one.md").exists());
+    }
+
+    #[test]
+    fn rename_page_allows_a_pure_casing_change_to_its_own_title() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "my-page.md", "---\nid: p1\ntitle: My Page\n---\n");
+        let state = setup_vault(&dir);
+
+        let result = rename_page_impl(&state, "p1", "MY PAGE").unwrap();
+        assert_eq!(result.title, "MY PAGE");
+    }
+
+    #[test]
+    fn rename_page_does_not_collide_with_a_trashed_page_of_the_same_title() {
+        let dir = TempDir::new().unwrap();
+        write_page(&dir, "taken.md", "---\nid: t1\ntitle: Taken\n---\n");
+        write_page(&dir, "other.md", "---\nid: p1\ntitle: Other\n---\n");
+        let state = setup_vault(&dir);
+        trash_page_impl(&state, "t1").unwrap();
+
+        let result = rename_page_impl(&state, "p1", "Taken").unwrap();
+        assert_eq!(result.title, "Taken");
     }
 
     #[test]
