@@ -4,6 +4,10 @@ A git-native, markdown-based knowledge base ("second brain"): notes live as plai
 
 ## Language
 
+**Vault**:
+The directory `vault/` at the root of a git repository, holding every [page](#language) in that repository. The path is fixed, never configurable, and never the repository root itself — files beside it at the root (a `README.md`, an `AGENTS.md`) are part of the repository but are not pages. Every `.md` file under the vault is a page, whether or not Cerebrite created it. See [ADR-0011](docs/adr/0011-vault-is-a-hardcoded-subdirectory-of-its-git-repository.md).
+_Avoid_: Using "vault" for the whole repository, or for the folder the user picks (they pick the repository, which *contains* the vault); "notebook", "workspace", "library"
+
 **Page**:
 The top-level linkable entity. Exists as either a **persisted page** or a **dynamic page** — see both below.
 _Avoid_: Note, document (both used loosely elsewhere for the same file-on-disk concept; "page" is the canonical term)
