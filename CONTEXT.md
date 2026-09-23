@@ -16,6 +16,10 @@ _Avoid_: "Account", "login", "remote" (the remote is one half of a connection; t
 How a connection authenticates — one of *OAuth sign-in* (GitHub/GitLab), *access token* (pasted, any HTTPS host), or *SSH key* (Cerebrite-managed). The first two are both a token sent over HTTPS and differ only in how the token was obtained.
 _Avoid_: "Auth method" used loosely for the transport; "password" (no provider accepts one for git any more)
 
+**Credential store**:
+Where a connection's secret lives: either the *system keychain* (the default) or an *unencrypted file*, which the user must explicitly consent to per connection and only when no keychain is available. A connection is always in exactly one credential store and never moves between them unless the user moves it. See [ADR-0013](docs/adr/0013-credentials-live-in-the-os-keychain-with-consented-plaintext-as-the-only-fallback.md).
+_Avoid_: "Vault" for the keychain (password managers use the word; here it means only the page directory); "encrypted" or "secure storage" for the unencrypted file
+
 **Page**:
 The top-level linkable entity. Exists as either a **persisted page** or a **dynamic page** — see both below.
 _Avoid_: Note, document (both used loosely elsewhere for the same file-on-disk concept; "page" is the canonical term)
