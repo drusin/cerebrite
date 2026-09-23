@@ -68,10 +68,9 @@ Git credential helpers and `keyutils` are out.
 - the HTTPS username;
 - the provider;
 - the token expiry;
-- the author identity;
 - which credential store is in use.
 
-`origin` stays in `.git/config`.
+`origin` stays in `.git/config`, and so does the vault's author: see [Git author identity in the connect journey](11-git-author-identity-product.md), which moved it out of the connection record.
 
 **App level:** `settings.json` gains only an index of connection IDs and their stores.
 

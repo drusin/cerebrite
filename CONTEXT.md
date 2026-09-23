@@ -20,6 +20,10 @@ _Avoid_: "Auth method" used loosely for the transport; "password" (no provider a
 Where a connection's secret lives: either the *system keychain* (the default) or an *unencrypted file*, which the user must explicitly consent to per connection and only when no keychain is available. A connection is always in exactly one credential store and never moves between them unless the user moves it. See [ADR-0013](docs/adr/0013-credentials-live-in-the-os-keychain-with-consented-plaintext-as-the-only-fallback.md).
 _Avoid_: "Vault" for the keychain (password managers use the word; here it means only the page directory); "encrypted" or "secure storage" for the unencrypted file
 
+**Author**:
+The name and email a vault's commits are recorded under. Belongs to the vault, not to its connection, so a vault with no connection has one too; it is set per device and must be seen and confirmed by the user before the vault's first commit. Cerebrite never invents one. Changing it affects future commits only.
+_Avoid_: "Account", "user" (the provider account is a different thing, which can suggest an author but is never one); "committer" (git distinguishes the two, Cerebrite always sets them to the same value); "git identity" in anything user-facing, where it appears as "Commit as"
+
 **Page**:
 The top-level linkable entity. Exists as either a **persisted page** or a **dynamic page** — see both below.
 _Avoid_: Note, document (both used loosely elsewhere for the same file-on-disk concept; "page" is the canonical term)
