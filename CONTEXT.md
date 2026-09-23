@@ -8,6 +8,14 @@ A git-native, markdown-based knowledge base ("second brain"): notes live as plai
 The directory `vault/` at the root of a git repository, holding every [page](#language) in that repository. The path is fixed, never configurable, and never the repository root itself — files beside it at the root (a `README.md`, an `AGENTS.md`) are part of the repository but are not pages. Every `.md` file under the vault is a page, whether or not Cerebrite created it. See [ADR-0011](docs/adr/0011-vault-is-a-hardcoded-subdirectory-of-its-git-repository.md).
 _Avoid_: Using "vault" for the whole repository, or for the folder the user picks (they pick the repository, which *contains* the vault); "notebook", "workspace", "library"
 
+**Connection**:
+A vault's binding to its git provider: the repository's `origin` plus exactly one **credential kind** and the credential it holds. Each vault owns its own connection; nothing is shared between vaults, and sync never tries any credential other than the connection's.
+_Avoid_: "Account", "login", "remote" (the remote is one half of a connection; the credential is the other)
+
+**Credential kind**:
+How a connection authenticates — one of *OAuth sign-in* (GitHub/GitLab), *access token* (pasted, any HTTPS host), or *SSH key* (Cerebrite-managed). The first two are both a token sent over HTTPS and differ only in how the token was obtained.
+_Avoid_: "Auth method" used loosely for the transport; "password" (no provider accepts one for git any more)
+
 **Page**:
 The top-level linkable entity. Exists as either a **persisted page** or a **dynamic page** — see both below.
 _Avoid_: Note, document (both used loosely elsewhere for the same file-on-disk concept; "page" is the canonical term)
