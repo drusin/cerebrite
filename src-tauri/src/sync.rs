@@ -29,6 +29,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::connection::Connection;
+use crate::connection_record::CredentialKind;
 
 /// Relative path (from the vault root) of the conflict-backup directory,
 /// mirroring the `.cerebrite/trash/` convention from ticket 10.
@@ -49,7 +50,16 @@ pub enum SyncFailureCause {
     /// `NeedsAttention`.
     NetworkUnreachable { detail: String },
     /// The connection's one credential was rejected by the remote.
-    CredentialRejected { detail: String },
+    /// `credential_kind` names *which* kind was in use when the remote
+    /// rejected it (ticket 04: an expired/rejected access token must
+    /// surface identifiably as "access token", not a generic message) --
+    /// `None` only when no `Connection` was available to classify against
+    /// (e.g. `classify_git_error` called directly in a test, or a fetch
+    /// failure that happens before any credential is even attempted).
+    CredentialRejected {
+        detail: String,
+        credential_kind: Option<CredentialKind>,
+    },
     /// A push was rejected because it was not a fast-forward on the
     /// remote -- someone else pushed first.
     NonFastForwardPush { detail: String },
@@ -67,11 +77,25 @@ impl std::fmt::Display for SyncFailureCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SyncFailureCause::NetworkUnreachable { detail } => write!(f, "network problem: {detail}"),
-            SyncFailureCause::CredentialRejected { detail } => write!(f, "credential rejected: {detail}"),
+            SyncFailureCause::CredentialRejected { detail, credential_kind } => match credential_kind {
+                Some(kind) => write!(f, "{} rejected: {detail}", credential_kind_label(*kind)),
+                None => write!(f, "credential rejected: {detail}"),
+            },
             SyncFailureCause::NonFastForwardPush { detail } => write!(f, "push rejected: {detail}"),
             SyncFailureCause::Conflict { detail } => write!(f, "conflict: {detail}"),
             SyncFailureCause::Other { detail } => write!(f, "{detail}"),
         }
+    }
+}
+
+/// A human-facing name for a credential kind, used to make a rejected
+/// credential's `SyncFailureCause` identifiable (ticket 04) rather than a
+/// generic "credential rejected" message.
+fn credential_kind_label(kind: CredentialKind) -> &'static str {
+    match kind {
+        CredentialKind::AccessToken => "access token",
+        CredentialKind::SshKey => "SSH key",
+        CredentialKind::OauthSignIn => "sign-in",
     }
 }
 
@@ -105,7 +129,9 @@ impl SyncFailureCause {
 pub fn classify_git_error(err: &git2::Error) -> SyncFailureCause {
     let detail = err.message().to_string();
     match err.code() {
-        git2::ErrorCode::Auth => return SyncFailureCause::CredentialRejected { detail },
+        git2::ErrorCode::Auth => {
+            return SyncFailureCause::CredentialRejected { detail, credential_kind: None }
+        }
         git2::ErrorCode::NotFastForward => return SyncFailureCause::NonFastForwardPush { detail },
         git2::ErrorCode::Timeout => return SyncFailureCause::NetworkUnreachable { detail },
         _ => {}
@@ -126,12 +152,30 @@ pub fn classify_git_error(err: &git2::Error) -> SyncFailureCause {
                 || detail.contains("403")
                 || lower.contains("authentication")
             {
-                SyncFailureCause::CredentialRejected { detail }
+                SyncFailureCause::CredentialRejected { detail, credential_kind: None }
             } else {
                 SyncFailureCause::Other { detail }
             }
         }
         _ => SyncFailureCause::Other { detail },
+    }
+}
+
+/// Classifies a git2 error the same way `classify_git_error` does, but when
+/// the result is a rejected credential and `connection` is known, tags it
+/// with which credential kind was in use -- so a needs-attention failure can
+/// name it ("access token rejected: ...") instead of a generic message
+/// (ticket 04 checklist: "surfaces ... as a needs-attention failure naming
+/// this credential kind").
+pub fn classify_git_error_for(err: &git2::Error, connection: Option<&Connection>) -> SyncFailureCause {
+    match (classify_git_error(err), connection) {
+        (SyncFailureCause::CredentialRejected { detail, .. }, Some(connection)) => {
+            SyncFailureCause::CredentialRejected {
+                detail,
+                credential_kind: Some(connection.credential_kind()),
+            }
+        }
+        (cause, _) => cause,
     }
 }
 
@@ -207,7 +251,7 @@ pub fn test_fetch(remote_url: &str, connection: &Connection) -> Result<(), SyncF
     let callbacks = connection.make_callbacks();
     remote
         .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
-        .map_err(|e| classify_git_error(&e))?;
+        .map_err(|e| classify_git_error_for(&e, Some(connection)))?;
     Ok(())
 }
 
@@ -308,7 +352,7 @@ pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<Sy
     // `git fetch`.
     if let Err(e) = remote.fetch(&[] as &[&str], Some(&mut fetch_opts), None) {
         return Ok(SyncOutcome {
-            status: classify_git_error(&e).into_status(),
+            status: classify_git_error_for(&e, connection).into_status(),
             index_rebuild_needed: false,
         });
     }
@@ -321,7 +365,7 @@ pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<Sy
             // push to create it.
             if let Err(e) = push_current_branch(&mut remote, &branch, connection) {
                 return Ok(SyncOutcome {
-                    status: classify_git_error(&e).into_status(),
+                    status: classify_git_error_for(&e, connection).into_status(),
                     index_rebuild_needed: false,
                 });
             }
@@ -374,7 +418,7 @@ pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<Sy
         // Remote has nothing new to merge in; local may still be ahead.
         if let Err(e) = push_current_branch(&mut remote, &branch, connection) {
             return Ok(SyncOutcome {
-                status: classify_git_error(&e).into_status(),
+                status: classify_git_error_for(&e, connection).into_status(),
                 index_rebuild_needed: false,
             });
         }
@@ -447,7 +491,7 @@ pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<Sy
         // updated above) -- only the push failed, so this still needs an
         // index rebuild even though the push itself didn't succeed.
         return Ok(SyncOutcome {
-            status: classify_git_error(&e).into_status(),
+            status: classify_git_error_for(&e, connection).into_status(),
             index_rebuild_needed: true,
         });
     }
@@ -808,6 +852,42 @@ mod tests {
                     matches!(cause, SyncFailureCause::CredentialRejected { .. }),
                     "expected CredentialRejected, got {cause:?}"
                 )
+            }
+            other => panic!("expected NeedsAttention, got {other:?}"),
+        }
+    }
+
+    // -- ticket 04: a rejected credential names its kind, not just "credential
+    // rejected" -- exercised through `run_sync` with a real access-token
+    // `Connection`, mirroring `rejected_credential_lands_in_needs_attention`
+    // above.
+
+    #[test]
+    fn rejected_access_token_names_its_credential_kind() {
+        let dir = tempdir().unwrap();
+        vault::ensure_git_repo(dir.path()).unwrap();
+        fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
+        vault::commit_all(dir.path(), "Create page").unwrap();
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let port = spawn_401_server();
+        repo.remote("origin", &format!("http://127.0.0.1:{port}/repo.git")).unwrap();
+
+        let connection = access_token_connection("invalid-token");
+        let outcome = run_sync(dir.path(), Some(&connection)).unwrap();
+
+        match outcome.status {
+            SyncStatus::NeedsAttention { cause } => {
+                match &cause {
+                    SyncFailureCause::CredentialRejected { credential_kind, .. } => {
+                        assert_eq!(*credential_kind, Some(CredentialKind::AccessToken));
+                    }
+                    other => panic!("expected CredentialRejected, got {other:?}"),
+                }
+                assert!(
+                    cause.to_string().starts_with("access token rejected:"),
+                    "expected the message to name the credential kind, got: {cause}"
+                );
             }
             other => panic!("expected NeedsAttention, got {other:?}"),
         }

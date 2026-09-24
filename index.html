@@ -159,6 +159,30 @@
               </label>
             </div>
           </div>
+
+          <!-- Ticket 04: minimal/raw connect form -- the generic access-token
+               path for any HTTPS git host that isn't GitHub/GitLab sign-in.
+               No wizard polish (provider detection, OAuth, SSH) -- that's
+               tickets 09/10; this just establishes the mechanism end-to-end. -->
+          <div class="settings-section">
+            <h3>Connect a git remote (access token)</h3>
+            <form id="settings-connect-form" class="settings-connect-form">
+              <label>
+                Repository URL
+                <input id="settings-connect-url" type="text" placeholder="https://example.com/user/repo.git" required />
+              </label>
+              <label>
+                Username
+                <input id="settings-connect-username" type="text" required />
+              </label>
+              <label>
+                Access token
+                <input id="settings-connect-token" type="password" required />
+              </label>
+              <button id="settings-connect-button" type="submit">Connect</button>
+              <p id="settings-connect-status" class="settings-connect-status" hidden></p>
+            </form>
+          </div>
         </div>
       </div>
     </div>

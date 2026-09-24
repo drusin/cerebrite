@@ -732,6 +732,31 @@ body {
   cursor: pointer;
 }
 
+/* Ticket 04: minimal/raw connect form -- deliberately plain, no wizard
+   polish (that's tickets 09/10). */
+.settings-connect-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+}
+
+.settings-connect-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3em;
+  font-size: 0.85em;
+}
+
+.settings-connect-form button {
+  align-self: flex-start;
+}
+
+.settings-connect-status {
+  font-size: 0.85em;
+  opacity: 0.8;
+  margin: 0;
+}
+
 /* Forced color scheme (Settings): `[data-theme="dark"]` overrides the same
    variables the `prefers-color-scheme` block below sets, and `:not([data-
    theme="light"])` keeps the OS-driven default working for "System" (no

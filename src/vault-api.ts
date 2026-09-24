@@ -214,3 +214,14 @@ export interface SearchResult {
 export function searchPages(query: string, includeTrash: boolean): Promise<SearchResult[]> {
   return invoke("search_pages", { query, includeTrash });
 }
+
+/// Ticket 04's minimal/raw "connect with an access token" entry point -- the
+/// generic HTTPS path for any git host that isn't GitHub/GitLab sign-in
+/// (Bitbucket Cloud, Gitea, Forgejo, Codeberg, a bare HTTPS remote). The
+/// backend runs a real test fetch with the given credentials *before* saving
+/// anything; a rejected/unreachable test fetch rejects this promise and
+/// leaves nothing persisted. On success, background sync picks up the new
+/// connection on its own -- no further prompting.
+export function connectAccessToken(remoteUrl: string, username: string, token: string): Promise<void> {
+  return invoke("connect_access_token", { remoteUrl, username, token });
+}

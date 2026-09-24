@@ -447,6 +447,109 @@ fn get_sync_status(state: State<AppState>) -> sync::SyncStatus {
     state.sync_status.lock().unwrap().clone()
 }
 
+/// Ticket 04's minimal/raw "connect with an access token" entry point -- the
+/// generic HTTPS path for any git host that isn't GitHub/GitLab sign-in
+/// (Bitbucket Cloud, Gitea, Forgejo, Codeberg, a bare HTTPS remote). Reuses
+/// ticket 03's `connection::try_connect` persist-gate as-is: it runs a real
+/// test fetch with `Cred::userpass_plaintext(username, token)` *before*
+/// writing anything, so a wrong/expired token returns an error (its message
+/// names the credential kind -- see `sync::SyncFailureCause`'s `Display`)
+/// and leaves no connection record or stored secret behind. On success the
+/// vault has exactly one Connection (`CredentialKind::AccessToken`); the
+/// background sync loop (`perform_sync` above) picks it up on its own with
+/// no further prompting.
+///
+/// Store choice is a call this minimal command has to make on its own (no
+/// Settings-UI consent flow yet -- that's ticket 13): prefer the platform
+/// keychain, actually probed (not just "did `platform()` construct")
+/// so a reachable-but-locked keychain isn't mistaken for a usable one;
+/// fall back to the consented plaintext store (ADR-0013) whenever it isn't.
+/// A dedicated "keychain unavailable, store in plaintext instead?" prompt is
+/// deliberately out of this ticket's scope.
+#[tauri::command]
+fn connect_access_token(
+    app: AppHandle,
+    state: State<AppState>,
+    remote_url: String,
+    username: String,
+    token: String,
+) -> Result<(), String> {
+    let remote_url = remote_url.trim().to_string();
+    let username = username.trim().to_string();
+    if remote_url.is_empty() || username.is_empty() || token.is_empty() {
+        return Err("Repository URL, username, and access token are all required".to_string());
+    }
+
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let plaintext = credential::PlaintextStore::new(&config_dir);
+
+    let keychain = credential::KeychainBackend::platform().ok();
+    let store_kind = match &keychain {
+        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
+        _ => connection_record::StoreKind::Plaintext,
+    };
+
+    let record = connection_record::ConnectionRecord {
+        connection_id: uuid::Uuid::new_v4().to_string(),
+        credential_kind: connection_record::CredentialKind::AccessToken,
+        provider: infer_provider(&remote_url),
+        https_username: Some(username),
+        token_expiry: None,
+        credential_store: store_kind,
+    };
+
+    let connection = connection::try_connect(
+        &repo_root,
+        keychain.as_ref(),
+        &plaintext,
+        record.clone(),
+        token.into_bytes(),
+        &remote_url,
+        credential::CallUrgency::Interactive,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Index bookkeeping (ADR-0013 / ticket 02's `settings::set_connection_store`):
+    // records which store this connection's secret ended up in, app-wide, so
+    // a later cleanup/"remove all credentials" pass can find it without
+    // walking every vault on disk.
+    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+
+    // The vault now has a working connection -- nudge the background sync
+    // loop to try immediately rather than waiting for its next periodic
+    // tick, same as any other state-changing action already does via
+    // `notify_sync`.
+    notify_sync(&state);
+
+    debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::AccessToken);
+    Ok(())
+}
+
+/// Provider hosts recognized as `Provider::GitHub`/`Provider::GitLab`;
+/// anything else is `Provider::Other(host)` -- ticket 04's generic
+/// access-token path covers exactly that "anything else" tier (Bitbucket,
+/// Gitea, Forgejo, Codeberg, a bare HTTPS host).
+fn infer_provider(remote_url: &str) -> connection_record::Provider {
+    let without_scheme = remote_url.splitn(2, "://").nth(1).unwrap_or(remote_url);
+    let after_auth = without_scheme.rsplit('@').next().unwrap_or(without_scheme);
+    let host = after_auth
+        .split(['/', ':'])
+        .next()
+        .unwrap_or(after_auth)
+        .to_lowercase();
+    match host.as_str() {
+        "github.com" => connection_record::Provider::GitHub,
+        "gitlab.com" => connection_record::Provider::GitLab,
+        _ => connection_record::Provider::Other(host),
+    }
+}
+
 /// Lists every persisted page's id/title, flat and alphabetical.
 #[tauri::command]
 fn list_pages(state: State<AppState>) -> Result<Vec<PageSummary>, String> {
@@ -1135,6 +1238,7 @@ pub fn run() {
             list_trashed_pages,
             search_pages,
             get_sync_status,
+            connect_access_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

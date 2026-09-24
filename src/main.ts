@@ -16,6 +16,7 @@ import {
   emptyTrash,
   listTrashedPages,
   searchPages,
+  connectAccessToken,
   type PageSummary,
   type PageResolution,
   type TrashedPageSummary,
@@ -85,6 +86,12 @@ const settingsModalOverlayEl = document.querySelector<HTMLElement>("#settings-mo
 const settingsVaultPathEl = document.querySelector<HTMLElement>("#settings-vault-path");
 const settingsChangeFolderButtonEl = document.querySelector<HTMLButtonElement>("#settings-change-folder-button");
 const settingsThemeRadios = document.querySelectorAll<HTMLInputElement>('input[name="settings-theme"]');
+const settingsConnectFormEl = document.querySelector<HTMLFormElement>("#settings-connect-form");
+const settingsConnectUrlEl = document.querySelector<HTMLInputElement>("#settings-connect-url");
+const settingsConnectUsernameEl = document.querySelector<HTMLInputElement>("#settings-connect-username");
+const settingsConnectTokenEl = document.querySelector<HTMLInputElement>("#settings-connect-token");
+const settingsConnectButtonEl = document.querySelector<HTMLButtonElement>("#settings-connect-button");
+const settingsConnectStatusEl = document.querySelector<HTMLElement>("#settings-connect-status");
 
 // The page currently loaded in the editor: either a persisted page (has an
 // id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
@@ -977,6 +984,38 @@ async function handleChangeVaultFolderClick() {
   }
 }
 
+/**
+ * Ticket 04's minimal/raw "connect with an access token" submit handler:
+ * disables the form while the backend runs its test fetch, then reports
+ * success/failure inline. A failed connect (wrong/expired token, unreachable
+ * remote) leaves the fields filled in so the user can just fix the token and
+ * resubmit, rather than clearing the form on error.
+ */
+async function handleConnectFormSubmit(event: SubmitEvent) {
+  event.preventDefault();
+  if (!settingsConnectUrlEl || !settingsConnectUsernameEl || !settingsConnectTokenEl) return;
+
+  const remoteUrl = settingsConnectUrlEl.value.trim();
+  const username = settingsConnectUsernameEl.value.trim();
+  const token = settingsConnectTokenEl.value;
+
+  settingsConnectButtonEl?.setAttribute("disabled", "");
+  if (settingsConnectStatusEl) {
+    settingsConnectStatusEl.textContent = "Connecting…";
+    settingsConnectStatusEl.removeAttribute("hidden");
+  }
+
+  try {
+    await connectAccessToken(remoteUrl, username, token);
+    if (settingsConnectStatusEl) settingsConnectStatusEl.textContent = "Connected.";
+    settingsConnectTokenEl.value = "";
+  } catch (err) {
+    if (settingsConnectStatusEl) settingsConnectStatusEl.textContent = String(err);
+  } finally {
+    settingsConnectButtonEl?.removeAttribute("disabled");
+  }
+}
+
 function openSettingsModal() {
   if (!settingsModalOverlayEl) return;
   if (settingsVaultPathEl) settingsVaultPathEl.textContent = currentVaultPath ?? "";
@@ -1051,6 +1090,7 @@ async function init() {
   sidebarRailSettingsButtonEl?.addEventListener("click", openSettingsModal);
   settingsChangeFolderButtonEl?.addEventListener("click", () => void handleChangeVaultFolderClick());
   settingsThemeRadios.forEach((radio) => radio.addEventListener("change", (e) => void handleThemeRadioChange(e)));
+  settingsConnectFormEl?.addEventListener("submit", (e) => void handleConnectFormSubmit(e));
   // Clicking the dimmed backdrop (not the modal card itself) closes it.
   settingsModalOverlayEl?.addEventListener("click", (event) => {
     if (event.target === settingsModalOverlayEl) closeSettingsModal();

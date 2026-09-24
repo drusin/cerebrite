@@ -181,9 +181,18 @@ impl std::error::Error for ConnectError {}
 /// fetch using its credential succeeds." On success, the secret is stored
 /// in the store the record declares and the record is written; on any
 /// failure, nothing is persisted at all.
+///
+/// `keychain` is `Option` (widened from ticket 03's original `&KeychainBackend`
+/// by ticket 04): a caller that has already probed `KeychainBackend::platform()`
+/// and found no keychain reachable at all still needs to be able to connect
+/// with `record.credential_store` set to `StoreKind::Plaintext` -- there is no
+/// live `KeychainBackend` to hand over in that case, and there shouldn't need
+/// to be one, since a plaintext-store record never calls into it. `None` with
+/// a `Keychain`-store record fails with `ConnectError::Credential` rather than
+/// panicking.
 pub fn try_connect(
     repo_root: &Path,
-    keychain: &KeychainBackend,
+    keychain: Option<&KeychainBackend>,
     plaintext: &PlaintextStore,
     record: ConnectionRecord,
     secret: Vec<u8>,
@@ -196,6 +205,11 @@ pub fn try_connect(
 
     match record.credential_store {
         StoreKind::Keychain => keychain
+            .ok_or_else(|| {
+                ConnectError::Credential(CredentialError::Unavailable(
+                    "no keychain backend is available".to_string(),
+                ))
+            })?
             .set_secret(&record.connection_id, &secret, urgency)
             .map_err(ConnectError::Credential)?,
         StoreKind::Plaintext => plaintext
@@ -280,7 +294,7 @@ mod tests {
 
         let result = try_connect(
             repo_dir.path(),
-            &keychain,
+            Some(&keychain),
             &plaintext,
             record.clone(),
             b"a-token".to_vec(),
@@ -323,7 +337,7 @@ mod tests {
 
         let connection = try_connect(
             repo_dir.path(),
-            &keychain,
+            Some(&keychain),
             &plaintext,
             record.clone(),
             b"a-token".to_vec(),
@@ -372,5 +386,188 @@ mod tests {
 
         assert_eq!(loaded.credential_kind(), CredentialKind::AccessToken);
         assert_eq!(loaded.secret, b"stored-token");
+    }
+
+    // -- ticket 04: integration test against a fixture HTTPS remote
+    // requiring HTTP Basic auth -- connect succeeds with the correct token,
+    // fails (and persists nothing) with the wrong one, and never falls back
+    // to any other mechanism (ADR-0012: `credential_for_kind`'s `AccessToken`
+    // arm only ever builds one `Cred::userpass_plaintext`, so there is
+    // nothing else for a failed attempt to fall back to). `test_fetch`'s
+    // `connect_auth` only needs the smart-HTTP `info/refs` handshake to
+    // succeed, never a real pack transfer, so this fixture only has to
+    // answer that one request -- mirroring the pattern `sync.rs`'s
+    // `spawn_401_server` established for ticket 03's own credential test.
+    mod basic_auth_fixture {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        /// Minimal, dependency-free base64 decoder -- just enough to read
+        /// back the `Authorization: Basic <base64>` header this fixture
+        /// receives; not a general-purpose implementation.
+        fn base64_decode(input: &str) -> Vec<u8> {
+            const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = Vec::new();
+            let mut buf = 0u32;
+            let mut bits = 0u32;
+            for c in input.bytes() {
+                if c == b'=' {
+                    break;
+                }
+                let Some(val) = ALPHABET.iter().position(|&b| b == c) else { continue };
+                buf = (buf << 6) | val as u32;
+                bits += 6;
+                if bits >= 8 {
+                    bits -= 8;
+                    out.push((buf >> bits) as u8);
+                }
+            }
+            out
+        }
+
+        fn basic_auth_credentials(request_head: &str) -> Option<(String, String)> {
+            let header = request_head
+                .lines()
+                .find(|line| line.to_lowercase().starts_with("authorization:"))?;
+            let value = header.splitn(2, ':').nth(1)?.trim();
+            let b64 = value.strip_prefix("Basic ")?;
+            let decoded = String::from_utf8(base64_decode(b64)).ok()?;
+            let mut parts = decoded.splitn(2, ':');
+            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+        }
+
+        /// A minimal git smart-HTTP `info/refs` responder requiring HTTP
+        /// Basic auth: `401` for a missing/wrong `Authorization` header,
+        /// otherwise a minimal valid (zero-ref) `git-upload-pack`
+        /// advertisement for exactly `username`/`token` -- any other
+        /// credential is rejected, there is no secondary check to fall
+        /// back to.
+        pub fn spawn(username: &'static str, token: &'static str) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().take(20) {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+
+                    let authorized = basic_auth_credentials(&request)
+                        .map(|(u, p)| u == username && p == token)
+                        .unwrap_or(false);
+
+                    if authorized {
+                        let service_line = "# service=git-upload-pack\n";
+                        let mut body = Vec::new();
+                        body.extend_from_slice(format!("{:04x}", service_line.len() + 4).as_bytes());
+                        body.extend_from_slice(service_line.as_bytes());
+                        body.extend_from_slice(b"0000"); // flush after the service announcement
+                        body.extend_from_slice(b"0000"); // flush for an empty ref list
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/x-git-upload-pack-advertisement\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\
+                             \r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(&body);
+                    } else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\n\
+                              WWW-Authenticate: Basic realm=\"cerebrite-test\"\r\n\
+                              Content-Length: 0\r\n\
+                              Connection: close\r\n\
+                              \r\n",
+                        );
+                    }
+                }
+            });
+            port
+        }
+    }
+
+    #[test]
+    fn connect_succeeds_against_a_basic_auth_fixture_remote_with_the_correct_token() {
+        let repo_dir = tempdir().unwrap();
+        vault::ensure_git_repo(repo_dir.path()).unwrap();
+
+        let config_dir = tempdir().unwrap();
+        let keychain = crate::credential::KeychainBackend::in_memory();
+        let plaintext = crate::credential::PlaintextStore::new(config_dir.path());
+
+        let port = basic_auth_fixture::spawn("dawid", "correct-token");
+        let remote_url = format!("http://127.0.0.1:{port}/repo.git");
+
+        let mut record = access_token_record();
+        record.credential_store = StoreKind::Keychain;
+
+        let connection = try_connect(
+            repo_dir.path(),
+            Some(&keychain),
+            &plaintext,
+            record.clone(),
+            b"correct-token".to_vec(),
+            &remote_url,
+            CallUrgency::Interactive,
+        )
+        .unwrap();
+
+        assert_eq!(connection.credential_kind(), CredentialKind::AccessToken);
+        assert_eq!(connection_record::read(repo_dir.path()).unwrap(), Some(record.clone()));
+        assert_eq!(
+            keychain.get_secret(&record.connection_id, CallUrgency::Interactive).unwrap(),
+            b"correct-token"
+        );
+    }
+
+    #[test]
+    fn connect_fails_and_persists_nothing_against_a_basic_auth_fixture_remote_with_the_wrong_token() {
+        let repo_dir = tempdir().unwrap();
+        vault::ensure_git_repo(repo_dir.path()).unwrap();
+
+        let config_dir = tempdir().unwrap();
+        let keychain = crate::credential::KeychainBackend::in_memory();
+        let plaintext = crate::credential::PlaintextStore::new(config_dir.path());
+
+        let port = basic_auth_fixture::spawn("dawid", "correct-token");
+        let remote_url = format!("http://127.0.0.1:{port}/repo.git");
+
+        let mut record = access_token_record();
+        record.credential_store = StoreKind::Keychain;
+
+        let result = try_connect(
+            repo_dir.path(),
+            Some(&keychain),
+            &plaintext,
+            record.clone(),
+            b"wrong-token".to_vec(),
+            &remote_url,
+            CallUrgency::Interactive,
+        );
+
+        match result {
+            Err(ConnectError::Fetch(cause)) => {
+                assert!(
+                    matches!(cause, crate::sync::SyncFailureCause::CredentialRejected { .. }),
+                    "expected CredentialRejected, got {cause:?}"
+                );
+                assert!(
+                    cause.to_string().starts_with("access token rejected:"),
+                    "expected the failure to name the credential kind, got: {cause}"
+                );
+            }
+            Ok(_) => panic!("expected connect to fail with the wrong token, but it succeeded"),
+            Err(other) => panic!("expected ConnectError::Fetch(CredentialRejected), got {other:?}"),
+        }
+        // Nothing was persisted: no connection record, and the keychain
+        // never received a secret for this connection id -- a failed test
+        // fetch must never fall through to storing the credential anyway.
+        assert_eq!(connection_record::read(repo_dir.path()).unwrap(), None);
+        assert!(matches!(
+            keychain.get_secret(&record.connection_id, CallUrgency::Interactive),
+            Err(CredentialError::NotFound)
+        ));
     }
 }
