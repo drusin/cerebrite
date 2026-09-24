@@ -3,19 +3,21 @@
 // a consented-per-connection plaintext file when the keychain is
 // unavailable -- plus the app-wide `known_hosts` file that sits beside it.
 //
-// No credential *kind* (OAuth sign-in / access token / SSH key, ADR-0012)
-// is wired to this yet -- tickets 04-07 do that. This module only has to
-// move opaque secret bytes in and out of a store reliably, off the UI
-// thread, with the right timeout, and tell "keychain locked" apart from
-// "keychain unreachable" (ADR-0013). The non-secret connection record is
-// `connection_record.rs`; the app-level index of which store each
-// connection uses is `settings::Settings::connections`.
+// No credential *kind*-specific setup/refresh flow (OAuth sign-in / access
+// token / SSH key, ADR-0012) is wired to this yet -- tickets 04-07 do that.
+// This module only has to move opaque secret bytes in and out of a store
+// reliably, off the UI thread, with the right timeout, and tell "keychain
+// locked" apart from "keychain unreachable" (ADR-0013). The non-secret
+// connection record is `connection_record.rs`; the app-level index of which
+// store each connection uses is `settings::Settings::connections`; ticket
+// 03's `connection::Connection` is the first caller of the public API here,
+// resolving a connection's secret generically (not yet per-kind) so sync
+// can authenticate with it.
 //
-// Nothing in this crate calls the public API here yet -- there is no
-// credential kind to plug it into until tickets 04-07 -- so most of it is
-// otherwise-dead code from `cargo build`'s point of view. Silenced
-// deliberately rather than leaving the warning noise, or littering every
-// item with `#[allow(dead_code)]`; remove this once a caller exists.
+// A few items (`move_to_keychain`, `remove_all_credentials`, `known_hosts_path`)
+// still have no caller -- those are ticket 13 (Settings UI) and ticket 05
+// (SSH host keys) respectively -- so `#[allow(dead_code)]` stays on this
+// module rather than being removed piecemeal.
 #![allow(dead_code)]
 
 use std::fs;

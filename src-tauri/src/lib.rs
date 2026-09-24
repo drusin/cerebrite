@@ -1,3 +1,4 @@
+mod connection;
 mod connection_record;
 mod credential;
 mod frontmatter;
@@ -389,11 +390,39 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
     *state.sync_status.lock().unwrap() = sync::SyncStatus::Syncing;
     let _ = app.emit("sync-status-changed", &sync::SyncStatus::Syncing);
 
-    let outcome = match sync::run_sync(repo_root) {
-        Ok(outcome) => outcome,
-        Err(e) => sync::SyncOutcome {
-            status: sync::SyncStatus::Error { detail: e.to_string() },
+    // Ticket 03 / ADR-0012: sync authenticates with this vault's one
+    // configured Connection (its named credential kind) and nothing else --
+    // `None` when no connection has been set up, which is fine for a
+    // transport that needs no credentials and fails cleanly for one that
+    // does. A failure resolving the credential itself (e.g. a locked
+    // keychain) is reported the same way a fetch/push failure would be,
+    // rather than silently falling back to no credentials.
+    let keychain = credential::KeychainBackend::platform();
+    let connection_load = keychain.as_ref().ok().and_then(|keychain| {
+        app.path().app_config_dir().ok().and_then(|config_dir| {
+            let plaintext = credential::PlaintextStore::new(&config_dir);
+            connection::Connection::load(repo_root, keychain, &plaintext, credential::CallUrgency::Background).transpose()
+        })
+    });
+
+    let outcome = match connection_load {
+        Some(Err(e)) => sync::SyncOutcome {
+            status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
             index_rebuild_needed: false,
+        },
+        Some(Ok(connection)) => match sync::run_sync(repo_root, Some(&connection)) {
+            Ok(outcome) => outcome,
+            Err(e) => sync::SyncOutcome {
+                status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
+                index_rebuild_needed: false,
+            },
+        },
+        None => match sync::run_sync(repo_root, None) {
+            Ok(outcome) => outcome,
+            Err(e) => sync::SyncOutcome {
+                status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
+                index_rebuild_needed: false,
+            },
         },
     };
 

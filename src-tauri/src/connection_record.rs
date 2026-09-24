@@ -18,13 +18,12 @@
 // (connect/disconnect) must not affect it. Do not add an author field to
 // this struct.
 //
-// No credential *kind* is wired up by this ticket -- tickets 04 (access
-// token), 05 (SSH key) and 06/07 (OAuth sign-in) do that. This is just the
-// shape the record can hold, and the read/write/delete plumbing for it.
-//
-// `write`/`read`/`delete` have no caller yet -- wiring a real connection
-// into a vault starts at ticket 04 -- so silence the dead-code warning
-// deliberately rather than leaving the noise; remove once a caller exists.
+// No credential *kind*-specific setup/refresh flow is wired up by this
+// ticket -- tickets 04 (access token), 05 (SSH key) and 06/07 (OAuth
+// sign-in) do that. This is just the shape the record can hold, and the
+// read/write/delete plumbing for it. Ticket 03's `connection.rs` is the
+// first caller: `Connection::load` reads a record, `connection::try_connect`
+// writes one once a test fetch with its credential has succeeded.
 #![allow(dead_code)]
 
 use std::fs;
