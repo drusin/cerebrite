@@ -1167,6 +1167,11 @@ mod tests {
             perms.set_mode(0o600);
             std::fs::set_permissions(path, perms).unwrap();
         }
+
+        // `spawn` bails out before reaching this on platforms without
+        // `/usr/sbin/sshd`, but the call sites still have to compile there.
+        #[cfg(not(unix))]
+        fn restrict(_path: &PathBuf) {}
     }
 
     fn ssh_key_record() -> ConnectionRecord {
