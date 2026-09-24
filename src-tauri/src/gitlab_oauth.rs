@@ -100,6 +100,13 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 pub struct GitLabEndpoints {
     pub device_code_url: String,
     pub token_url: String,
+    /// Base of GitLab's REST API v4 (`https://gitlab.com/api/v4` in
+    /// production) -- ticket 09's create/list-repository endpoints. Named
+    /// the same way `github_oauth::GitHubEndpoints::api_base_url` is, for
+    /// consistency between the two provider modules; previously unused here
+    /// because ticket 07 had no per-repo REST calls of its own (unlike
+    /// GitHub's installation check).
+    pub api_base_url: String,
 }
 
 impl GitLabEndpoints {
@@ -107,6 +114,7 @@ impl GitLabEndpoints {
         Self {
             device_code_url: "https://gitlab.com/oauth/authorize_device".to_string(),
             token_url: "https://gitlab.com/oauth/token".to_string(),
+            api_base_url: "https://gitlab.com/api/v4".to_string(),
         }
     }
 }
@@ -448,6 +456,137 @@ pub fn refresh_if_needed(
     crate::connection::Connection::from_parts(record, new_secret.to_bytes())
 }
 
+/// One repository as surfaced to the guided connect wizard (ticket 09) --
+/// identical shape to `github_oauth::RepoInfo` (kept duplicated rather than
+/// shared, same as the rest of this module, to keep the two provider
+/// modules independently readable/removable).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoInfo {
+    pub name: String,
+    pub full_name: String,
+    pub private: bool,
+    pub clone_url: String,
+    pub html_url: String,
+}
+
+/// Ticket 09's create-new path: `POST {api_base_url}/projects` with `name`
+/// and `visibility` (`"private"`/`"public"` -- private is the caller's
+/// responsibility to default to). GitLab's REST API takes an OAuth token as
+/// a `Bearer` credential exactly like GitHub's does.
+pub fn create_repository(
+    endpoints: &GitLabEndpoints,
+    access_token: &str,
+    name: &str,
+    private: bool,
+) -> Result<RepoInfo, DeviceFlowError> {
+    let visibility = if private { "private" } else { "public" };
+    let url = format!("{}/projects", endpoints.api_base_url);
+    let body = serde_json::json!({ "name": name, "visibility": visibility });
+    let (status, body) = post_bearer_json(&url, access_token, &body)?;
+    match status {
+        200 | 201 => {
+            let raw: RawProjectResponse =
+                serde_json::from_str(&body).map_err(|e| DeviceFlowError::UnexpectedResponse(e.to_string()))?;
+            raw.try_into()
+        }
+        401 | 403 => Err(DeviceFlowError::Rejected(format!(
+            "GitLab rejected the repository creation request with status {status}"
+        ))),
+        other => Err(DeviceFlowError::UnexpectedResponse(format!(
+            "unexpected status {other} creating a repository: {body}"
+        ))),
+    }
+}
+
+/// Ticket 09's pick-existing path: `GET {api_base_url}/projects?membership=true`
+/// (only projects the authenticated user is a member of), first 100 results
+/// -- paginating further is explicitly optional per the ticket.
+pub fn list_repositories(endpoints: &GitLabEndpoints, access_token: &str) -> Result<Vec<RepoInfo>, DeviceFlowError> {
+    let url = format!("{}/projects?membership=true&per_page=100", endpoints.api_base_url);
+    let (status, body) = get_bearer(&url, access_token)?;
+    match status {
+        200 => {
+            let raw: Vec<RawProjectResponse> =
+                serde_json::from_str(&body).map_err(|e| DeviceFlowError::UnexpectedResponse(e.to_string()))?;
+            raw.into_iter().map(TryInto::try_into).collect()
+        }
+        401 | 403 => Err(DeviceFlowError::Rejected(format!(
+            "GitLab rejected the repository list request with status {status}"
+        ))),
+        other => Err(DeviceFlowError::UnexpectedResponse(format!(
+            "unexpected status {other} listing repositories: {body}"
+        ))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProjectResponse {
+    name: Option<String>,
+    path_with_namespace: Option<String>,
+    visibility: Option<String>,
+    http_url_to_repo: Option<String>,
+    web_url: Option<String>,
+}
+
+impl TryFrom<RawProjectResponse> for RepoInfo {
+    type Error = DeviceFlowError;
+
+    fn try_from(raw: RawProjectResponse) -> Result<Self, Self::Error> {
+        let (Some(name), Some(full_name), Some(visibility), Some(clone_url), Some(html_url)) = (
+            raw.name,
+            raw.path_with_namespace,
+            raw.visibility,
+            raw.http_url_to_repo,
+            raw.web_url,
+        ) else {
+            return Err(DeviceFlowError::UnexpectedResponse(
+                "project response missing required fields".to_string(),
+            ));
+        };
+        Ok(RepoInfo {
+            name,
+            full_name,
+            private: visibility != "public",
+            clone_url,
+            html_url,
+        })
+    }
+}
+
+/// A blocking `POST` with a JSON body and a `Bearer` token, returning
+/// (status, body) -- the create-repository counterpart to `get_bearer`
+/// (which this module doesn't otherwise have; added alongside it here for
+/// ticket 09's list-repository call).
+fn post_bearer_json(url: &str, token: &str, json_body: &serde_json::Value) -> Result<(u16, String), DeviceFlowError> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(json_body)
+        .send()
+        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response.text().map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    Ok((status, body))
+}
+
+/// A blocking `GET` with a `Bearer` token, returning (status, body) --
+/// `github_oauth.rs` has its own copy of this same shape; kept duplicated
+/// here for the same independently-readable-module reason as the rest of
+/// this file.
+fn get_bearer(url: &str, token: &str) -> Result<(u16, String), DeviceFlowError> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response.text().map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    Ok((status, body))
+}
+
 // -- internal: raw response shapes and shared HTTP plumbing --
 
 #[derive(Debug, Deserialize)]
@@ -708,7 +847,8 @@ mod tests {
         let base = format!("http://127.0.0.1:{port}");
         GitLabEndpoints {
             device_code_url: base.clone(),
-            token_url: base,
+            token_url: base.clone(),
+            api_base_url: base,
         }
     }
 
@@ -860,6 +1000,68 @@ mod tests {
             r#"{"error":"invalid_grant","error_description":"The refresh token is invalid."}"#.to_string(),
         )]);
         let result = refresh_token_pair(&endpoints_for(port), "client", "glrt_stale");
+        assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
+    }
+
+    // -- create_repository / list_repositories (ticket 09) --
+
+    #[test]
+    fn create_repository_parses_a_successful_response() {
+        let port = mock_server::spawn(vec![(
+            201,
+            r#"{"name":"notes","path_with_namespace":"dawid/notes","visibility":"private","http_url_to_repo":"https://gitlab.com/dawid/notes.git","web_url":"https://gitlab.com/dawid/notes"}"#.to_string(),
+        )]);
+        let repo = create_repository(&endpoints_for(port), "glpat_abc", "notes", true).unwrap();
+        assert_eq!(repo.name, "notes");
+        assert_eq!(repo.full_name, "dawid/notes");
+        assert!(repo.private);
+        assert_eq!(repo.clone_url, "https://gitlab.com/dawid/notes.git");
+    }
+
+    #[test]
+    fn create_repository_defaults_visibility_to_public_only_when_explicitly_asked() {
+        let port = mock_server::spawn(vec![(
+            201,
+            r#"{"name":"public-thing","path_with_namespace":"dawid/public-thing","visibility":"public","http_url_to_repo":"https://gitlab.com/dawid/public-thing.git","web_url":"https://gitlab.com/dawid/public-thing"}"#.to_string(),
+        )]);
+        let repo = create_repository(&endpoints_for(port), "glpat_abc", "public-thing", false).unwrap();
+        assert!(!repo.private);
+    }
+
+    #[test]
+    fn create_repository_surfaces_a_name_already_taken_rejection() {
+        let port = mock_server::spawn(vec![(
+            400,
+            r#"{"message":{"name":["has already been taken"]}}"#.to_string(),
+        )]);
+        let result = create_repository(&endpoints_for(port), "glpat_abc", "notes", true);
+        assert!(matches!(result, Err(DeviceFlowError::UnexpectedResponse(_))));
+    }
+
+    #[test]
+    fn create_repository_surfaces_a_rejected_token() {
+        let port = mock_server::spawn(vec![(401, r#"{"message":"401 Unauthorized"}"#.to_string())]);
+        let result = create_repository(&endpoints_for(port), "bad-token", "notes", true);
+        assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
+    }
+
+    #[test]
+    fn list_repositories_parses_a_successful_response() {
+        let port = mock_server::spawn(vec![(
+            200,
+            r#"[{"name":"notes","path_with_namespace":"dawid/notes","visibility":"private","http_url_to_repo":"https://gitlab.com/dawid/notes.git","web_url":"https://gitlab.com/dawid/notes"},
+                {"name":"public-thing","path_with_namespace":"dawid/public-thing","visibility":"public","http_url_to_repo":"https://gitlab.com/dawid/public-thing.git","web_url":"https://gitlab.com/dawid/public-thing"}]"#.to_string(),
+        )]);
+        let repos = list_repositories(&endpoints_for(port), "glpat_abc").unwrap();
+        assert_eq!(repos.len(), 2);
+        assert!(repos[0].private);
+        assert!(!repos[1].private);
+    }
+
+    #[test]
+    fn list_repositories_surfaces_a_rejected_token() {
+        let port = mock_server::spawn(vec![(401, r#"{"message":"401 Unauthorized"}"#.to_string())]);
+        let result = list_repositories(&endpoints_for(port), "bad-token");
         assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
     }
 

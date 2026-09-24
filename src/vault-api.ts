@@ -387,6 +387,50 @@ export function connectGitlabOauth(
   return invoke("connect_gitlab_oauth", { remoteUrl, accessToken, refreshToken, accessTokenExpiresAt });
 }
 
+/// One repository as surfaced to the guided connect wizard (ticket 09), for
+/// both GitHub and GitLab -- just enough to render a pickable list entry
+/// (name + private/public indicator) and hand `cloneUrl` straight to
+/// `connectGithubOauth`/`connectGitlabOauth` after a create-new or
+/// pick-existing selection.
+export interface RepoInfo {
+  name: string;
+  fullName: string;
+  private: boolean;
+  cloneUrl: string;
+  htmlUrl: string;
+}
+
+/// Ticket 09's create-new path, GitHub half: creates a repository via the
+/// GitHub REST API using the access token already acquired from a completed
+/// `startGithubDeviceFlow`/`pollGithubDeviceFlow` sign-in. `private` is the
+/// wizard's responsibility to default to `true` -- this call takes whatever
+/// the caller passes verbatim. Creating alone persists nothing to the vault;
+/// only the subsequent `connectGithubOauth` call (against the returned
+/// `cloneUrl`) does, gated by its own real test fetch.
+export function createGithubRepository(name: string, isPrivate: boolean, accessToken: string): Promise<RepoInfo> {
+  return invoke("create_github_repository", { name, private: isPrivate, accessToken });
+}
+
+/// Ticket 09's pick-existing path, GitHub half: lists the signed-in user's
+/// repositories (first 100, most-recently-updated first) for the wizard's
+/// picker list.
+export function listGithubRepositories(accessToken: string): Promise<RepoInfo[]> {
+  return invoke("list_github_repositories", { accessToken });
+}
+
+/// Ticket 09's create-new path, GitLab half -- mirrors
+/// `createGithubRepository` exactly, using GitLab's REST API v4.
+export function createGitlabRepository(name: string, isPrivate: boolean, accessToken: string): Promise<RepoInfo> {
+  return invoke("create_gitlab_repository", { name, private: isPrivate, accessToken });
+}
+
+/// Ticket 09's pick-existing path, GitLab half -- mirrors
+/// `listGithubRepositories` exactly, listing only projects the signed-in
+/// user is a member of.
+export function listGitlabRepositories(accessToken: string): Promise<RepoInfo[]> {
+  return invoke("list_gitlab_repositories", { accessToken });
+}
+
 /// Ticket 08's "Commit as" author identity -- see
 /// `src-tauri/src/author.rs`'s module doc comment for the full resolved
 /// decision this implements. Stored exclusively in the vault's repo-local

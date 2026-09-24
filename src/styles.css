@@ -757,6 +757,92 @@ body {
   margin: 0;
 }
 
+/* Ticket 09: guided connect wizard -- a compact modal layered over Settings
+   (same overlay/card treatment, deliberately not full-screen -- that's
+   clone's treatment, ticket 10). */
+.settings-wizard-intro {
+  font-size: 0.85em;
+  opacity: 0.75;
+  margin: 0 0 0.6em;
+}
+
+.connect-wizard {
+  z-index: 31; /* above the Settings modal it's layered on top of */
+}
+
+.connect-wizard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+}
+
+.connect-wizard-body input {
+  padding: 0.4em 0.5em;
+  font-size: 0.9em;
+}
+
+.connect-wizard-footer {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 1em;
+  padding-top: 0.75em;
+  border-top: 1px solid var(--modal-border);
+}
+
+.connect-wizard-footer button {
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+
+.wizard-question {
+  font-weight: 600;
+  margin: 0;
+}
+
+.wizard-button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+}
+
+.wizard-primary-action {
+  align-self: flex-start;
+  font-weight: 600;
+}
+
+.wizard-secondary-action {
+  align-self: flex-start;
+  opacity: 0.8;
+}
+
+.wizard-inline-error {
+  font-size: 0.85em;
+}
+
+.wizard-repo-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3em;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.wizard-repo-item {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5em;
+  text-align: left;
+}
+
+.wizard-repo-visibility {
+  opacity: 0.6;
+  font-size: 0.85em;
+}
+
 /* Ticket 08: the "Commit as" field's "future commits only" note -- same
    muted, small-print treatment as `.settings-connect-status` above. */
 .settings-commit-author-note {

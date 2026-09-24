@@ -1090,6 +1090,48 @@ fn connect_gitlab_oauth(
     Ok(OauthConnectResult { provider_suggested_author })
 }
 
+/// Ticket 09's create-new path, GitHub half: creates a repository via
+/// `POST /user/repos` using the access token already in hand from a
+/// completed device flow (tickets 06/06's `connect_github_oauth` isn't
+/// involved yet -- creating costs nothing to persist, only the subsequent
+/// `connect_github_oauth` call against the returned `clone_url` does, via
+/// `connection::try_connect`'s real test-fetch gate). `private` defaults to
+/// `true` in the wizard's state machine (`src/connect-wizard.ts`) -- this
+/// command takes whatever the caller passes verbatim rather than enforcing
+/// the default itself, since the frontend is the only caller and already
+/// enforces it (never defaulting to public without an explicit toggle).
+#[tauri::command]
+fn create_github_repository(name: String, private: bool, access_token: String) -> Result<github_oauth::RepoInfo, String> {
+    let endpoints = github_oauth::GitHubEndpoints::production();
+    github_oauth::create_repository(&endpoints, &access_token, &name, private).map_err(|e| e.to_string())
+}
+
+/// Ticket 09's pick-existing path, GitHub half: lists the signed-in user's
+/// repositories (first 100, most-recently-updated first) for the wizard's
+/// picker list.
+#[tauri::command]
+fn list_github_repositories(access_token: String) -> Result<Vec<github_oauth::RepoInfo>, String> {
+    let endpoints = github_oauth::GitHubEndpoints::production();
+    github_oauth::list_repositories(&endpoints, &access_token).map_err(|e| e.to_string())
+}
+
+/// Ticket 09's create-new path, GitLab half -- mirrors
+/// `create_github_repository` exactly, using GitLab's REST API v4 instead.
+#[tauri::command]
+fn create_gitlab_repository(name: String, private: bool, access_token: String) -> Result<gitlab_oauth::RepoInfo, String> {
+    let endpoints = gitlab_oauth::GitLabEndpoints::production();
+    gitlab_oauth::create_repository(&endpoints, &access_token, &name, private).map_err(|e| e.to_string())
+}
+
+/// Ticket 09's pick-existing path, GitLab half -- mirrors
+/// `list_github_repositories` exactly, listing only projects the signed-in
+/// user is a member of.
+#[tauri::command]
+fn list_gitlab_repositories(access_token: String) -> Result<Vec<gitlab_oauth::RepoInfo>, String> {
+    let endpoints = gitlab_oauth::GitLabEndpoints::production();
+    gitlab_oauth::list_repositories(&endpoints, &access_token).map_err(|e| e.to_string())
+}
+
 /// Provider hosts recognized as `Provider::GitHub`/`Provider::GitLab`;
 /// anything else is `Provider::Other(host)` -- ticket 04's generic
 /// access-token path covers exactly that "anything else" tier (Bitbucket,
@@ -1809,9 +1851,13 @@ pub fn run() {
             poll_github_device_flow,
             check_github_installation,
             connect_github_oauth,
+            create_github_repository,
+            list_github_repositories,
             start_gitlab_device_flow,
             poll_gitlab_device_flow,
             connect_gitlab_oauth,
+            create_gitlab_repository,
+            list_gitlab_repositories,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

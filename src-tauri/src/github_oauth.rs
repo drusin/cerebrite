@@ -430,6 +430,122 @@ pub enum InstallationStatus {
     NotInstalled { install_url: String },
 }
 
+/// One repository as surfaced to the guided connect wizard (ticket 09): just
+/// enough to render a pickable list entry (name + private/public indicator)
+/// and to hand `clone_url` straight to the existing OAuth-token connect path
+/// (`connect_github_oauth`) after a create-new or pick-existing selection --
+/// no separate "clone URL" concept, since ticket 09 is connect-only (ticket
+/// 10 is clone).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoInfo {
+    pub name: String,
+    pub full_name: String,
+    pub private: bool,
+    pub clone_url: String,
+    pub html_url: String,
+}
+
+/// Ticket 09's create-new path: `POST {api_base_url}/user/repos` with `name`
+/// and `private` -- private is the caller's responsibility to default to
+/// `true` (the wizard never defaults to public). Mirrors
+/// `check_installation`'s status-code mapping style: 401/403 is a rejected
+/// token, anything else unexpected (422 for a name that's already taken,
+/// most commonly) is surfaced with GitHub's own error body so the wizard can
+/// show it verbatim rather than a generic failure.
+pub fn create_repository(
+    endpoints: &GitHubEndpoints,
+    access_token: &str,
+    name: &str,
+    private: bool,
+) -> Result<RepoInfo, DeviceFlowError> {
+    let url = format!("{}/user/repos", endpoints.api_base_url);
+    let body = serde_json::json!({ "name": name, "private": private });
+    let (status, body) = post_bearer_json(&url, access_token, &body)?;
+    match status {
+        200 | 201 => {
+            let raw: RawRepoResponse =
+                serde_json::from_str(&body).map_err(|e| DeviceFlowError::UnexpectedResponse(e.to_string()))?;
+            raw.try_into()
+        }
+        401 | 403 => Err(DeviceFlowError::Rejected(format!(
+            "GitHub rejected the repository creation request with status {status}"
+        ))),
+        other => Err(DeviceFlowError::UnexpectedResponse(format!(
+            "unexpected status {other} creating a repository: {body}"
+        ))),
+    }
+}
+
+/// Ticket 09's pick-existing path: `GET {api_base_url}/user/repos`, sorted by
+/// most-recently-updated, first 100 results -- paginating further is
+/// explicitly optional per the ticket, and a first reasonable page is enough
+/// for a picker list.
+pub fn list_repositories(endpoints: &GitHubEndpoints, access_token: &str) -> Result<Vec<RepoInfo>, DeviceFlowError> {
+    let url = format!("{}/user/repos?per_page=100&sort=updated", endpoints.api_base_url);
+    let (status, body) = get_bearer(&url, access_token)?;
+    match status {
+        200 => {
+            let raw: Vec<RawRepoResponse> =
+                serde_json::from_str(&body).map_err(|e| DeviceFlowError::UnexpectedResponse(e.to_string()))?;
+            raw.into_iter().map(TryInto::try_into).collect()
+        }
+        401 | 403 => Err(DeviceFlowError::Rejected(format!(
+            "GitHub rejected the repository list request with status {status}"
+        ))),
+        other => Err(DeviceFlowError::UnexpectedResponse(format!(
+            "unexpected status {other} listing repositories: {body}"
+        ))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRepoResponse {
+    name: Option<String>,
+    full_name: Option<String>,
+    private: Option<bool>,
+    clone_url: Option<String>,
+    html_url: Option<String>,
+}
+
+impl TryFrom<RawRepoResponse> for RepoInfo {
+    type Error = DeviceFlowError;
+
+    fn try_from(raw: RawRepoResponse) -> Result<Self, Self::Error> {
+        let (Some(name), Some(full_name), Some(private), Some(clone_url), Some(html_url)) =
+            (raw.name, raw.full_name, raw.private, raw.clone_url, raw.html_url)
+        else {
+            return Err(DeviceFlowError::UnexpectedResponse(
+                "repository response missing required fields".to_string(),
+            ));
+        };
+        Ok(RepoInfo {
+            name,
+            full_name,
+            private,
+            clone_url,
+            html_url,
+        })
+    }
+}
+
+/// A blocking `POST` with a JSON body and a `Bearer` token, returning
+/// (status, body) -- the create-repository counterpart to `get_bearer`.
+fn post_bearer_json(url: &str, token: &str, json_body: &serde_json::Value) -> Result<(u16, String), DeviceFlowError> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "cerebrite")
+        .json(json_body)
+        .send()
+        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response.text().map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    Ok((status, body))
+}
+
 // -- internal: raw response shapes and shared HTTP plumbing --
 
 #[derive(Debug, Deserialize)]
@@ -880,6 +996,62 @@ mod tests {
     fn check_installation_surfaces_a_rejected_token() {
         let port = mock_server::spawn(vec![(401, r#"{"message":"Bad credentials"}"#.to_string())]);
         let result = check_installation(&endpoints_for(port), "bad-token", "dawid", "notes");
+        assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
+    }
+
+    // -- create_repository / list_repositories (ticket 09) --
+
+    #[test]
+    fn create_repository_parses_a_successful_response() {
+        let port = mock_server::spawn(vec![(
+            201,
+            r#"{"name":"notes","full_name":"dawid/notes","private":true,"clone_url":"https://github.com/dawid/notes.git","html_url":"https://github.com/dawid/notes"}"#.to_string(),
+        )]);
+        let repo = create_repository(&endpoints_for(port), "gho_abc", "notes", true).unwrap();
+        assert_eq!(repo.name, "notes");
+        assert_eq!(repo.full_name, "dawid/notes");
+        assert!(repo.private);
+        assert_eq!(repo.clone_url, "https://github.com/dawid/notes.git");
+    }
+
+    #[test]
+    fn create_repository_surfaces_a_name_already_taken_rejection() {
+        // GitHub answers a name collision with 422, not 401/403 -- this must
+        // surface as an error the wizard can show, not a parse panic.
+        let port = mock_server::spawn(vec![(
+            422,
+            r#"{"message":"Repository creation failed.","errors":[{"message":"name already exists on this account"}]}"#
+                .to_string(),
+        )]);
+        let result = create_repository(&endpoints_for(port), "gho_abc", "notes", true);
+        assert!(matches!(result, Err(DeviceFlowError::UnexpectedResponse(_))));
+    }
+
+    #[test]
+    fn create_repository_surfaces_a_rejected_token() {
+        let port = mock_server::spawn(vec![(401, r#"{"message":"Bad credentials"}"#.to_string())]);
+        let result = create_repository(&endpoints_for(port), "bad-token", "notes", true);
+        assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
+    }
+
+    #[test]
+    fn list_repositories_parses_a_successful_response() {
+        let port = mock_server::spawn(vec![(
+            200,
+            r#"[{"name":"notes","full_name":"dawid/notes","private":true,"clone_url":"https://github.com/dawid/notes.git","html_url":"https://github.com/dawid/notes"},
+                {"name":"public-thing","full_name":"dawid/public-thing","private":false,"clone_url":"https://github.com/dawid/public-thing.git","html_url":"https://github.com/dawid/public-thing"}]"#.to_string(),
+        )]);
+        let repos = list_repositories(&endpoints_for(port), "gho_abc").unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].name, "notes");
+        assert!(repos[0].private);
+        assert!(!repos[1].private);
+    }
+
+    #[test]
+    fn list_repositories_surfaces_a_rejected_token() {
+        let port = mock_server::spawn(vec![(401, r#"{"message":"Bad credentials"}"#.to_string())]);
+        let result = list_repositories(&endpoints_for(port), "bad-token");
         assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
     }
 }

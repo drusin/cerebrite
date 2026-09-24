@@ -187,6 +187,21 @@
             </form>
           </div>
 
+          <!-- Ticket 09: guided connect wizard entry point -- a compact
+               modal (opened on top of this one, not full-screen: that's
+               clone's treatment, ticket 10) that walks branching/pick vs.
+               create/credential-kind/"Commit as" steps end to end, reusing
+               the raw forms' backend commands under the hood. The raw forms
+               below (tickets 04/06/07) stay in place as a fallback/escape
+               hatch and for anyone who prefers the direct path. -->
+          <div class="settings-section">
+            <h3>Connect a repository</h3>
+            <p class="settings-wizard-intro">
+              Guided setup: sign in, pick or create a repository, and confirm how commits are attributed.
+            </p>
+            <button id="connect-wizard-open-button" type="button">Connect…</button>
+          </div>
+
           <!-- Ticket 04: minimal/raw connect form -- the generic access-token
                path for any HTTPS git host that isn't GitHub/GitLab sign-in.
                No wizard polish (provider detection, OAuth, SSH) -- that's
@@ -282,6 +297,26 @@
               </p>
             </div>
             <p id="settings-gitlab-status" class="settings-connect-status" hidden></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Ticket 09: the guided connect wizard's compact modal, layered
+           above the Settings modal. `#connect-wizard-body` is rebuilt
+           per-step by main.ts (connect-wizard.ts's pure reducer drives
+           *which* step; main.ts owns rendering it and the actual `invoke`
+           calls) -- closed by Escape or clicking outside the card, same as
+           every other modal here. -->
+      <div id="connect-wizard-overlay" class="settings-modal-overlay" hidden>
+        <div id="connect-wizard" class="settings-modal connect-wizard" role="dialog" aria-modal="true" aria-label="Connect a repository">
+          <div class="settings-modal-header">
+            <h2>Connect a repository</h2>
+            <button id="connect-wizard-close-button" type="button" aria-label="Close">✕</button>
+          </div>
+          <div id="connect-wizard-body" class="connect-wizard-body"></div>
+          <div class="connect-wizard-footer">
+            <button id="connect-wizard-back-button" type="button">Back</button>
+            <button id="connect-wizard-manual-button" type="button">Switch to manual setup</button>
           </div>
         </div>
       </div>
