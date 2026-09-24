@@ -544,7 +544,10 @@ export type SyncFailureCause =
   | { cause: "other"; detail: string }
   | { cause: "hostKeyUnconfirmed"; host: string; fingerprint: string }
   | { cause: "hostKeyMismatch"; host: string; fingerprint: string }
-  | { cause: "oauthReconnectRequired"; detail: string; credentialKind: CredentialKind };
+  | { cause: "oauthReconnectRequired"; detail: string; credentialKind: CredentialKind }
+  | { cause: "keychainLocked"; detail: string }
+  | { cause: "keychainUnavailable"; detail: string }
+  | { cause: "refreshedSignInNotSaved"; detail: string; credentialKind: CredentialKind };
 
 /// Mirrors `sync::SyncStatus`'s `#[serde(tag = "state", rename_all = "camelCase")]` shape exactly.
 export type SyncStatus =
@@ -574,15 +577,39 @@ export function onSyncStatusChanged(callback: (status: SyncStatus) => void): Pro
  * which provider `origin` points at, and when the last successful sync
  * completed. `provider`/`lastSyncedAt` are `null` when there's nothing to
  * report yet (no remote configured, or no sync has completed since the app
- * started). */
+ * started).
+ *
+ * Ticket 13 added `remoteUrl`/`credentialKind`: what the "Reconnect" CTA
+ * needs to jump straight into the matching credential-kind sub-form,
+ * pre-filled with the already-known repository URL, instead of restarting
+ * the guided connect wizard from scratch. `null` under the same conditions
+ * as `provider` (no connection configured for this vault). */
 export interface SyncDetails {
   status: SyncStatus;
   provider: string | null;
   lastSyncedAt: number | null;
+  remoteUrl: string | null;
+  credentialKind: CredentialKind | null;
 }
 
 export function getSyncDetails(): Promise<SyncDetails> {
   return invoke("get_sync_details");
+}
+
+/** Ticket 13 checklist item 2: the needs-attention popup's "Unlock and
+ * retry" CTA for a `keychainLocked` cause -- retries the keychain call with
+ * the interactive (prompt-raising) path rather than the background
+ * fail-fast one, then triggers an ordinary sync attempt. Rejects if no
+ * vault is open, or the interactive unlock itself fails/is cancelled. */
+export function unlockKeychainAndRetrySync(): Promise<void> {
+  return invoke("unlock_keychain_and_retry_sync");
+}
+
+/** Ticket 13 checklist item 5: the merge-conflict needs-attention CTA --
+ * reveals `.cerebrite/conflict-backups/` in the system file manager.
+ * Rejects if no vault is open. */
+export function revealConflictBackups(): Promise<void> {
+  return invoke("reveal_conflict_backups");
 }
 
 /** "Sync now": an immediate sync attempt independent of the background

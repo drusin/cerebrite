@@ -1055,6 +1055,13 @@ body {
   opacity: 1;
 }
 
+/* Ticket 13: `refreshedSignInNotSaved` is a lower-key heads-up (sync is
+   still working right now), not a hard failure -- same needsAttention icon
+   state, distinguished only by color via the popup's `data-severity`. */
+.sync-popup[data-severity="warning"] .sync-status-icon[data-state="needsAttention"] {
+  color: #b8860b;
+}
+
 @keyframes sync-status-spin {
   from {
     transform: rotate(0deg);
@@ -1098,6 +1105,17 @@ body {
   margin: 0 0 0.5em;
   font-size: 0.85em;
   opacity: 0.75;
+}
+
+.sync-popup-cause-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4em;
+  margin: 0 0 0.5em;
+}
+
+.sync-popup-cause-actions[hidden] {
+  display: none;
 }
 
 .sync-popup-actions {

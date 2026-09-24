@@ -38,6 +38,8 @@ import {
   getSyncStatus,
   getSyncDetails,
   triggerSyncNow,
+  unlockKeychainAndRetrySync,
+  revealConflictBackups,
   onSyncStatusChanged,
   type CommitAuthor,
   type PageSummary,
@@ -50,8 +52,9 @@ import {
   type CloneCredential,
   type CommitAuthorPrefillResult,
   type SyncStatus,
+  type CredentialKind,
 } from "./vault-api";
-import { syncIndicatorFor } from "./sync-status";
+import { syncIndicatorFor, type SyncCtaId } from "./sync-status";
 import {
   reduceWizard,
   initialWizardState,
@@ -165,6 +168,7 @@ const syncPopupIconEl = document.querySelector<HTMLElement>("#sync-popup-icon");
 const syncPopupStatusTextEl = document.querySelector<HTMLElement>("#sync-popup-status-text");
 const syncPopupProviderEl = document.querySelector<HTMLElement>("#sync-popup-provider");
 const syncPopupLastSyncedEl = document.querySelector<HTMLElement>("#sync-popup-last-synced");
+const syncPopupCauseActionsEl = document.querySelector<HTMLElement>("#sync-popup-cause-actions");
 const syncPopupSyncNowButtonEl = document.querySelector<HTMLButtonElement>("#sync-popup-sync-now-button");
 const syncPopupSettingsLinkEl = document.querySelector<HTMLButtonElement>("#sync-popup-settings-link");
 const syncSectionNotConnectedEl = document.querySelector<HTMLElement>("#sync-section-not-connected");
@@ -1467,6 +1471,16 @@ function applySyncIndicator(status: SyncStatus) {
   sidebarRailSyncStatusButtonEl?.setAttribute("aria-label", ariaLabel);
   sidebarRailSyncStatusButtonEl?.setAttribute("title", ariaLabel);
   if (syncPopupStatusTextEl) syncPopupStatusTextEl.textContent = indicator.statusText;
+  // Ticket 13: `refreshedSignInNotSaved`'s lower-key warning reads
+  // distinctly from a hard failure via this attribute alone -- it's still
+  // the same `needsAttention` icon state, not a separate one (per the
+  // ticket's "not a separate top-level state" requirement).
+  if (indicator.severity === "warning") {
+    syncPopupEl?.setAttribute("data-severity", "warning");
+  } else {
+    syncPopupEl?.removeAttribute("data-severity");
+  }
+  renderSyncPopupCtas(indicator.ctas);
 
   updateSyncSectionNotConnectedBanner();
 }
@@ -1566,6 +1580,154 @@ async function handleSyncNowClick() {
     // No vault open -- nothing to sync; the button simply has no effect.
   } finally {
     syncPopupSyncNowButtonEl.removeAttribute("disabled");
+  }
+}
+
+// --- Ticket 13: per-cause needs-attention CTAs -----------------------------
+//
+// `sync-status.ts`'s `ctasFor` maps a `SyncFailureCause` to zero or more
+// `{ id, label }` buttons; this section renders them into
+// `#sync-popup-cause-actions` and wires each `id` to its actual handler.
+
+/** Clears and re-renders the popup's cause-specific CTA buttons -- called
+ * from `applySyncIndicator` on every status change, same as the rest of the
+ * popup's content, so it never goes stale while the popup happens to be
+ * open. */
+function renderSyncPopupCtas(ctas: { id: SyncCtaId; label: string }[]) {
+  if (!syncPopupCauseActionsEl) return;
+  syncPopupCauseActionsEl.replaceChildren();
+  if (ctas.length === 0) {
+    syncPopupCauseActionsEl.setAttribute("hidden", "");
+    return;
+  }
+  syncPopupCauseActionsEl.removeAttribute("hidden");
+  for (const cta of ctas) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = cta.label;
+    button.addEventListener("click", () => void handleSyncCtaClick(cta.id));
+    syncPopupCauseActionsEl.appendChild(button);
+  }
+}
+
+function handleSyncCtaClick(id: SyncCtaId): Promise<void> {
+  switch (id) {
+    case "reconnect":
+      return openQuickReconnect();
+    case "unlockAndRetry":
+      return handleUnlockAndRetryClick();
+    case "setUpKeychain":
+      return handleSetUpKeychainClick();
+    case "storeAsPlaintext":
+      return handleStoreAsPlaintextClick();
+    case "retrySync":
+      return handleSyncNowClick();
+    case "openConflictBackups":
+      return handleOpenConflictBackupsClick();
+  }
+}
+
+/** Ticket 13 checklist item 1: "Reconnect" for a rejected/expired/revoked
+ * credential (any kind, including a mismatched/unconfirmed SSH host key --
+ * re-establishing the connection is the fix either way). Jumps straight
+ * into the matching credential-kind sub-form of the always-visible "Sync"
+ * section (ticket 11), pre-filled with the already-known repository URL,
+ * rather than restarting the guided connect wizard from the top. The
+ * credential itself still has to be re-entered/re-authorized -- there is no
+ * way to recover a rejected token/key without the user's involvement -- but
+ * the provider and repository are carried over so they don't have to be. */
+async function openQuickReconnect(): Promise<void> {
+  closeSyncPopup();
+  let remoteUrl = "";
+  let subformKind = "accessToken";
+  try {
+    const details = await getSyncDetails();
+    remoteUrl = details.remoteUrl ?? "";
+    subformKind = syncSubformKindFor(details.credentialKind, details.provider);
+  } catch {
+    // No vault open, or the command otherwise unavailable -- still open the
+    // manual Sync section (unprefilled) rather than doing nothing.
+  }
+  openSyncManualForm(remoteUrl);
+  if (syncCredentialKindEl) {
+    syncCredentialKindEl.value = subformKind;
+    updateSyncSubformVisibility();
+  }
+}
+
+/** Maps a connection's stored `credentialKind` (+ `provider`, for
+ * `oauth_sign_in`, which doesn't say by itself whether it's GitHub's or
+ * GitLab's device flow) to the always-visible "Sync" section's
+ * `data-sync-kind` sub-form values (`index.html`'s `#sync-credential-kind`
+ * options). Defaults to `"accessToken"` when nothing is known yet (no
+ * connection configured) -- the same default `updateSyncSubformVisibility`
+ * already falls back to. */
+function syncSubformKindFor(credentialKind: CredentialKind | null, provider: string | null): string {
+  switch (credentialKind) {
+    case "ssh_key":
+      return "sshKey";
+    case "oauth_sign_in":
+      return provider === "GitLab" ? "gitlabOauth" : "githubOauth";
+    case "access_token":
+    case null:
+      return "accessToken";
+  }
+}
+
+/** Ticket 13 checklist item 2: "Unlock and retry" for `keychainLocked`. */
+async function handleUnlockAndRetryClick(): Promise<void> {
+  try {
+    await unlockKeychainAndRetrySync();
+  } catch (e) {
+    window.alert(`Couldn't unlock the keychain: ${e}`);
+  }
+}
+
+/** Ticket 13 checklist item 3: "Set up a keychain" for `keychainUnavailable`.
+ * There's no in-app way to install/start an OS keychain daemon -- this is
+ * guidance plus a nudge toward "Retry sync" (always available in the popup)
+ * once the user has done that outside the app. */
+function handleSetUpKeychainClick(): Promise<void> {
+  window.alert(
+    "No keychain could be reached. Set up or unlock your system's credential " +
+      "store (e.g. start your desktop's Secret Service/keychain daemon), then " +
+      'use "Sync now" below to retry.',
+  );
+  return Promise.resolve();
+}
+
+/** Ticket 13 checklist item 3: "Store as plaintext instead" for
+ * `keychainUnavailable` -- reusing ticket 02's plaintext-fallback mechanism
+ * (`credential::PlaintextStore`) and its consent requirement (ADR-0013),
+ * which had no frontend consent dialog to reuse yet, so this is that
+ * dialog's first, minimal (`window.confirm`-based) implementation. If the
+ * secret this connection needs was only ever in the now-unreachable
+ * keychain, there's no way to recover it without the user re-entering it --
+ * confirming here jumps into the same quick-reconnect sub-form "Reconnect"
+ * uses; every connect_* command already falls back to plaintext storage
+ * automatically whenever a keychain probe fails (see `lib.rs`'s
+ * `connect_access_token`/`connect_ssh_key`/etc.), so re-entering the
+ * credential here naturally lands in plaintext storage without a separate
+ * "force plaintext" flag. */
+async function handleStoreAsPlaintextClick(): Promise<void> {
+  const confirmed = window.confirm(
+    "Store this connection's credential as a plaintext file instead of the " +
+      "system keychain? This is less secure than the keychain, and should " +
+      "only be used when no keychain is available. You'll need to re-enter " +
+      "the credential.",
+  );
+  if (!confirmed) return;
+  await openQuickReconnect();
+}
+
+/** Ticket 13 checklist item 5: "Open backup folder" for `conflict` --
+ * reveals `.cerebrite/conflict-backups/` in the system file manager; no
+ * in-app conflict-resolution UI, per the ticket. */
+async function handleOpenConflictBackupsClick(): Promise<void> {
+  try {
+    await revealConflictBackups();
+  } catch (e) {
+    window.alert(`Couldn't open the conflict-backups folder: ${e}`);
   }
 }
 

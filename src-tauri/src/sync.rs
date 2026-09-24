@@ -96,6 +96,41 @@ pub enum SyncFailureCause {
         detail: String,
         credential_kind: CredentialKind,
     },
+    /// This vault's connection secret lives in the OS keychain, but the
+    /// keychain was reached and found *locked* (a Secret Service collection
+    /// needing an interactive unlock prompt) -- ticket 02/13 /
+    /// `credential::CredentialError::Locked`. A background sync call never
+    /// raises that prompt itself (ADR-0013), so this surfaces distinctly
+    /// from `KeychainUnavailable`: the secret is right there, it just needs
+    /// the user to unlock the store, via the interactive path
+    /// (`credential::CallUrgency::Interactive`) rather than reconnecting.
+    /// `credential::run_with_timeout`'s doc comment notes that a locked
+    /// store's background call usually actually surfaces as
+    /// `CredentialError::TimedOut` (no timeout of its own on the unlock
+    /// wait) rather than `Locked` outright -- `classify_credential_error`
+    /// below treats both the same way.
+    KeychainLocked { detail: String },
+    /// This vault's connection secret lives in the OS keychain, but no
+    /// keychain could be reached at all right now (no Secret
+    /// Service/Credential Manager daemon on the bus) --
+    /// `credential::CredentialError::Unavailable`. Distinct from
+    /// `KeychainLocked`: there is no prompt to answer, the store itself
+    /// isn't there to ask.
+    KeychainUnavailable { detail: String },
+    /// Ticket 06/07's unattended background OAuth refresh (`refresh_if_needed`
+    /// in `github_oauth.rs`/`gitlab_oauth.rs`) obtained a fresh token pair
+    /// and used it for *this* sync attempt, but could not persist it to
+    /// whichever store the connection record names (a locked/unreachable
+    /// keychain, or a plaintext-file write failure) -- the fresh pair only
+    /// lives in memory and is lost the next time the app quits. Sync is
+    /// working right now, so this is a lower-key warning rather than a hard
+    /// failure (see `into_status`: it still lands in `NeedsAttention`, just
+    /// with less alarming framing upstream in the UI), not a reason to stop
+    /// trusting the credential.
+    RefreshedSignInNotSaved {
+        detail: String,
+        credential_kind: CredentialKind,
+    },
 }
 
 impl std::fmt::Display for SyncFailureCause {
@@ -120,6 +155,19 @@ impl std::fmt::Display for SyncFailureCause {
             SyncFailureCause::OauthReconnectRequired { detail, credential_kind } => write!(
                 f,
                 "{} expired and can't be refreshed automatically -- reconnect required: {detail}",
+                credential_kind_label(*credential_kind)
+            ),
+            SyncFailureCause::KeychainLocked { detail } => write!(
+                f,
+                "keychain locked: {detail} -- unlock it and retry"
+            ),
+            SyncFailureCause::KeychainUnavailable { detail } => write!(
+                f,
+                "keychain unreachable: {detail} -- set up a keychain, or store this credential as plaintext instead"
+            ),
+            SyncFailureCause::RefreshedSignInNotSaved { detail, credential_kind } => write!(
+                f,
+                "your renewed {} couldn't be saved and will be lost when the app quits: {detail} -- reconnect to fix",
                 credential_kind_label(*credential_kind)
             ),
         }
@@ -233,6 +281,32 @@ pub fn classify_git_error_for(err: &git2::Error, connection: Option<&Connection>
             }
         }
         (cause, _) => cause,
+    }
+}
+
+/// Classifies a `credential::CredentialError` hit while resolving this
+/// vault's stored connection secret (`connection::Connection::load`, called
+/// once per sync attempt from `lib.rs`'s `perform_sync` *before* any
+/// fetch/push is even attempted) into a `SyncFailureCause` -- ticket 13
+/// checklist items 2/3: "keychain locked"/"keychain unreachable" need to be
+/// distinguishable in the needs-attention popup, not collapsed into a
+/// generic `Other` the way every other non-git failure already was.
+///
+/// `CredentialError::TimedOut` is treated the same as `Locked`: per
+/// `credential::run_with_timeout`'s own doc comment, that's what actually
+/// fires for a background call against a locked collection in practice (the
+/// underlying unlock wait has no timeout of its own, so `run_with_timeout`
+/// is what turns the hang into this fail-fast error) -- from the user's
+/// side both are "the keychain needs to be unlocked."
+pub fn classify_credential_error(err: &crate::credential::CredentialError) -> SyncFailureCause {
+    use crate::credential::CredentialError;
+    match err {
+        CredentialError::Locked(detail) => SyncFailureCause::KeychainLocked { detail: detail.clone() },
+        CredentialError::TimedOut => SyncFailureCause::KeychainLocked {
+            detail: "the keychain call timed out waiting for a response".to_string(),
+        },
+        CredentialError::Unavailable(detail) => SyncFailureCause::KeychainUnavailable { detail: detail.clone() },
+        other => SyncFailureCause::Other { detail: other.to_string() },
     }
 }
 
@@ -670,6 +744,61 @@ mod tests {
         let err = git2::Error::new(git2::ErrorCode::Timeout, git2::ErrorClass::Net, "timed out");
 
         assert!(matches!(classify_git_error(&err), SyncFailureCause::NetworkUnreachable { .. }));
+    }
+
+    // -- ticket 13: classify_credential_error --
+
+    #[test]
+    fn locked_credential_error_classifies_as_keychain_locked_needs_attention() {
+        let err = crate::credential::CredentialError::Locked("collection is locked".to_string());
+
+        let cause = classify_credential_error(&err);
+
+        assert!(matches!(cause, SyncFailureCause::KeychainLocked { .. }));
+        assert!(matches!(cause.clone().into_status(), SyncStatus::NeedsAttention { .. }));
+        assert!(cause.to_string().contains("unlock"));
+    }
+
+    #[test]
+    fn timed_out_credential_error_classifies_as_keychain_locked_too() {
+        // Per `credential::run_with_timeout`'s doc comment, a locked store's
+        // background call actually surfaces as `TimedOut`, not `Locked`,
+        // since the underlying unlock wait has no timeout of its own.
+        let err = crate::credential::CredentialError::TimedOut;
+
+        assert!(matches!(classify_credential_error(&err), SyncFailureCause::KeychainLocked { .. }));
+    }
+
+    #[test]
+    fn unavailable_credential_error_classifies_as_keychain_unavailable_needs_attention() {
+        let err = crate::credential::CredentialError::Unavailable("no Secret Service on the bus".to_string());
+
+        let cause = classify_credential_error(&err);
+
+        assert!(matches!(cause, SyncFailureCause::KeychainUnavailable { .. }));
+        assert!(matches!(cause.clone().into_status(), SyncStatus::NeedsAttention { .. }));
+        assert!(cause.to_string().contains("plaintext"));
+    }
+
+    #[test]
+    fn other_credential_errors_fall_back_to_other() {
+        let err = crate::credential::CredentialError::NotFound;
+
+        assert!(matches!(classify_credential_error(&err), SyncFailureCause::Other { .. }));
+    }
+
+    // -- ticket 13: RefreshedSignInNotSaved stays in the needs-attention
+    // bucket (a lower-key warning is a UI-layer distinction, not a
+    // different top-level SyncStatus) --
+
+    #[test]
+    fn refreshed_sign_in_not_saved_is_needs_attention_not_transient() {
+        let cause = SyncFailureCause::RefreshedSignInNotSaved {
+            detail: "keychain locked".to_string(),
+            credential_kind: CredentialKind::OauthSignIn,
+        };
+
+        assert!(matches!(cause.into_status(), SyncStatus::NeedsAttention { .. }));
     }
 
     #[test]

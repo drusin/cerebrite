@@ -365,31 +365,38 @@ pub fn check_installation(
 /// `SyncFailureCause::CredentialRejected` naming this connection's kind
 /// ("sign-in rejected: ...", per `sync::credential_kind_label`) -- no
 /// separate cause variant is needed for this case.
+///
+/// Returns `(connection, save_failed)` -- ticket 13 checklist item 4:
+/// `save_failed` is `true` only on the "refreshed but couldn't persist it"
+/// path described above, so `lib.rs`'s `perform_sync` can surface
+/// `SyncFailureCause::RefreshedSignInNotSaved` as a lower-key warning once
+/// the sync attempt that follows actually succeeds with the fresh in-memory
+/// pair -- previously this fact was silently dropped on the floor.
 pub fn refresh_if_needed(
     repo_root: &std::path::Path,
     keychain: Option<&crate::credential::KeychainBackend>,
     plaintext: &crate::credential::PlaintextStore,
     connection: crate::connection::Connection,
-) -> crate::connection::Connection {
+) -> (crate::connection::Connection, bool) {
     use crate::connection_record::{self, CredentialKind, StoreKind};
 
     if connection.credential_kind() != CredentialKind::OauthSignIn {
-        return connection;
+        return (connection, false);
     }
     if !needs_refresh(connection.record().token_expiry.as_deref()) {
-        return connection;
+        return (connection, false);
     }
     let Ok(secret) = OauthSecret::from_bytes(connection.secret_bytes()) else {
         // Corrupt stored secret -- not this function's problem to fix; the
         // ordinary auth path will fail cleanly on it (see
         // `connection::credential_for_kind`'s `OauthSignIn` arm).
-        return connection;
+        return (connection, false);
     };
 
     let endpoints = GitHubEndpoints::production();
     let pair = match refresh_token_pair(&endpoints, GITHUB_CLIENT_ID, &secret.refresh_token) {
         Ok(pair) => pair,
-        Err(_) => return connection,
+        Err(_) => return (connection, false),
     };
 
     let new_secret = OauthSecret {
@@ -409,11 +416,12 @@ pub fn refresh_if_needed(
             .set_secret(&record.connection_id, &new_secret.to_bytes())
             .map_err(|e| crate::credential::CredentialError::Other(e.to_string())),
     };
+    let save_failed = stored.is_err();
     if stored.is_ok() {
         let _ = connection_record::write(repo_root, &record);
     }
 
-    crate::connection::Connection::from_parts(record, new_secret.to_bytes())
+    (crate::connection::Connection::from_parts(record, new_secret.to_bytes()), save_failed)
 }
 
 /// The URL to send the user to in order to install the GitHub App on a

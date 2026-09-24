@@ -398,38 +398,42 @@ pub fn needs_refresh(token_expiry: Option<&str>) -> bool {
 /// in-memory-only fallback on a store-write failure ticket 06 established:
 /// a locked keychain or disk error doesn't discard a refresh that actually
 /// succeeded, it just means the next sync attempt refreshes again.
+///
+/// Returns `(connection, save_failed)` -- see `github_oauth::refresh_if_needed`'s
+/// doc comment for what `save_failed` means and how `lib.rs`'s
+/// `perform_sync` uses it (ticket 13 checklist item 4).
 pub fn refresh_if_needed(
     repo_root: &std::path::Path,
     keychain: Option<&crate::credential::KeychainBackend>,
     plaintext: &crate::credential::PlaintextStore,
     connection: crate::connection::Connection,
-) -> crate::connection::Connection {
+) -> (crate::connection::Connection, bool) {
     use crate::connection_record::{self, CredentialKind, Provider, StoreKind};
 
     if connection.credential_kind() != CredentialKind::OauthSignIn {
-        return connection;
+        return (connection, false);
     }
     if connection.record().provider != Provider::GitLab {
-        return connection;
+        return (connection, false);
     }
     if !needs_refresh(connection.record().token_expiry.as_deref()) {
-        return connection;
+        return (connection, false);
     }
     let Ok(secret) = OauthSecret::from_bytes(connection.secret_bytes()) else {
         // Corrupt stored secret -- not this function's problem to fix; the
         // ordinary auth path will fail cleanly on it (see
         // `connection::credential_for_kind`'s `OauthSignIn`/`GitLab` arm).
-        return connection;
+        return (connection, false);
     };
     let Some(refresh_token) = secret.refresh_token.clone() else {
         // No refresh token to exchange -- see this function's doc comment.
-        return connection;
+        return (connection, false);
     };
 
     let endpoints = GitLabEndpoints::production();
     let pair = match refresh_token_pair(&endpoints, GITLAB_CLIENT_ID, &refresh_token) {
         Ok(pair) => pair,
-        Err(_) => return connection,
+        Err(_) => return (connection, false),
     };
 
     let new_secret = OauthSecret {
@@ -449,11 +453,12 @@ pub fn refresh_if_needed(
             .set_secret(&record.connection_id, &new_secret.to_bytes())
             .map_err(|e| crate::credential::CredentialError::Other(e.to_string())),
     };
+    let save_failed = stored.is_err();
     if stored.is_ok() {
         let _ = connection_record::write(repo_root, &record);
     }
 
-    crate::connection::Connection::from_parts(record, new_secret.to_bytes())
+    (crate::connection::Connection::from_parts(record, new_secret.to_bytes()), save_failed)
 }
 
 /// One repository as surfaced to the guided connect wizard (ticket 09) --
@@ -1151,10 +1156,11 @@ mod tests {
             };
             let connection = Connection::from_parts(record.clone(), github_secret.to_bytes());
 
-            let result = refresh_if_needed(repo_dir.path(), Some(&keychain), &plaintext, connection);
+            let (result, save_failed) = refresh_if_needed(repo_dir.path(), Some(&keychain), &plaintext, connection);
 
             assert_eq!(result.secret_bytes(), github_secret.to_bytes());
             assert_eq!(result.record(), &record);
+            assert!(!save_failed);
         }
 
         #[test]
@@ -1176,10 +1182,11 @@ mod tests {
             };
             let connection = Connection::from_parts(record.clone(), secret.to_bytes());
 
-            let result = refresh_if_needed(repo_dir.path(), Some(&keychain), &plaintext, connection);
+            let (result, save_failed) = refresh_if_needed(repo_dir.path(), Some(&keychain), &plaintext, connection);
 
             assert_eq!(result.secret_bytes(), secret.to_bytes());
             assert_eq!(result.record(), &record);
+            assert!(!save_failed);
         }
 
         #[test]
@@ -1198,9 +1205,10 @@ mod tests {
             };
             let connection = Connection::from_parts(record.clone(), secret.to_bytes());
 
-            let result = refresh_if_needed(repo_dir.path(), Some(&keychain), &plaintext, connection);
+            let (result, save_failed) = refresh_if_needed(repo_dir.path(), Some(&keychain), &plaintext, connection);
 
             assert_eq!(result.secret_bytes(), secret.to_bytes());
+            assert!(!save_failed);
         }
     }
 }

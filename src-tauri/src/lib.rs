@@ -29,6 +29,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
 /// Shared app state: the currently open vault path and its derived-index
 /// connection. `None` until a vault has been opened.
@@ -424,18 +425,48 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
         .as_ref()
         .and_then(|dir| credential::known_hosts_path(dir).ok());
     let plaintext = config_dir.as_ref().map(|dir| credential::PlaintextStore::new(dir));
-    let connection_load = keychain.as_ref().ok().and_then(|keychain| {
-        plaintext
-            .as_ref()
-            .and_then(|plaintext| {
-                connection::Connection::load(repo_root, keychain, plaintext, credential::CallUrgency::Background)
-                    .transpose()
-            })
-    });
+
+    // Ticket 13: whether *some* connection is configured for this vault at
+    // all, checked independently of whether the keychain could even be
+    // reached. Before this ticket, a `KeychainBackend::platform()` failure
+    // (no Secret Service/Credential Manager daemon on the bus) made
+    // `connection_load` below unconditionally `None`, so a vault whose
+    // connection secret genuinely lives in that now-unreachable keychain
+    // silently behaved exactly like "no remote configured" instead of
+    // surfacing `KeychainUnavailable` -- reading the record first fixes
+    // that.
+    let has_connection_record = connection_record::read(repo_root).ok().flatten().is_some();
+
+    let connection_load: Option<Result<connection::Connection, sync::SyncFailureCause>> = if !has_connection_record {
+        None
+    } else {
+        match (&keychain, plaintext.as_ref()) {
+            (Ok(keychain), Some(plaintext)) => {
+                match connection::Connection::load(repo_root, keychain, plaintext, credential::CallUrgency::Background) {
+                    Ok(Some(connection)) => Some(Ok(connection)),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(classify_connection_load_error(&e))),
+                }
+            }
+            (Err(e), _) => Some(Err(sync::classify_credential_error(e))),
+            (_, None) => Some(Err(sync::SyncFailureCause::Other {
+                detail: "the app's config directory could not be resolved".to_string(),
+            })),
+        }
+    };
+
+    // Ticket 13 checklist item 4: set when a background OAuth refresh below
+    // succeeded but couldn't persist the new pair. Only turned into a
+    // surfaced `SyncFailureCause` once it's known the sync attempt that
+    // follows -- using that fresh in-memory pair -- actually succeeded (see
+    // below): if sync failed for some other reason, that failure is already
+    // more specific and more urgent than "your refreshed sign-in wasn't
+    // saved."
+    let mut refreshed_sign_in_not_saved: Option<sync::SyncFailureCause> = None;
 
     let outcome = match connection_load {
-        Some(Err(e)) => sync::SyncOutcome {
-            status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
+        Some(Err(cause)) => sync::SyncOutcome {
+            status: cause.into_status(),
             index_rebuild_needed: false,
         },
         Some(Ok(connection)) => {
@@ -455,8 +486,17 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
             // is actually signed in with.
             let connection = match (keychain.as_ref().ok(), plaintext.as_ref()) {
                 (keychain, Some(plaintext)) => {
-                    let connection = github_oauth::refresh_if_needed(repo_root, keychain, plaintext, connection);
-                    gitlab_oauth::refresh_if_needed(repo_root, keychain, plaintext, connection)
+                    let (connection, github_save_failed) =
+                        github_oauth::refresh_if_needed(repo_root, keychain, plaintext, connection);
+                    let (connection, gitlab_save_failed) =
+                        gitlab_oauth::refresh_if_needed(repo_root, keychain, plaintext, connection);
+                    if github_save_failed || gitlab_save_failed {
+                        refreshed_sign_in_not_saved = Some(sync::SyncFailureCause::RefreshedSignInNotSaved {
+                            detail: "the store that should hold it couldn't be written to".to_string(),
+                            credential_kind: connection.credential_kind(),
+                        });
+                    }
+                    connection
                 }
                 _ => connection,
             };
@@ -477,6 +517,17 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
         },
     };
 
+    // Ticket 13 checklist item 4: promote the "refreshed but not saved"
+    // warning to the actual reported status only now that it's known this
+    // sync attempt (using the fresh in-memory pair) came back `Synced`.
+    let outcome = match (&refreshed_sign_in_not_saved, &outcome.status) {
+        (Some(cause), sync::SyncStatus::Synced) => sync::SyncOutcome {
+            status: cause.clone().into_status(),
+            ..outcome
+        },
+        _ => outcome,
+    };
+
     if outcome.index_rebuild_needed {
         let mut db_guard = state.db.lock().unwrap();
         if let Some(conn) = db_guard.as_mut() {
@@ -489,6 +540,21 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
     }
     *state.sync_status.lock().unwrap() = outcome.status.clone();
     let _ = app.emit("sync-status-changed", &outcome.status);
+}
+
+/// Recovers a `SyncFailureCause` from the `anyhow::Error` `connection::Connection::load`
+/// returns (ticket 13 checklist items 2/3) -- a locked or unreachable
+/// keychain must be distinguishable from a generic failure in the
+/// needs-attention popup, not collapsed into `SyncFailureCause::Other` the
+/// way every `Connection::load` error was before this ticket.
+/// `Connection::load` wraps a `credential::CredentialError` in
+/// `connection::ConnectionError::Credential` via a bare `?` with no added
+/// context, so downcasting back to it is lossless.
+fn classify_connection_load_error(err: &anyhow::Error) -> sync::SyncFailureCause {
+    match err.downcast_ref::<connection::ConnectionError>() {
+        Some(connection::ConnectionError::Credential(cred_err)) => sync::classify_credential_error(cred_err),
+        None => sync::SyncFailureCause::Other { detail: err.to_string() },
+    }
 }
 
 /// Unix seconds "now" -- used only for `AppState::last_synced_at` (ticket
@@ -535,22 +601,44 @@ struct SyncDetails {
     /// Unix seconds of the last sync attempt that completed as `Synced`,
     /// `None` until the first one since this vault was opened.
     last_synced_at: Option<u64>,
+    /// The `origin` remote's raw URL (not just its human-facing `provider`
+    /// label above) -- ticket 13's "Reconnect" CTA needs this to pre-fill
+    /// the quick-reconnect sub-form's own repository URL field, the same
+    /// way the guided wizard already carries `remoteUrl` into
+    /// `openSyncManualForm`. `None` under the same conditions as `provider`.
+    remote_url: Option<String>,
+    /// This vault's currently configured connection's credential kind --
+    /// ticket 13's "Reconnect" CTA uses this (together with `provider`) to
+    /// jump straight into the matching credential-kind sub-form rather than
+    /// asking the user to pick it again. `None` when no connection is
+    /// configured.
+    credential_kind: Option<connection_record::CredentialKind>,
 }
 
 #[tauri::command]
 fn get_sync_details(state: State<AppState>) -> SyncDetails {
     let status = state.sync_status.lock().unwrap().clone();
     let last_synced_at = *state.last_synced_at.lock().unwrap();
-    let provider = state
+    let repo_root = state
         .vault_path
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|vault_path| repo_root_of(vault_path).ok())
-        .and_then(|repo_root| sync::origin_remote_url(&repo_root))
-        .map(|url| provider_label(&infer_provider(&url)));
+        .and_then(|vault_path| repo_root_of(vault_path).ok());
+    let remote_url = repo_root.as_ref().and_then(|repo_root| sync::origin_remote_url(repo_root));
+    let provider = remote_url.as_deref().map(|url| provider_label(&infer_provider(url)));
+    let credential_kind = repo_root
+        .as_ref()
+        .and_then(|repo_root| connection_record::read(repo_root).ok().flatten())
+        .map(|record| record.credential_kind);
 
-    SyncDetails { status, provider, last_synced_at }
+    SyncDetails {
+        status,
+        provider,
+        last_synced_at,
+        remote_url,
+        credential_kind,
+    }
 }
 
 /// A human-facing name for `provider`, used by `get_sync_details` -- "GitHub"
@@ -581,6 +669,54 @@ fn trigger_sync_now(state: State<AppState>) -> Result<(), String> {
     }
     notify_sync(&state);
     Ok(())
+}
+
+/// Ticket 13 checklist item 2: the needs-attention popup's "Unlock and
+/// retry" CTA for `SyncFailureCause::KeychainLocked`. Background sync always
+/// resolves a connection's secret with `CallUrgency::Background` (ADR-0013:
+/// "background calls never raise a prompt"), which is exactly why a locked
+/// keychain fails fast there instead of showing the unlock prompt. This
+/// command takes the interactive path instead: probing with
+/// `CallUrgency::Interactive` (the ~2 minute, prompt-raising timeout
+/// `credential.rs` reserves for connect-time calls) actually raises that
+/// prompt for the user to answer. Once the probe succeeds -- the collection
+/// is unlocked for this session -- an ordinary sync attempt is kicked off
+/// the same way "Sync now" does; that attempt resolves the real secret with
+/// the ordinary background urgency, which now succeeds because the store is
+/// already unlocked.
+#[tauri::command]
+fn unlock_keychain_and_retry_sync(state: State<AppState>) -> Result<(), String> {
+    let keychain = credential::KeychainBackend::platform().map_err(|e| e.to_string())?;
+    keychain
+        .probe(credential::CallUrgency::Interactive)
+        .map_err(|e| e.to_string())?;
+    if state.sync_tx.lock().unwrap().is_none() {
+        return Err("No vault is open".to_string());
+    }
+    notify_sync(&state);
+    Ok(())
+}
+
+/// Ticket 13 checklist item 5: the merge-conflict needs-attention CTA --
+/// reveals `.cerebrite/conflict-backups/` (`sync::CONFLICT_BACKUP_DIR_REL`,
+/// ADR-0006) in the system file manager via the `tauri-plugin-opener`
+/// dependency ticket 12 already added, rather than any in-app
+/// conflict-resolution UI (explicitly out of scope per the ticket -- the
+/// popup's message points the user at resolving with ordinary git tooling
+/// instead). Creates the directory first if it doesn't exist yet (e.g. the
+/// one conflict-detected-but-nothing-backed-up edge case `sync.rs`'s
+/// `backup_conflicted_files` doc comment calls out) so "reveal" always has
+/// somewhere real to show rather than erroring on a missing path.
+#[tauri::command]
+fn reveal_conflict_backups(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+    let backup_dir = repo_root.join(sync::CONFLICT_BACKUP_DIR_REL);
+    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+    app.opener().reveal_item_in_dir(&backup_dir).map_err(|e| e.to_string())
 }
 
 /// Ticket 08 checklist item 3/8: the "Commit as" prefill for the currently
@@ -2248,6 +2384,8 @@ pub fn run() {
             get_sync_status,
             get_sync_details,
             trigger_sync_now,
+            unlock_keychain_and_retry_sync,
+            reveal_conflict_backups,
             commit_author_prefill,
             get_commit_author,
             confirm_commit_author,

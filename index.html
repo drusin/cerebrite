@@ -215,7 +215,15 @@
            footer/rail icon, never auto-opened. Shows provider, last-synced
            time, status text, a link into Settings' Sync section, and a
            "Sync now" action that's always available. Closed by Escape or
-           clicking outside it. -->
+           clicking outside it.
+
+           Ticket 13: `#sync-popup-cause-actions` holds the cause-specific
+           CTA button(s) (`sync-status.ts`'s `ctasFor`) for a `needsAttention`
+           status -- empty/hidden for every other state, and for
+           `needsAttention` itself before ticket 13. `data-severity` on the
+           popup lets `refreshedSignInNotSaved`'s lower-key warning read
+           distinctly from a hard failure without being a separate icon
+           state. -->
       <div id="sync-popup" class="sync-popup" hidden role="dialog" aria-label="Sync status">
         <p class="sync-popup-status-line">
           <span id="sync-popup-icon" class="sync-status-icon" data-state="notConnected" aria-hidden="true">○</span>
@@ -223,6 +231,7 @@
         </p>
         <p id="sync-popup-provider" class="sync-popup-detail" hidden></p>
         <p id="sync-popup-last-synced" class="sync-popup-detail" hidden></p>
+        <div id="sync-popup-cause-actions" class="sync-popup-cause-actions" hidden></div>
         <div class="sync-popup-actions">
           <button id="sync-popup-sync-now-button" type="button">Sync now</button>
           <button id="sync-popup-settings-link" type="button" class="sync-popup-settings-link">Sync settings…</button>
