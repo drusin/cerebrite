@@ -89,16 +89,18 @@ pub fn ensure_git_repo(picked_path: &Path) -> Result<PathBuf> {
 
             // Compare canonicalized paths so e.g. a trailing slash or a
             // symlinked tempdir (common in tests) doesn't produce a false
-            // "not the root" refusal.
-            let canonical_discovered = discovered_root.canonicalize().unwrap_or(discovered_root.clone());
-            let canonical_picked = picked_path.canonicalize().unwrap_or_else(|_| picked_path.to_path_buf());
+            // "not the root" refusal. `dunce` rather than std so that on
+            // Windows the root named in the error below reads as a normal
+            // `C:\...` path, not libgit2's `C:/.../` or std's `\\?\C:\...`.
+            let canonical_discovered = dunce::canonicalize(&discovered_root).unwrap_or(discovered_root);
+            let canonical_picked = dunce::canonicalize(picked_path).unwrap_or_else(|_| picked_path.to_path_buf());
 
             if canonical_discovered != canonical_picked {
                 bail!(
                     "'{}' is inside an existing git repository rooted at '{}'. Pick that folder instead \
                      of a folder nested inside it.",
                     picked_path.display(),
-                    discovered_root.display()
+                    canonical_discovered.display()
                 );
             }
         }
@@ -492,7 +494,7 @@ mod tests {
         let err = ensure_git_repo(&nested).unwrap_err();
 
         let message = err.to_string();
-        let expected_root = dir.path().canonicalize().unwrap_or_else(|_| dir.path().to_path_buf());
+        let expected_root = dunce::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
         assert!(
             message.contains(&expected_root.display().to_string()),
             "expected the error to name the real repo root '{}', got: {message}",

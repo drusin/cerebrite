@@ -76,6 +76,10 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # RFC 3339 timestamp formatting/parsing for OAuth token expiry (ticket 06) --
 # also already present transitively at this version.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# `canonicalize` without Windows' `\\?\` verbatim prefix, so a canonical
+# path is still readable when shown to the user (e.g. `ensure_git_repo`'s
+# "pick the repo root instead" error) -- also already present transitively.
+dunce = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust (zbus) Secret Service store -- avoids a libdbus-sys build
