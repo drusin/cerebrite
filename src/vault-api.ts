@@ -7,6 +7,17 @@ export interface VaultInfo {
   pageCount: number;
 }
 
+/// Code-review follow-up (ticket 02/04): the exact rejection message
+/// `connectAccessToken`/`connectSshKey`/`connectGithubOauth`/`connectGitlabOauth`
+/// reject with when no keychain is reachable and `allowPlaintextFallback`
+/// wasn't `true` -- must match `credential::PLAINTEXT_CONSENT_REQUIRED` in
+/// the Rust core verbatim. Callers match a caught error against this exact
+/// string to distinguish "needs plaintext consent" from every other connect
+/// failure (a rejected token, an unreachable remote, ...), which must still
+/// surface as an ordinary error.
+export const PLAINTEXT_CONSENT_REQUIRED_ERROR =
+  "No keychain is available on this device. Storing this credential requires explicit consent to save it as plaintext instead.";
+
 export interface PageSummary {
   id: string;
   title: string;
@@ -223,8 +234,20 @@ export function searchPages(query: string, includeTrash: boolean): Promise<Searc
 /// anything; a rejected/unreachable test fetch rejects this promise and
 /// leaves nothing persisted. On success, background sync picks up the new
 /// connection on its own -- no further prompting.
-export function connectAccessToken(remoteUrl: string, username: string, token: string): Promise<void> {
-  return invoke("connect_access_token", { remoteUrl, username, token });
+///
+/// `allowPlaintextFallback` (code-review follow-up, ticket 02): must be
+/// `true` for the secret to be stored as a plaintext file when no keychain
+/// is reachable -- without it, an unreachable keychain rejects this promise
+/// with `PLAINTEXT_CONSENT_REQUIRED_ERROR`, which the caller is expected to
+/// turn into a consent prompt (see `main.ts`'s `promptPlaintextFallbackConsent`)
+/// before retrying with `true`.
+export function connectAccessToken(
+  remoteUrl: string,
+  username: string,
+  token: string,
+  allowPlaintextFallback: boolean,
+): Promise<void> {
+  return invoke("connect_access_token", { remoteUrl, username, token, allowPlaintextFallback });
 }
 
 /// Ticket 05's SSH key connection path. `SshKeyInfo` is what
@@ -258,8 +281,15 @@ export function importSshKey(privateKeyOpenssh: string, passphrase?: string): Pr
 /// promise naming the host and fingerprint; confirm it via
 /// `confirmSshHostKey` (only after showing it to the user and getting
 /// explicit confirmation) and call this again.
-export function connectSshKey(remoteUrl: string, privateKeyOpenssh: string, passphrase?: string): Promise<void> {
-  return invoke("connect_ssh_key", { remoteUrl, privateKeyOpenssh, passphrase });
+/// `allowPlaintextFallback`: see `connectAccessToken`'s doc comment -- same
+/// consent gate, same rejection to catch and retry.
+export function connectSshKey(
+  remoteUrl: string,
+  privateKeyOpenssh: string,
+  passphrase: string | undefined,
+  allowPlaintextFallback: boolean,
+): Promise<void> {
+  return invoke("connect_ssh_key", { remoteUrl, privateKeyOpenssh, passphrase, allowPlaintextFallback });
 }
 
 /// Persists explicit TOFU confirmation of `fingerprint` for `host` to
@@ -331,13 +361,22 @@ export interface OauthConnectResult {
 /// (`x-access-token` HTTPS Basic-auth convention) before persisting
 /// anything, same gate as `connectAccessToken`/`connectSshKey`. Stores the
 /// full token pair so the background sync path can refresh it unattended.
+/// `allowPlaintextFallback`: see `connectAccessToken`'s doc comment -- same
+/// consent gate, same rejection to catch and retry.
 export function connectGithubOauth(
   remoteUrl: string,
   accessToken: string,
   refreshToken: string,
   accessTokenExpiresAt: string,
+  allowPlaintextFallback: boolean,
 ): Promise<OauthConnectResult> {
-  return invoke("connect_github_oauth", { remoteUrl, accessToken, refreshToken, accessTokenExpiresAt });
+  return invoke("connect_github_oauth", {
+    remoteUrl,
+    accessToken,
+    refreshToken,
+    accessTokenExpiresAt,
+    allowPlaintextFallback,
+  });
 }
 
 /// Ticket 07's GitLab Device Authorization Grant sign-in -- same shape as
@@ -379,13 +418,22 @@ export function pollGitlabDeviceFlow(deviceCode: string): Promise<GitlabDevicePo
 /// `connectGithubOauth`/`connectAccessToken`/`connectSshKey`. Stores
 /// whatever refresh token (if any) came back so the background sync path
 /// can refresh unattended when one exists.
+/// `allowPlaintextFallback`: see `connectAccessToken`'s doc comment -- same
+/// consent gate, same rejection to catch and retry.
 export function connectGitlabOauth(
   remoteUrl: string,
   accessToken: string,
   refreshToken: string | undefined,
   accessTokenExpiresAt: string,
+  allowPlaintextFallback: boolean,
 ): Promise<OauthConnectResult> {
-  return invoke("connect_gitlab_oauth", { remoteUrl, accessToken, refreshToken, accessTokenExpiresAt });
+  return invoke("connect_gitlab_oauth", {
+    remoteUrl,
+    accessToken,
+    refreshToken,
+    accessTokenExpiresAt,
+    allowPlaintextFallback,
+  });
 }
 
 /// One repository as surfaced to the guided connect wizard (ticket 09), for

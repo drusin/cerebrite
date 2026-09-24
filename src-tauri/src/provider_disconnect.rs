@@ -37,6 +37,7 @@
 
 use std::path::Path;
 
+use anyhow::Context;
 use serde::Serialize;
 
 use crate::connection_record::{self, ConnectionRecord, CredentialKind, Provider, StoreKind};
@@ -72,12 +73,19 @@ pub struct DisconnectOutcome {
 /// `Ok(None)`). The caller still owns clearing `settings.json`'s index entry
 /// via `settings::remove_connection` once this returns `Ok(Some(_))`.
 ///
-/// Every deletion here is best-effort past reading the record: once the
-/// connection record itself is confirmed gone (the one artifact whose
-/// removal this function propagates as a hard error), a failure deleting
-/// the now-orphaned-either-way secret or removing the `origin` remote
-/// doesn't leave the vault in a half-disconnected state the user can't
-/// recover from by trying Disconnect again.
+/// Code-review follow-up (ticket 14): deleting the stored secret used to be
+/// `let _ = ...`'d away, so a keychain that refused the delete (locked,
+/// permission denied, daemon unreachable) still resulted in `Ok` -- the
+/// caller reported "disconnected" while the credential was, in fact, still
+/// sitting in the store. That's now a hard error, returned *before* the
+/// connection record is deleted: the record staying in place is what makes
+/// the failure recoverable (the user can just try Disconnect again) rather
+/// than leaving an orphaned secret with nothing left referencing it.
+/// Removing the `origin` remote remains best-effort past that point -- a
+/// vault whose `origin` can't be removed (wrong permissions, a corrupt
+/// `.git`) still ends up fully disconnected credential-wise; it just won't
+/// report `NoRemote` on its very next sync attempt the way a normally
+/// removable remote would.
 pub fn disconnect_connection(
     repo_root: &Path,
     keychain: Option<&KeychainBackend>,
@@ -91,7 +99,8 @@ pub fn disconnect_connection(
     // GitLab revoke first -- needs the secret to still be in its store.
     let gitlab_revoked = maybe_revoke_gitlab(&record, keychain, plaintext, gitlab_endpoints);
 
-    delete_stored_secret(&record, keychain, plaintext);
+    delete_stored_secret(&record, keychain, plaintext)
+        .with_context(|| format!("deleting stored secret for connection {}", record.connection_id))?;
 
     connection_record::delete(repo_root)?;
 
@@ -145,16 +154,22 @@ fn maybe_revoke_gitlab(
     Some(gitlab_oauth::revoke_token(endpoints, gitlab_oauth::GITLAB_CLIENT_ID, &refresh_token).is_ok())
 }
 
-fn delete_stored_secret(record: &ConnectionRecord, keychain: Option<&KeychainBackend>, plaintext: &PlaintextStore) {
+/// Deletes `record`'s stored secret. A hard error (not swallowed -- see
+/// `disconnect_connection`'s doc comment) so a keychain that refuses the
+/// delete is never mistaken for one that succeeded. `StoreKind::Keychain`
+/// with no reachable `keychain` backend is itself an error, for the same
+/// reason: the secret is presumably still there, unreachable, not gone.
+fn delete_stored_secret(
+    record: &ConnectionRecord,
+    keychain: Option<&KeychainBackend>,
+    plaintext: &PlaintextStore,
+) -> anyhow::Result<()> {
     match record.credential_store {
-        StoreKind::Keychain => {
-            if let Some(kc) = keychain {
-                let _ = kc.delete_secret(&record.connection_id, CallUrgency::Interactive);
-            }
-        }
-        StoreKind::Plaintext => {
-            let _ = plaintext.delete_secret(&record.connection_id);
-        }
+        StoreKind::Keychain => keychain
+            .ok_or_else(|| anyhow::anyhow!("no keychain backend is available"))?
+            .delete_secret(&record.connection_id, CallUrgency::Interactive)
+            .map_err(anyhow::Error::from),
+        StoreKind::Plaintext => plaintext.delete_secret(&record.connection_id),
     }
 }
 
@@ -164,21 +179,24 @@ fn delete_stored_secret(record: &ConnectionRecord, keychain: Option<&KeychainBac
 /// `connection.json` left to read the way `disconnect_connection` needs.
 /// Also used by "Remove all stored Cerebrite credentials" (checklist item 7)
 /// for whichever of its entries turn out to already be orphaned.
+///
+/// Code-review follow-up (ticket 14): returns the outcome instead of
+/// swallowing it, for the same reason `delete_stored_secret` does -- a
+/// caller that treats this as always-successful can end up removing the
+/// `settings.json` index entry (the only remaining record of the secret's
+/// existence) while the secret itself is still sitting in the store.
 pub fn delete_orphaned_secret(
     keychain: Option<&KeychainBackend>,
     plaintext: &PlaintextStore,
     connection_id: &str,
     store: StoreKind,
-) {
+) -> anyhow::Result<()> {
     match store {
-        StoreKind::Keychain => {
-            if let Some(kc) = keychain {
-                let _ = kc.delete_secret(connection_id, CallUrgency::Interactive);
-            }
-        }
-        StoreKind::Plaintext => {
-            let _ = plaintext.delete_secret(connection_id);
-        }
+        StoreKind::Keychain => keychain
+            .ok_or_else(|| anyhow::anyhow!("no keychain backend is available"))?
+            .delete_secret(connection_id, CallUrgency::Interactive)
+            .map_err(anyhow::Error::from),
+        StoreKind::Plaintext => plaintext.delete_secret(connection_id),
     }
 }
 
@@ -298,6 +316,46 @@ mod tests {
             .unwrap();
 
         assert!(keychain.get_secret("conn-1", CallUrgency::Interactive).is_err());
+    }
+
+    // -- code-review follow-up (ticket 14): a failed secret deletion must be
+    // a hard error, not swallowed -- and must leave the connection record
+    // (and the secret) in place so the failure is recoverable.
+
+    #[test]
+    fn disconnect_connection_fails_and_leaves_the_record_and_secret_in_place_when_the_keychain_is_unreachable() {
+        let repo_dir = tempdir().unwrap();
+        let _bare = local_bare_remote(repo_dir.path());
+
+        let config_dir = tempdir().unwrap();
+        let plaintext = PlaintextStore::new(config_dir.path());
+        // A Keychain-store record with no keychain backend at all --
+        // `delete_stored_secret` can't even attempt the delete, which must
+        // surface as an error rather than a silent no-op success.
+        let record = access_token_record(StoreKind::Keychain);
+        connection_record::write(repo_dir.path(), &record).unwrap();
+
+        let endpoints = mock_endpoints(0);
+        let result = disconnect_connection(repo_dir.path(), None, &plaintext, &endpoints);
+
+        assert!(result.is_err(), "expected disconnect to fail, but it reported success");
+        // The record must still be there -- otherwise a retry has nothing
+        // left to disconnect, even though the (unreachable, still-live)
+        // secret was never actually deleted.
+        assert_eq!(connection_record::read(repo_dir.path()).unwrap(), Some(record));
+        // And the origin remote -- the last step -- must not have run either.
+        let repo = git2::Repository::open(repo_dir.path()).unwrap();
+        assert!(repo.find_remote("origin").is_ok());
+    }
+
+    #[test]
+    fn delete_orphaned_secret_reports_failure_instead_of_claiming_success() {
+        let config_dir = tempdir().unwrap();
+        let plaintext = PlaintextStore::new(config_dir.path());
+
+        let result = delete_orphaned_secret(None, &plaintext, "conn-1", StoreKind::Keychain);
+
+        assert!(result.is_err());
     }
 
     // -- checklist item 8: a subsequent sync reports NoRemote, not a stale
@@ -478,7 +536,7 @@ mod tests {
         let plaintext = PlaintextStore::new(config_dir.path());
         plaintext.set_secret("conn-orphan", b"leftover").unwrap();
 
-        delete_orphaned_secret(None, &plaintext, "conn-orphan", StoreKind::Plaintext);
+        delete_orphaned_secret(None, &plaintext, "conn-orphan", StoreKind::Plaintext).unwrap();
 
         assert!(plaintext.get_secret("conn-orphan").is_err());
     }
@@ -492,7 +550,7 @@ mod tests {
             .set_secret("conn-orphan", b"leftover", CallUrgency::Interactive)
             .unwrap();
 
-        delete_orphaned_secret(Some(&keychain), &plaintext, "conn-orphan", StoreKind::Keychain);
+        delete_orphaned_secret(Some(&keychain), &plaintext, "conn-orphan", StoreKind::Keychain).unwrap();
 
         assert!(keychain.get_secret("conn-orphan", CallUrgency::Interactive).is_err());
     }

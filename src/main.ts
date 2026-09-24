@@ -45,6 +45,7 @@ import {
   scanOrphanedConnections,
   cleanupOrphanedConnections,
   removeAllStoredCredentials,
+  PLAINTEXT_CONSENT_REQUIRED_ERROR,
   type DisconnectOutcome,
   type Provider,
   type CommitAuthor,
@@ -1231,7 +1232,7 @@ async function handleConnectFormSubmit(event: SubmitEvent) {
   }
 
   try {
-    await connectAccessToken(remoteUrl, username, token);
+    await withPlaintextFallbackConsent((allow) => connectAccessToken(remoteUrl, username, token, allow));
     if (settingsConnectStatusEl) settingsConnectStatusEl.textContent = "Connected.";
     settingsConnectTokenEl.value = "";
   } catch (err) {
@@ -1343,7 +1344,9 @@ async function finishGithubConnect(remoteUrl: string) {
 
   settingsGithubInstallEl?.setAttribute("hidden", "");
   settingsGithubStatusEl.textContent = "Connecting…";
-  const result = await connectGithubOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt);
+  const result = await withPlaintextFallbackConsent((allow) =>
+    connectGithubOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt, allow),
+  );
   settingsGithubStatusEl.textContent = "Connected.";
   pendingGithubTokenPair = null;
   await maybeOfferProviderCommitAuthorSwitch(result.providerSuggestedAuthor);
@@ -1433,7 +1436,9 @@ async function handleGitlabFormSubmit(event: SubmitEvent) {
 
     settingsGitlabDeviceCodeEl?.setAttribute("hidden", "");
     setStatus("Connecting…");
-    const connectResult = await connectGitlabOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt);
+    const connectResult = await withPlaintextFallbackConsent((allow) =>
+      connectGitlabOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt, allow),
+    );
     setStatus("Connected.");
     await maybeOfferProviderCommitAuthorSwitch(connectResult.providerSuggestedAuthor);
   } catch (err) {
@@ -1706,6 +1711,31 @@ async function handleUnlockAndRetryClick(): Promise<void> {
   }
 }
 
+/** Code-review follow-up (ticket 02/04): wraps a `connect*` call so the
+ * backend's `PLAINTEXT_CONSENT_REQUIRED_ERROR` rejection (no keychain
+ * reachable, and the caller hadn't consented to plaintext storage yet) turns
+ * into the same "store as plaintext instead?" consent dialog ticket 13's
+ * reconnect path already uses (`handleStoreAsPlaintextClick`) -- reused here
+ * for the *initial* connect path, which never had one before. `attempt` is
+ * always first called with `allowPlaintextFallback: false`; it's retried
+ * with `true` only if that specific rejection comes back and the user
+ * confirms. Any other rejection (wrong token, unreachable remote, rejected
+ * SSH host key, ...) passes straight through unchanged. */
+async function withPlaintextFallbackConsent<T>(attempt: (allowPlaintextFallback: boolean) => Promise<T>): Promise<T> {
+  try {
+    return await attempt(false);
+  } catch (err) {
+    if (String(err) !== PLAINTEXT_CONSENT_REQUIRED_ERROR) throw err;
+    const confirmed = window.confirm(
+      "No keychain is available on this device. Store this connection's credential as a plaintext " +
+        "file instead? This is less secure than the keychain, and should only be used when no keychain " +
+        "is available.",
+    );
+    if (!confirmed) throw err;
+    return attempt(true);
+  }
+}
+
 /** Ticket 13 checklist item 3: "Set up a keychain" for `keychainUnavailable`.
  * There's no in-app way to install/start an OS keychain daemon -- this is
  * guidance plus a nudge toward "Retry sync" (always available in the popup)
@@ -1816,7 +1846,9 @@ async function handleSettingsSshKeyConnectClick() {
   settingsSshKeyStatusEl.textContent = "Connecting…";
   settingsSshKeyStatusEl.removeAttribute("hidden");
   try {
-    await connectSshKey(remoteUrl, settingsSshKey.privateKeyOpenssh, settingsSshKey.passphrase);
+    await withPlaintextFallbackConsent((allow) =>
+      connectSshKey(remoteUrl, settingsSshKey!.privateKeyOpenssh, settingsSshKey!.passphrase, allow),
+    );
     settingsSshKeyStatusEl.textContent = "Connected.";
   } catch (err) {
     settingsSshKeyStatusEl.textContent = String(err);
@@ -2642,20 +2674,29 @@ async function performWizardConnect(generation: number) {
             `Cerebrite isn't installed on this repository yet. Install it at ${installation.installUrl}, then try again.`,
           );
         }
-        await connectGithubOauth(remoteUrl, wizardAccessToken, wizardRefreshToken ?? "", wizardAccessTokenExpiresAt);
+        await withPlaintextFallbackConsent((allow) =>
+          connectGithubOauth(remoteUrl, wizardAccessToken!, wizardRefreshToken ?? "", wizardAccessTokenExpiresAt, allow),
+        );
       } else {
-        await connectGitlabOauth(remoteUrl, wizardAccessToken, wizardRefreshToken, wizardAccessTokenExpiresAt);
+        await withPlaintextFallbackConsent((allow) =>
+          connectGitlabOauth(remoteUrl, wizardAccessToken!, wizardRefreshToken, wizardAccessTokenExpiresAt, allow),
+        );
       }
     } else if (wizardState.credentialKind === "accessToken") {
       if (!wizardPendingAccessTokenConnect) throw new Error("Missing access token details.");
-      await connectAccessToken(
-        wizardPendingAccessTokenConnect.remoteUrl,
-        wizardPendingAccessTokenConnect.username,
-        wizardPendingAccessTokenConnect.token,
+      await withPlaintextFallbackConsent((allow) =>
+        connectAccessToken(
+          wizardPendingAccessTokenConnect!.remoteUrl,
+          wizardPendingAccessTokenConnect!.username,
+          wizardPendingAccessTokenConnect!.token,
+          allow,
+        ),
       );
     } else if (wizardState.credentialKind === "sshKey") {
       if (!wizardSshKey) throw new Error("Generate or import an SSH key first.");
-      await connectSshKey(remoteUrl, wizardSshKey.privateKeyOpenssh, wizardSshKey.passphrase);
+      await withPlaintextFallbackConsent((allow) =>
+        connectSshKey(remoteUrl, wizardSshKey!.privateKeyOpenssh, wizardSshKey!.passphrase, allow),
+      );
     } else {
       throw new Error("No connection method was chosen.");
     }

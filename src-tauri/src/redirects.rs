@@ -275,6 +275,18 @@ pub fn resolve_heading_slug(
 /// This is a deliberate choice over batching everything into a single
 /// commit: it keeps "links were repointed" and "redirect log was pruned"
 /// separately reviewable in git history.
+///
+/// Code-review follow-up (ticket 08): both commits are skipped (not
+/// attempted at all) when no commit author is confirmed anywhere for this
+/// vault yet (`vault::has_commit_author`) -- this runs unconditionally as
+/// part of *every* vault open (`open_vault`/`clone_and_open_vault` in
+/// `lib.rs`), and opening a vault must never hard-fail just because this
+/// byproduct cleanup had real work to do and no author to commit it under.
+/// The rewritten files (and pruned `redirects.tsv`) are still written to
+/// disk either way -- only the *commit* is skipped -- so they simply sit as
+/// uncommitted working-tree changes until whichever commit succeeds next
+/// (an edit made once an author is confirmed, or the next time this same
+/// cleanup runs and an author is by then confirmed) folds them in.
 pub fn cleanup_and_prune(vault_path: &Path, repo_root: &Path, conn: &Connection) -> Result<()> {
     let entries = load(vault_path)?;
     if entries.is_empty() {
@@ -338,7 +350,7 @@ pub fn cleanup_and_prune(vault_path: &Path, repo_root: &Path, conn: &Connection)
         any_file_changed = true;
     }
 
-    if any_file_changed {
+    if any_file_changed && vault::has_commit_author(repo_root) {
         vault::commit_all(repo_root, "Rewrite links through renamed headings")?;
     }
 
@@ -367,7 +379,9 @@ pub fn cleanup_and_prune(vault_path: &Path, repo_root: &Path, conn: &Connection)
         .collect();
 
     save(vault_path, &pruned)?;
-    vault::commit_all(repo_root, "Prune resolved heading redirects")?;
+    if vault::has_commit_author(repo_root) {
+        vault::commit_all(repo_root, "Prune resolved heading redirects")?;
+    }
 
     Ok(())
 }
@@ -577,6 +591,82 @@ mod tests {
         let repo = git2::Repository::open(dir.path()).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_ne!(head.message().unwrap(), "Initial fixture");
+    }
+
+    /// See `vault.rs`'s test helper of the same name -- duplicated rather
+    /// than shared (matching this crate's existing precedent, e.g.
+    /// `sync.rs`'s own copy) so this module's tests stay independently
+    /// readable. Idempotent and safe across threads.
+    fn isolate_from_host_git_config() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let empty = std::env::temp_dir().join("cerebrite-test-empty-gitconfig");
+            fs::create_dir_all(&empty).expect("creating empty test gitconfig dir");
+            for level in [git2::ConfigLevel::System, git2::ConfigLevel::Global, git2::ConfigLevel::XDG] {
+                unsafe {
+                    git2::opts::set_search_path(level, &empty).expect("redirecting git2 config search path");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cleanup_and_prune_skips_committing_but_still_rewrites_and_prunes_when_no_author_is_confirmed() {
+        // Code-review follow-up (ticket 08): before this fix, `open_vault`
+        // (which calls `cleanup_and_prune` unconditionally on every vault
+        // open) would hard-fail here -- `vault::commit_all` requires a
+        // confirmed author, and this fixture deliberately confirms none
+        // anywhere (repo-local or global), reproducing "adopted an existing
+        // vault, with pending redirect cleanup work, on a device with no
+        // git identity configured yet at all".
+        isolate_from_host_git_config();
+        let dir = tempdir().unwrap();
+        let vault_path = vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
+
+        write_page(
+            &vault_path,
+            "target.md",
+            "---\nid: target-id\ntitle: Target\n---\n## New Heading\n\nBody.\n",
+        );
+        write_page(
+            &vault_path,
+            "source.md",
+            "---\nid: source-id\ntitle: Source\n---\nSee [[Target#old-slug]] for details.\n",
+        );
+        vault::commit_all(dir.path(), "Initial fixture").unwrap();
+        insert_sorted(&vault_path, entry("target-id#old-slug", "target-id#new-heading")).unwrap();
+
+        // Now strip the author away -- as if this were a fresh device that
+        // has never confirmed one, opening a vault it cloned/adopted from
+        // elsewhere with this fixture's history already in it.
+        let mut config = git2::Repository::open(dir.path()).unwrap().config().unwrap();
+        config.remove("user.name").ok();
+        config.remove("user.email").ok();
+        assert!(!vault::has_commit_author(dir.path()));
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        index::build_index(&mut conn, &vault_path).unwrap();
+
+        // Must not error -- this is what `open_vault` propagates as a hard
+        // failure otherwise.
+        cleanup_and_prune(&vault_path, dir.path(), &conn).unwrap();
+
+        // The rewrite and prune still happened on disk...
+        let rewritten = fs::read_to_string(vault_path.join("source.md")).unwrap();
+        assert!(rewritten.contains("[[Target#new-heading]]"), "expected rewritten link, got: {rewritten}");
+        let remaining = load(&vault_path).unwrap();
+        assert!(remaining.is_empty(), "expected the redirect to be pruned, got {remaining:?}");
+
+        // ...but nothing was committed -- HEAD is still the initial fixture
+        // commit, and the working tree has uncommitted changes waiting for
+        // whichever commit succeeds next.
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap(), "Initial fixture");
+        let statuses = repo.statuses(None).unwrap();
+        assert!(!statuses.is_empty(), "expected uncommitted working-tree changes");
     }
 
     #[test]

@@ -25,6 +25,17 @@ use crate::connection_record::StoreKind;
 pub struct ConnectionEntry {
     pub store: StoreKind,
     pub repo_path: String,
+    /// Code-review follow-up (ticket 02, ADR-0013 "consented plaintext as
+    /// the only fallback"): `true` only for a `StoreKind::Plaintext` entry
+    /// the user actually consented to (the caller passed
+    /// `allow_plaintext_fallback: true` to whichever `connect_*` command
+    /// created it -- see `lib.rs`'s `resolve_store_kind`). Meaningless (and
+    /// left `false`) for `StoreKind::Keychain`, which never needs consent.
+    /// Defaults to `false` on deserialize so entries written before this
+    /// field existed don't retroactively claim a consent that was never
+    /// actually asked for.
+    #[serde(default)]
+    pub plaintext_consented: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -117,13 +128,20 @@ pub fn set_theme(app: &AppHandle, theme: Theme) -> Result<()> {
 /// in, and which repository it belongs to (ticket 14's addition -- see
 /// `ConnectionEntry`'s doc comment). Called whenever a secret is first
 /// stored and whenever "Move to keychain" (ticket 02) succeeds.
-pub fn set_connection_store(app: &AppHandle, connection_id: &str, store: StoreKind, repo_root: &Path) -> Result<()> {
+pub fn set_connection_store(
+    app: &AppHandle,
+    connection_id: &str,
+    store: StoreKind,
+    repo_root: &Path,
+    plaintext_consented: bool,
+) -> Result<()> {
     let mut settings = load(app);
     settings.connections.insert(
         connection_id.to_string(),
         ConnectionEntry {
             store,
             repo_path: repo_root.to_string_lossy().to_string(),
+            plaintext_consented,
         },
     );
     save(app, &settings)
@@ -147,6 +165,7 @@ mod tests {
         ConnectionEntry {
             store: StoreKind::Plaintext,
             repo_path: repo_path.to_string(),
+            plaintext_consented: true,
         }
     }
 

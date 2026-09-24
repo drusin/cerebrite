@@ -31,6 +31,18 @@ use std::time::Duration;
 use anyhow::{Context, Result as AnyResult};
 use keyring_core::{CredentialStore, Entry};
 
+/// Code-review follow-up (ticket 02/04): the exact message every `connect_*`
+/// command in `lib.rs` returns when the keychain is unavailable/unusable and
+/// the caller didn't pass `allow_plaintext_fallback: true` -- matched
+/// verbatim by the frontend (`src/main.ts`) to route this specific failure
+/// into ticket 13's existing "Set up a keychain" / "Store as plaintext
+/// instead" consent dialog, rather than an ordinary error alert. Before this
+/// fix, every `connect_*` command silently stored the secret as plaintext
+/// the moment a keychain probe failed, with no consent prompt at all --
+/// ADR-0013 only ever intended plaintext as a *consented* fallback.
+pub const PLAINTEXT_CONSENT_REQUIRED: &str =
+    "No keychain is available on this device. Storing this credential requires explicit consent to save it as plaintext instead.";
+
 /// Service name every connection's keychain entry is filed under. The
 /// connection ID -- a random ID, never a secret itself -- is the
 /// per-entry "user" (see `KEYCHAIN_SERVICE` usage below).
@@ -336,19 +348,49 @@ impl PlaintextStore {
     }
 
     /// Writes (or overwrites) `connection_id`'s secret as a `0600` file.
+    ///
+    /// Code-review follow-up (ticket 02): this used to `fs::write` the
+    /// secret with the process' default (often world- or group-readable)
+    /// permissions and only restrict them to `0600` *afterward* -- a window
+    /// during which another local process/user could open the file while it
+    /// still had permissive permissions. The file is now created with
+    /// `0600` from the very first `open()` call (`OpenOptions::mode`, which
+    /// the kernel applies atomically at creation, masked by umask only when
+    /// *not* explicitly set -- setting it here means the requested mode
+    /// wins), so there is no window where the secret is readable by anyone
+    /// but the owner.
     pub fn set_secret(&self, connection_id: &str, secret: &[u8]) -> AnyResult<()> {
         fs::create_dir_all(&self.dir).context("creating credentials dir")?;
         let path = self.path_for(connection_id);
-        fs::write(&path, secret).with_context(|| format!("writing {}", path.display()))?;
+
         #[cfg(unix)]
         {
-            let mut perms = fs::metadata(&path)
-                .with_context(|| format!("reading permissions of {}", path.display()))?
-                .permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&path, perms)
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            // A pre-existing file (e.g. left over with looser permissions
+            // from before this fix) keeps whatever mode it already had --
+            // `create(true)` only applies the mode to a *new* file, per
+            // `OpenOptions::mode`'s documented Unix semantics -- so this
+            // still restricts it explicitly, but now *before* any secret
+            // bytes are written to it, not after.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("restricting permissions of {}", path.display()))?;
+            file.write_all(secret)
+                .with_context(|| format!("writing {}", path.display()))?;
         }
+        #[cfg(not(unix))]
+        {
+            fs::write(&path, secret).with_context(|| format!("writing {}", path.display()))?;
+        }
+
         Ok(())
     }
 

@@ -141,9 +141,9 @@ fn looks_like_a_legacy_root_vault(repo_root: &Path) -> bool {
     repo_root.join(".cerebrite").is_dir()
 }
 
-/// Moves every markdown page and the `.cerebrite/` directory currently
-/// sitting at `repo_root`'s root into a freshly created `vault_dir`, then
-/// commits the move as a single commit.
+/// Moves every markdown page (at any depth) and the `.cerebrite/` directory
+/// currently sitting at `repo_root`'s root into a freshly created
+/// `vault_dir`, then commits the move as a single commit.
 ///
 /// Doing every move as plain filesystem renames staged together in one
 /// commit (rather than as separate delete-then-add commits) is what keeps
@@ -152,28 +152,56 @@ fn looks_like_a_legacy_root_vault(repo_root: &Path) -> bool {
 /// single diff, not from any explicit "this was a rename" marker, so an
 /// old-path-deleted/new-path-added pair only registers as a rename when
 /// both sides land in the same commit.
+///
+/// Code-review follow-up (ticket 01): this used to `fs::read_dir` only
+/// `repo_root`'s *top level*, so a page organized under a subdirectory (e.g.
+/// `repo_root/journal/2024-01-01.md`) was silently left behind -- the
+/// top-level `journal` entry is a directory, not a `.md` file, and nothing
+/// ever descended into it to find what was inside. `WalkDir` (already a
+/// dependency, used the same way by `index.rs`) walks the whole tree
+/// instead, so a markdown page is found and moved regardless of how deeply
+/// it's nested, preserving its relative path (and therefore its
+/// subdirectory structure) under `vault_dir`.
 fn migrate_root_vault_into_subdirectory(repo_root: &Path, vault_dir: &Path) -> Result<()> {
     fs::create_dir_all(vault_dir).context("creating vault/ subdirectory")?;
 
-    for entry in fs::read_dir(repo_root).context("reading repository root")? {
-        let entry = entry.context("reading repository root entry")?;
-        let file_name = entry.file_name();
-
-        // Never touch git's own metadata or the vault/ directory itself
-        // (already handled/created above).
-        if file_name == ".git" || file_name == VAULT_SUBDIR {
+    let walker = walkdir::WalkDir::new(repo_root).min_depth(1).into_iter().filter_entry(|entry| {
+        let name = entry.file_name();
+        // Never descend into git's own metadata, the vault/ directory
+        // itself (already handled/created above), or `.cerebrite` (moved
+        // wholesale, as a single directory rename, below -- walking into it
+        // here would just re-discover its own files one at a time for no
+        // benefit, and ADR-0011 never creates it anywhere but the
+        // repository root).
+        name != ".git" && name != VAULT_SUBDIR && name != ".cerebrite"
+    });
+    for entry in walker {
+        let entry = entry.context("walking repository root")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
 
-        let path = entry.path();
-        let is_markdown_file = path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md");
-        let is_cerebrite_state = file_name == ".cerebrite";
-
-        if is_markdown_file || is_cerebrite_state {
-            let dest = vault_dir.join(&file_name);
-            fs::rename(&path, &dest)
-                .with_context(|| format!("moving '{}' into vault/", path.display()))?;
+        let relative = path
+            .strip_prefix(repo_root)
+            .context("computing a page's path relative to the repository root")?;
+        let dest = vault_dir.join(relative);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating '{}'", parent.display()))?;
         }
+        fs::rename(path, &dest).with_context(|| format!("moving '{}' into vault/", path.display()))?;
+    }
+
+    // `.cerebrite/`, if present, moves as a single directory rename (its
+    // contents are never walked individually above) -- ADR-0011 only ever
+    // creates it at the repository root, never nested.
+    let cerebrite_dir = repo_root.join(".cerebrite");
+    if cerebrite_dir.is_dir() {
+        fs::rename(&cerebrite_dir, vault_dir.join(".cerebrite"))
+            .with_context(|| format!("moving '{}' into vault/", cerebrite_dir.display()))?;
     }
 
     commit_all(repo_root, "Migrate vault into vault/ subdirectory (ADR-0011)")
@@ -241,6 +269,26 @@ pub fn commit_all(repo_root: &Path, message: &str) -> Result<()> {
         .context("creating commit")?;
 
     Ok(())
+}
+
+/// Whether `repo_root` currently has a commit author available anywhere in
+/// git's normal layered lookup (repo-local overriding global) -- exactly
+/// what `Repository::signature()` (and therefore `commit_all`) needs to
+/// actually succeed.
+///
+/// Code-review follow-up (ticket 08): lets a caller with optional,
+/// best-effort committing to do (`redirects::cleanup_and_prune`'s byproduct
+/// link-rewrite/redirect-prune commits, run unconditionally as part of
+/// every vault open) check first and skip attempting it, instead of hard
+/// failing the whole operation it's a byproduct of. `open_vault` must
+/// succeed regardless of whether an author has been confirmed yet on this
+/// device -- confirmation happens lazily, at first real-edit commit time,
+/// via `commit_author_prefill`/`confirm_commit_author`, which both need a
+/// vault already open to be reachable at all.
+pub fn has_commit_author(repo_root: &Path) -> bool {
+    git2::Repository::open(repo_root)
+        .map(|repo| repo.signature().is_ok())
+        .unwrap_or(false)
 }
 
 /// Ticket 10: which of the post-*clone* states a freshly cloned repository
@@ -517,6 +565,45 @@ mod tests {
                     == Some("vault/page.md".to_string())
         });
         assert!(renamed, "expected git to detect page.md -> vault/page.md as a rename");
+    }
+
+    #[test]
+    fn ensure_git_repo_migration_moves_pages_nested_in_subdirectories_too() {
+        // Code-review follow-up (ticket 01): the migration used to only
+        // `read_dir` the repository root, so a page organized under a
+        // subdirectory was silently left behind entirely -- never moved,
+        // never even looked at.
+        let dir = tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
+        fs::write(dir.path().join("page.md"), "---\nid: abc\ntitle: Page\n---\nBody.\n").unwrap();
+        fs::create_dir_all(dir.path().join("journal/2024")).unwrap();
+        fs::write(
+            dir.path().join("journal/entry.md"),
+            "---\nid: j1\ntitle: Entry\n---\nBody.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("journal/2024/deep.md"),
+            "---\nid: j2\ntitle: Deep Entry\n---\nBody.\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join(".cerebrite")).unwrap();
+        fs::write(dir.path().join(".cerebrite/redirects.tsv"), "").unwrap();
+        commit_all(dir.path(), "Initial commit").unwrap();
+
+        let vault_path = ensure_git_repo(dir.path()).unwrap();
+
+        assert!(vault_path.join("page.md").exists());
+        assert!(vault_path.join("journal/entry.md").exists());
+        assert!(vault_path.join("journal/2024/deep.md").exists());
+        assert!(vault_path.join(".cerebrite/redirects.tsv").exists());
+
+        // Nothing left behind at the old root-level locations.
+        assert!(!dir.path().join("page.md").exists());
+        assert!(!dir.path().join("journal/entry.md").exists());
+        assert!(!dir.path().join("journal/2024/deep.md").exists());
+        assert!(!dir.path().join(".cerebrite").exists());
     }
 
     #[test]

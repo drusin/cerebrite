@@ -367,13 +367,38 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
+/// Creates or repoints `repo_root`'s `origin` remote at `remote_url`.
+///
+/// Code-review follow-up (ticket 04 regression): every `connect_*` command
+/// (access token, SSH key, GitHub/GitLab OAuth) proves its credential with a
+/// *detached* `git2::Remote` (`sync::test_fetch`), which never touches
+/// `.git/config` -- so without this, a successful connect left the repo with
+/// no `origin` remote at all, and `sync::run_sync`'s `repo.find_remote
+/// ("origin")` would permanently report `SyncStatus::NoRemote` even though a
+/// Connection had just been persisted. Fixed once, here, so all four
+/// `connect_*` commands get it for free instead of each needing its own copy.
+fn configure_origin_remote(repo_root: &Path, remote_url: &str) -> Result<(), git2::Error> {
+    let repo = git2::Repository::open(repo_root)?;
+    let has_origin = repo.find_remote("origin").is_ok();
+    if has_origin {
+        repo.remote_set_url("origin", remote_url)
+    } else {
+        repo.remote("origin", remote_url).map(|_| ())
+    }
+}
+
 /// Sets up a new connection: proves `record`'s credential actually works
 /// against `remote_url` with a real (network) test fetch *before* writing
 /// anything -- neither `repo_root`'s `connection.json` nor the secret store.
 /// ADR-0012 / ticket 03 checklist: "No connection is persisted until a test
-/// fetch using its credential succeeds." On success, the secret is stored
-/// in the store the record declares and the record is written; on any
-/// failure, nothing is persisted at all.
+/// fetch using its credential succeeds." On success, `repo_root`'s `origin`
+/// remote is pointed at `remote_url`, the connection record is written, and
+/// then the secret is stored in the store the record declares -- the record
+/// is written *before* the secret (code-review follow-up, ticket 03: writing
+/// the secret first could orphan it if the record write then failed) so that
+/// if storing the secret fails, the record is deleted again (best-effort) and
+/// no half-persisted state survives; on any failure, nothing is persisted at
+/// all.
 ///
 /// `keychain` is `Option` (widened from ticket 03's original `&KeychainBackend`
 /// by ticket 04): a caller that has already probed `KeychainBackend::platform()`
@@ -397,21 +422,38 @@ pub fn try_connect(
 
     crate::sync::test_fetch(remote_url, &candidate, known_hosts_path).map_err(ConnectError::Fetch)?;
 
-    match record.credential_store {
+    configure_origin_remote(repo_root, remote_url)
+        .map_err(|e| ConnectError::Credential(CredentialError::Other(e.to_string())))?;
+
+    connection_record::write(repo_root, &record)
+        .map_err(|e| ConnectError::Credential(CredentialError::Other(e.to_string())))?;
+
+    let store_result = match record.credential_store {
         StoreKind::Keychain => keychain
             .ok_or_else(|| {
                 ConnectError::Credential(CredentialError::Unavailable(
                     "no keychain backend is available".to_string(),
                 ))
-            })?
-            .set_secret(&record.connection_id, &secret, urgency)
-            .map_err(ConnectError::Credential)?,
+            })
+            .and_then(|kc| {
+                kc.set_secret(&record.connection_id, &secret, urgency)
+                    .map_err(ConnectError::Credential)
+            }),
         StoreKind::Plaintext => plaintext
             .set_secret(&record.connection_id, &secret)
-            .map_err(|e| ConnectError::Credential(CredentialError::Other(e.to_string())))?,
+            .map_err(|e| ConnectError::Credential(CredentialError::Other(e.to_string()))),
+    };
+
+    if let Err(err) = store_result {
+        // The record was written but the secret wasn't -- clean up
+        // best-effort so no orphaned record is left referencing a secret
+        // that was never actually stored. A failure here is intentionally
+        // swallowed (not escalated): the original `err` is the one the
+        // caller needs to see, and there's nothing more useful to do than
+        // try.
+        let _ = connection_record::delete(repo_root);
+        return Err(err);
     }
-    connection_record::write(repo_root, &record)
-        .map_err(|e| ConnectError::Credential(CredentialError::Other(e.to_string())))?;
 
     Ok(candidate)
 }
@@ -679,6 +721,70 @@ mod tests {
             keychain.get_secret(&record.connection_id, CallUrgency::Interactive).unwrap(),
             b"a-token"
         );
+    }
+
+    // -- code-review follow-up (ticket 04): try_connect must leave a real
+    // `origin` remote behind, not just a connection record, since the test
+    // fetch itself only ever talks to a *detached* remote that never touches
+    // `.git/config`.
+
+    #[test]
+    fn try_connect_configures_an_origin_remote_so_background_sync_can_find_it() {
+        let repo_dir = tempdir().unwrap();
+        vault::ensure_git_repo(repo_dir.path()).unwrap();
+        crate::author::confirm_test_author(repo_dir.path());
+        fs::write(repo_dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
+        vault::commit_all(repo_dir.path(), "Create page").unwrap();
+
+        let bare_dir = tempdir().unwrap();
+        git2::Repository::init_bare(bare_dir.path()).unwrap();
+        // Push the vault's history to the bare repo out-of-band first (same
+        // as the sibling persist test) -- this is only setting up a remote
+        // that already has the vault's commits, not exercising try_connect's
+        // own remote wiring yet.
+        {
+            let repo = git2::Repository::open(repo_dir.path()).unwrap();
+            repo.remote("seed", bare_dir.path().to_str().unwrap()).unwrap();
+            let mut remote = repo.find_remote("seed").unwrap();
+            let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+            remote
+                .push(&[format!("refs/heads/{branch}:refs/heads/{branch}").as_str()], None)
+                .unwrap();
+            repo.remote_delete("seed").unwrap();
+        }
+
+        let config_dir = tempdir().unwrap();
+        let keychain = crate::credential::KeychainBackend::in_memory();
+        let plaintext = crate::credential::PlaintextStore::new(config_dir.path());
+
+        let mut record = access_token_record();
+        record.credential_store = StoreKind::Keychain;
+        let remote_url = bare_dir.path().to_str().unwrap().to_string();
+
+        try_connect(
+            repo_dir.path(),
+            Some(&keychain),
+            &plaintext,
+            record.clone(),
+            b"a-token".to_vec(),
+            &remote_url,
+            None,
+            CallUrgency::Interactive,
+        )
+        .unwrap();
+
+        // The bug this guards against: connect used to leave `.git/config`
+        // untouched entirely, so `find_remote("origin")` found nothing.
+        let repo = git2::Repository::open(repo_dir.path()).unwrap();
+        let origin = repo.find_remote("origin").expect("origin remote must be configured after connect");
+        assert_eq!(origin.url(), Some(remote_url.as_str()));
+
+        // And the actual symptom: a background `run_sync` must not report
+        // `NoRemote` any more -- it should actually reach the remote (using
+        // no credentials at all here, since the bare repo requires none) and
+        // sync cleanly.
+        let outcome = crate::sync::run_sync(repo_dir.path(), None, None).unwrap();
+        assert_ne!(outcome.status, crate::sync::SyncStatus::NoRemote);
     }
 
     // -- Connection::load --

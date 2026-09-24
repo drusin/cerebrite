@@ -734,6 +734,38 @@ fn credential_stores(app: &AppHandle) -> Result<(Option<credential::KeychainBack
     Ok((keychain, plaintext))
 }
 
+/// Code-review follow-up (ticket 02/04): shared by `connect_access_token`,
+/// `connect_ssh_key`, `connect_github_oauth`, and `connect_gitlab_oauth` --
+/// decides which store a *new* connection's secret goes into. Prefers the
+/// platform keychain when it's actually reachable and unlocked right now
+/// (not just "did `platform()` construct"); otherwise falls back to the
+/// consented plaintext store (ADR-0013) *only* when the caller passed
+/// `allow_plaintext_fallback: true`, and fails with
+/// `credential::PLAINTEXT_CONSENT_REQUIRED` otherwise.
+///
+/// Before this fix, every one of those four commands fell back to plaintext
+/// the instant a keychain probe failed, with no consent asked at all --
+/// ADR-0013's "consented plaintext as the only fallback" was never actually
+/// enforced on the initial-connect path (only ticket 13's *reconnect*
+/// dialog, `handleStoreAsPlaintextClick` in `main.ts`, asked first). The
+/// frontend now matches this exact error message to offer that same consent
+/// dialog before retrying with `allow_plaintext_fallback: true`.
+fn resolve_store_kind(
+    keychain: Option<&credential::KeychainBackend>,
+    allow_plaintext_fallback: bool,
+) -> Result<connection_record::StoreKind, String> {
+    let keychain_usable = keychain
+        .map(|kc| kc.probe(credential::CallUrgency::Interactive).is_ok())
+        .unwrap_or(false);
+    if keychain_usable {
+        Ok(connection_record::StoreKind::Keychain)
+    } else if allow_plaintext_fallback {
+        Ok(connection_record::StoreKind::Plaintext)
+    } else {
+        Err(credential::PLAINTEXT_CONSENT_REQUIRED.to_string())
+    }
+}
+
 /// Ticket 14 checklist item 1/2/3/4/5/8: "Disconnect" in Settings' Sync
 /// section. Deletes the currently open vault's stored secret, its
 /// `.git/cerebrite/connection.json`, and (best effort) its `origin` remote
@@ -799,18 +831,27 @@ fn scan_orphaned_connections(app: AppHandle) -> Vec<OrphanedConnection> {
 /// Ticket 14 checklist item 6, the cleanup half: deletes the stored secret
 /// (`provider_disconnect::delete_orphaned_secret` -- there is no
 /// `connection.json` left to read for an orphan, its repository is gone) and
-/// index entry for every currently orphaned connection. Best-effort and
-/// unconditional per entry (a secret that was already gone is still cleared
-/// from the index); returns how many entries were cleaned up.
+/// index entry for every currently orphaned connection. Returns how many
+/// entries were actually cleaned up.
+///
+/// Code-review follow-up (ticket 14): `delete_orphaned_secret` now reports
+/// whether it actually deleted the secret, and the index entry is only
+/// cleared when it did -- an entry whose secret deletion failed is left in
+/// place so a later cleanup attempt can retry it, rather than the index
+/// losing the only remaining record that an undeleted secret exists.
 #[tauri::command]
 fn cleanup_orphaned_connections(app: AppHandle) -> Result<usize, String> {
     let orphans = settings::load(&app).orphaned_connections();
     let (keychain, plaintext) = credential_stores(&app)?;
 
-    let count = orphans.len();
+    let mut count = 0;
     for (connection_id, entry) in orphans {
-        provider_disconnect::delete_orphaned_secret(keychain.as_ref(), &plaintext, &connection_id, entry.store);
-        let _ = settings::remove_connection(&app, &connection_id);
+        if provider_disconnect::delete_orphaned_secret(keychain.as_ref(), &plaintext, &connection_id, entry.store)
+            .is_ok()
+        {
+            let _ = settings::remove_connection(&app, &connection_id);
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -837,8 +878,7 @@ fn remove_all_stored_credentials(app: AppHandle) -> Result<Vec<String>, String> 
         let succeeded = if repo_path.exists() {
             provider_disconnect::disconnect_connection(repo_path, keychain.as_ref(), &plaintext, &gitlab_endpoints).is_ok()
         } else {
-            provider_disconnect::delete_orphaned_secret(keychain.as_ref(), &plaintext, connection_id, entry.store);
-            true
+            provider_disconnect::delete_orphaned_secret(keychain.as_ref(), &plaintext, connection_id, entry.store).is_ok()
         };
         if succeeded {
             let _ = settings::remove_connection(&app, connection_id);
@@ -916,13 +956,14 @@ fn confirm_commit_author(state: State<AppState>, name: String, email: String) ->
 /// background sync loop (`perform_sync` above) picks it up on its own with
 /// no further prompting.
 ///
-/// Store choice is a call this minimal command has to make on its own (no
-/// Settings-UI consent flow yet -- that's ticket 13): prefer the platform
-/// keychain, actually probed (not just "did `platform()` construct")
-/// so a reachable-but-locked keychain isn't mistaken for a usable one;
-/// fall back to the consented plaintext store (ADR-0013) whenever it isn't.
-/// A dedicated "keychain unavailable, store in plaintext instead?" prompt is
-/// deliberately out of this ticket's scope.
+/// Store choice: prefer the platform keychain, actually probed (not just
+/// "did `platform()` construct") so a reachable-but-locked keychain isn't
+/// mistaken for a usable one; fall back to the consented plaintext store
+/// (ADR-0013) only when the caller passes `allow_plaintext_fallback: true`
+/// (code-review follow-up, ticket 02 -- see `resolve_store_kind`'s doc
+/// comment). A caller that omits it gets
+/// `credential::PLAINTEXT_CONSENT_REQUIRED` back and is expected to prompt
+/// the user (ticket 13's existing consent dialog) before retrying.
 #[tauri::command]
 fn connect_access_token(
     app: AppHandle,
@@ -930,6 +971,7 @@ fn connect_access_token(
     remote_url: String,
     username: String,
     token: String,
+    allow_plaintext_fallback: bool,
 ) -> Result<(), String> {
     let remote_url = remote_url.trim().to_string();
     let username = username.trim().to_string();
@@ -947,10 +989,7 @@ fn connect_access_token(
     let plaintext = credential::PlaintextStore::new(&config_dir);
 
     let keychain = credential::KeychainBackend::platform().ok();
-    let store_kind = match &keychain {
-        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
-        _ => connection_record::StoreKind::Plaintext,
-    };
+    let store_kind = resolve_store_kind(keychain.as_ref(), allow_plaintext_fallback)?;
 
     let record = connection_record::ConnectionRecord {
         connection_id: uuid::Uuid::new_v4().to_string(),
@@ -977,7 +1016,7 @@ fn connect_access_token(
     // records which store this connection's secret ended up in, app-wide, so
     // a later cleanup/"remove all credentials" pass can find it without
     // walking every vault on disk.
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
 
     // The vault now has a working connection -- nudge the background sync
     // loop to try immediately rather than waiting for its next periodic
@@ -1065,6 +1104,7 @@ fn connect_ssh_key(
     remote_url: String,
     private_key_openssh: String,
     passphrase: Option<String>,
+    allow_plaintext_fallback: bool,
 ) -> Result<(), String> {
     let remote_url = remote_url.trim().to_string();
     if remote_url.is_empty() || private_key_openssh.trim().is_empty() {
@@ -1082,10 +1122,7 @@ fn connect_ssh_key(
     let known_hosts_path = credential::known_hosts_path(&config_dir).map_err(|e| e.to_string())?;
 
     let keychain = credential::KeychainBackend::platform().ok();
-    let store_kind = match &keychain {
-        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
-        _ => connection_record::StoreKind::Plaintext,
-    };
+    let store_kind = resolve_store_kind(keychain.as_ref(), allow_plaintext_fallback)?;
 
     let secret = ssh_key::SshSecret {
         private_key_openssh,
@@ -1113,7 +1150,7 @@ fn connect_ssh_key(
     )
     .map_err(|e| e.to_string())?;
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::SshKey);
@@ -1236,6 +1273,7 @@ fn connect_github_oauth(
     access_token: String,
     refresh_token: String,
     access_token_expires_at: String,
+    allow_plaintext_fallback: bool,
 ) -> Result<OauthConnectResult, String> {
     let remote_url = remote_url.trim().to_string();
     if remote_url.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
@@ -1252,10 +1290,7 @@ fn connect_github_oauth(
     let plaintext = credential::PlaintextStore::new(&config_dir);
 
     let keychain = credential::KeychainBackend::platform().ok();
-    let store_kind = match &keychain {
-        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
-        _ => connection_record::StoreKind::Plaintext,
-    };
+    let store_kind = resolve_store_kind(keychain.as_ref(), allow_plaintext_fallback)?;
 
     let record = connection_record::ConnectionRecord {
         connection_id: uuid::Uuid::new_v4().to_string(),
@@ -1283,7 +1318,7 @@ fn connect_github_oauth(
     )
     .map_err(|e| e.to_string())?;
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
@@ -1378,6 +1413,7 @@ fn connect_gitlab_oauth(
     access_token: String,
     refresh_token: Option<String>,
     access_token_expires_at: String,
+    allow_plaintext_fallback: bool,
 ) -> Result<OauthConnectResult, String> {
     let remote_url = remote_url.trim().to_string();
     if remote_url.is_empty() || access_token.is_empty() {
@@ -1394,10 +1430,7 @@ fn connect_gitlab_oauth(
     let plaintext = credential::PlaintextStore::new(&config_dir);
 
     let keychain = credential::KeychainBackend::platform().ok();
-    let store_kind = match &keychain {
-        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
-        _ => connection_record::StoreKind::Plaintext,
-    };
+    let store_kind = resolve_store_kind(keychain.as_ref(), allow_plaintext_fallback)?;
 
     let record = connection_record::ConnectionRecord {
         connection_id: uuid::Uuid::new_v4().to_string(),
@@ -1425,7 +1458,7 @@ fn connect_gitlab_oauth(
     )
     .map_err(|e| e.to_string())?;
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
@@ -1779,7 +1812,14 @@ fn clone_and_open_vault(
     *state.sync_tx.lock().unwrap() = Some(tx);
     spawn_sync_loop(app.clone(), vault_path.clone(), repo_root.clone(), rx);
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
+    // This guided-clone path (ticket 10) doesn't yet collect the explicit
+    // `allow_plaintext_fallback` consent the four ordinary `connect_*`
+    // commands now require (code-review follow-up, ticket 02) -- out of
+    // scope for that follow-up, tracked as a separate gap rather than fixed
+    // here. `plaintext_consented: false` is the honest value either way: no
+    // consent was actually asked for on this path.
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, false)
+        .map_err(|e| e.to_string())?;
     notify_sync(&state);
 
     // Ticket 10 checklist: "Wizard ends on the 'Commit as' step, prefilled
@@ -2550,6 +2590,38 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // -- code-review follow-up (ticket 02/04): resolve_store_kind, the
+    // shared plaintext-consent gate every connect_* command now goes
+    // through instead of silently falling back to plaintext. --
+
+    #[test]
+    fn resolve_store_kind_prefers_a_usable_keychain_regardless_of_consent() {
+        let keychain = credential::KeychainBackend::in_memory();
+        assert_eq!(
+            resolve_store_kind(Some(&keychain), false).unwrap(),
+            connection_record::StoreKind::Keychain
+        );
+        assert_eq!(
+            resolve_store_kind(Some(&keychain), true).unwrap(),
+            connection_record::StoreKind::Keychain
+        );
+    }
+
+    #[test]
+    fn resolve_store_kind_refuses_plaintext_fallback_without_explicit_consent() {
+        // No keychain backend at all (e.g. `KeychainBackend::platform()`
+        // found nothing reachable) and the caller didn't consent -- must be
+        // refused, not silently downgraded to plaintext.
+        let result = resolve_store_kind(None, false);
+        assert!(matches!(result, Err(msg) if msg == credential::PLAINTEXT_CONSENT_REQUIRED));
+    }
+
+    #[test]
+    fn resolve_store_kind_falls_back_to_plaintext_once_consent_is_given() {
+        let result = resolve_store_kind(None, true);
+        assert_eq!(result.unwrap(), connection_record::StoreKind::Plaintext);
+    }
 
     /// Builds an `AppState` over a fresh git-repo vault at `dir`, with the
     /// derived index built from whatever `.md` files already exist there --
