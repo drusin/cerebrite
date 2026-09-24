@@ -7,9 +7,11 @@
 //
 // Scope (per the ticket): CONNECT only -- attaching a remote to an
 // already-open local vault. Cloning a fresh vault from a remote is ticket
-// 10's job, not this one. "Switch to manual setup" is a stub here (ticket
-// 11 wires up a real standalone flow); `reset` is this module's stand-in for
-// it.
+// 10's job, not this one. "Switch to manual setup" (ticket 11) is the
+// `switchToManual` action below -- accepted from every step, transitioning
+// to the terminal `switchedToManual` step; main.ts treats that like `done`
+// for closing this wizard's own chrome, except it opens Settings' "Sync"
+// section instead of finishing normally.
 //
 // # Testing
 //
@@ -61,7 +63,16 @@ export type WizardStep =
   /** Ticket 08's "Commit as" step -- always the wizard's last step before it reports completion. */
   | "commitAuthor"
   /** Terminal: the wizard is done and should close. */
-  | "done";
+  | "done"
+  /**
+   * Terminal (ticket 11): the user clicked "Switch to manual setup" from
+   * *any* step -- the caller (main.ts) treats this exactly like `done` for
+   * closing the wizard's own chrome, except it opens Settings' always-visible
+   * "Sync" section (carrying over `remoteUrl`, if one was already committed)
+   * instead of finishing normally. Kept as its own step rather than reusing
+   * `done` so the two outcomes stay distinguishable to a caller/test.
+   */
+  | "switchedToManual";
 
 export interface WizardState {
   step: WizardStep;
@@ -107,7 +118,16 @@ export type WizardAction =
   | { type: "retry" }
   | { type: "commitAuthorConfirmed" }
   | { type: "back" }
-  | { type: "reset" };
+  | { type: "reset" }
+  /**
+   * Ticket 11's "Switch to manual setup" escape hatch -- accepted from
+   * *every* step (unlike every other action here, which is only honored
+   * from the specific step(s) it makes sense for), because the whole point
+   * is that it's always reachable. Handled at the very top of
+   * `reduceWizard`, before the step-specific switch, so no per-step branch
+   * needs to remember to allow it.
+   */
+  | { type: "switchToManual" };
 
 /**
  * The pure transition function -- every step change in the wizard goes
@@ -118,6 +138,14 @@ export type WizardAction =
  * resolving after the user clicked "back") can't corrupt the wizard.
  */
 export function reduceWizard(state: WizardState, action: WizardAction): WizardState {
+  // Ticket 11: checked before the step-specific switch below so it's
+  // reachable from literally every step, including ones added in the
+  // future -- the opposite of every other action here, which is ignored
+  // outside its one or two valid steps.
+  if (action.type === "switchToManual") {
+    return { ...state, step: "switchedToManual" };
+  }
+
   switch (action.type) {
     case "chooseHasRepo":
       return { ...state, hasRepo: action.hasRepo, step: "providerChoice" };
@@ -238,6 +266,8 @@ function previousStep(state: WizardState): WizardStep {
       return "commitAuthor"; // connecting already succeeded -- nothing to undo
     case "done":
       return "done";
+    case "switchedToManual":
+      return "switchedToManual"; // terminal, same as "done" -- back is hidden by then
   }
 }
 
@@ -249,4 +279,9 @@ export function isBusyStep(step: WizardStep): boolean {
 /** Whether the wizard has reached its terminal "close me" state. */
 export function isDone(state: WizardState): boolean {
   return state.step === "done";
+}
+
+/** Whether the wizard has been switched to ticket 11's manual setup form -- the caller should close the wizard's own chrome and open Settings' "Sync" section instead of treating this as a normal `isDone` completion. */
+export function isSwitchedToManual(state: WizardState): boolean {
+  return state.step === "switchedToManual";
 }

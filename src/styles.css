@@ -208,7 +208,10 @@ body {
 
 .clone-wizard-footer {
   display: flex;
-  justify-content: flex-start;
+  /* Ticket 11: "Back" (left) and "Switch to manual setup" (right) --
+     same space-between layout as `.connect-wizard-footer`'s back/manual
+     pair, now that this footer carries two buttons instead of one. */
+  justify-content: space-between;
   margin-top: 1em;
   padding-top: 0.75em;
   border-top: 1px solid var(--modal-border);

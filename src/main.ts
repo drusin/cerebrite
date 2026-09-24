@@ -50,6 +50,7 @@ import {
   reduceWizard,
   initialWizardState,
   isDone as isWizardDone,
+  isSwitchedToManual as isWizardSwitchedToManual,
   isBusyStep,
   type WizardState,
   type WizardAction,
@@ -59,6 +60,7 @@ import {
   reduceCloneWizard,
   initialCloneWizardState,
   isCloneWizardDone,
+  isCloneWizardSwitchedToManual,
   isCloneWizardBusyStep,
   type CloneWizardState,
   type CloneWizardAction,
@@ -92,6 +94,39 @@ const cloneWizardOverlayEl = document.querySelector<HTMLElement>("#clone-wizard-
 const cloneWizardBodyEl = document.querySelector<HTMLElement>("#clone-wizard-body");
 const cloneWizardCloseButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-close-button");
 const cloneWizardBackButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-back-button");
+const cloneWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-manual-button");
+
+// Ticket 11: the standalone "git clone" manual form's DOM handles --
+// reachable from the first-run screen (`cloneManualOpenButtonEl`) and from
+// the guided clone wizard's own "Switch to manual setup" link.
+const cloneManualOpenButtonEl = document.querySelector<HTMLButtonElement>("#clone-manual-open-button");
+const cloneManualOverlayEl = document.querySelector<HTMLElement>("#clone-manual-overlay");
+const cloneManualCloseButtonEl = document.querySelector<HTMLButtonElement>("#clone-manual-close-button");
+const cloneManualUrlEl = document.querySelector<HTMLInputElement>("#clone-manual-url");
+const cloneManualDestinationEl = document.querySelector<HTMLInputElement>("#clone-manual-destination");
+const cloneManualDestinationButtonEl = document.querySelector<HTMLButtonElement>("#clone-manual-destination-button");
+const cloneManualCredentialKindEl = document.querySelector<HTMLSelectElement>("#clone-manual-credential-kind");
+const cloneManualTokenUsernameEl = document.querySelector<HTMLInputElement>("#clone-manual-token-username");
+const cloneManualTokenValueEl = document.querySelector<HTMLInputElement>("#clone-manual-token-value");
+const cloneManualSshKeyGenerateButtonEl = document.querySelector<HTMLButtonElement>(
+  "#clone-manual-sshkey-generate-button",
+);
+const cloneManualSshKeyImportButtonEl = document.querySelector<HTMLButtonElement>(
+  "#clone-manual-sshkey-import-button",
+);
+const cloneManualSshKeyStatusEl = document.querySelector<HTMLElement>("#clone-manual-sshkey-status");
+const cloneManualGithubSigninButtonEl = document.querySelector<HTMLButtonElement>(
+  "#clone-manual-github-signin-button",
+);
+const cloneManualGithubDeviceCodeEl = document.querySelector<HTMLElement>("#clone-manual-github-device-code");
+const cloneManualGithubStatusEl = document.querySelector<HTMLElement>("#clone-manual-github-status");
+const cloneManualGitlabSigninButtonEl = document.querySelector<HTMLButtonElement>(
+  "#clone-manual-gitlab-signin-button",
+);
+const cloneManualGitlabDeviceCodeEl = document.querySelector<HTMLElement>("#clone-manual-gitlab-device-code");
+const cloneManualGitlabStatusEl = document.querySelector<HTMLElement>("#clone-manual-gitlab-status");
+const cloneManualSubmitButtonEl = document.querySelector<HTMLButtonElement>("#clone-manual-submit-button");
+const cloneManualStatusEl = document.querySelector<HTMLElement>("#clone-manual-status");
 
 const workspaceEl = document.querySelector<HTMLElement>("#workspace");
 const sidebarEl = document.querySelector<HTMLElement>("#sidebar");
@@ -140,6 +175,17 @@ const settingsConnectUsernameEl = document.querySelector<HTMLInputElement>("#set
 const settingsConnectTokenEl = document.querySelector<HTMLInputElement>("#settings-connect-token");
 const settingsConnectButtonEl = document.querySelector<HTMLButtonElement>("#settings-connect-button");
 const settingsConnectStatusEl = document.querySelector<HTMLElement>("#settings-connect-status");
+
+// Ticket 11: the always-visible "Sync" section's credential-kind selector
+// (shows/hides the sub-form matching the selected `data-sync-kind`), plus
+// the new raw SSH key sub-form (tickets 04/06/07 already had a raw Settings
+// form; ticket 05 only had the guided wizard's until now).
+const syncCredentialKindEl = document.querySelector<HTMLSelectElement>("#sync-credential-kind");
+const settingsSshKeyUrlEl = document.querySelector<HTMLInputElement>("#settings-sshkey-url");
+const settingsSshKeyGenerateButtonEl = document.querySelector<HTMLButtonElement>("#settings-sshkey-generate-button");
+const settingsSshKeyImportButtonEl = document.querySelector<HTMLButtonElement>("#settings-sshkey-import-button");
+const settingsSshKeyConnectButtonEl = document.querySelector<HTMLButtonElement>("#settings-sshkey-connect-button");
+const settingsSshKeyStatusEl = document.querySelector<HTMLElement>("#settings-sshkey-status");
 
 // Ticket 06: minimal "Sign in with GitHub" device-flow UI elements.
 const settingsGithubFormEl = document.querySelector<HTMLFormElement>("#settings-github-form");
@@ -1347,6 +1393,104 @@ async function handleGitlabFormSubmit(event: SubmitEvent) {
   }
 }
 
+// --- Ticket 11: the always-visible "Sync" section's credential-kind toggle
+// and its new raw SSH key sub-form ------------------------------------------
+//
+// The access-token/GitHub/GitLab sub-forms (tickets 04/06/07) are reused
+// completely unchanged -- only the SSH key sub-form (mirroring ticket 05's
+// generate/import/connect commands, the same way the guided wizard's own SSH
+// step already does) is new here.
+
+/** Shows the sub-form matching `#sync-credential-kind`'s current value, hides the other three -- called on `change` and once at startup. */
+function updateSyncSubformVisibility() {
+  const kind = syncCredentialKindEl?.value ?? "accessToken";
+  document.querySelectorAll<HTMLElement>("#sync-section .sync-subform").forEach((subform) => {
+    subform.hidden = subform.dataset.syncKind !== kind;
+  });
+}
+
+/** Holds the generated/imported key between "Generate"/"Import" and "Connect" -- mirrors `wizardSshKey`. */
+let settingsSshKey: SshKeyInfo | null = null;
+
+async function handleSettingsSshKeyGenerateClick() {
+  if (!settingsSshKeyStatusEl) return;
+  settingsSshKeyStatusEl.textContent = "Generating…";
+  settingsSshKeyStatusEl.removeAttribute("hidden");
+  try {
+    settingsSshKey = await generateSshKey();
+    settingsSshKeyStatusEl.textContent =
+      `Key ready (fingerprint ${settingsSshKey.fingerprintSha256}). Add the public key to your provider, then Connect.`;
+  } catch (err) {
+    settingsSshKeyStatusEl.textContent = String(err);
+  }
+}
+
+/** Same `window.prompt`-based import as the guided wizard's `handleWizardImportSshKey`. */
+async function handleSettingsSshKeyImportClick() {
+  if (!settingsSshKeyStatusEl) return;
+  const privateKeyOpenssh = window.prompt("Paste the private key (OpenSSH format):");
+  if (privateKeyOpenssh === null || !privateKeyOpenssh.trim()) return;
+  const passphrase = window.prompt("Passphrase (leave blank if none):") ?? undefined;
+
+  settingsSshKeyStatusEl.textContent = "Importing…";
+  settingsSshKeyStatusEl.removeAttribute("hidden");
+  try {
+    settingsSshKey = await importSshKey(privateKeyOpenssh, passphrase || undefined);
+    settingsSshKeyStatusEl.textContent =
+      `Key imported (fingerprint ${settingsSshKey.fingerprintSha256}). Add the public key to your provider, then Connect.`;
+  } catch (err) {
+    settingsSshKeyStatusEl.textContent = String(err);
+  }
+}
+
+/** Calls `connectSshKey` directly -- the exact same command/test-fetch-then-persist gate ticket 05 and the guided wizard's SSH step already use. */
+async function handleSettingsSshKeyConnectClick() {
+  if (!settingsSshKeyUrlEl || !settingsSshKeyStatusEl) return;
+  const remoteUrl = settingsSshKeyUrlEl.value.trim();
+  if (!remoteUrl) {
+    settingsSshKeyStatusEl.textContent = "Enter the repository's URL first.";
+    settingsSshKeyStatusEl.removeAttribute("hidden");
+    return;
+  }
+  if (!settingsSshKey) {
+    settingsSshKeyStatusEl.textContent = "Generate (or import) a key first.";
+    settingsSshKeyStatusEl.removeAttribute("hidden");
+    return;
+  }
+
+  settingsSshKeyConnectButtonEl?.setAttribute("disabled", "");
+  settingsSshKeyStatusEl.textContent = "Connecting…";
+  settingsSshKeyStatusEl.removeAttribute("hidden");
+  try {
+    await connectSshKey(remoteUrl, settingsSshKey.privateKeyOpenssh, settingsSshKey.passphrase);
+    settingsSshKeyStatusEl.textContent = "Connected.";
+  } catch (err) {
+    settingsSshKeyStatusEl.textContent = String(err);
+  } finally {
+    settingsSshKeyConnectButtonEl?.removeAttribute("disabled");
+  }
+}
+
+/**
+ * Ticket 11's carry-over into the manual "Sync" section: prefills every
+ * sub-form's own repository URL field with `remoteUrl` (whatever the wizard
+ * had already committed, if anything) so the user doesn't have to retype a
+ * URL they already entered, even though which sub-form ends up visible
+ * depends on the credential kind they pick next. Per the ticket, re-asking
+ * for a credential is an accepted limitation -- this just avoids re-asking
+ * for the URL too, where it's cheap to.
+ */
+function openSyncManualForm(remoteUrl: string) {
+  openSettingsModal();
+  if (remoteUrl) {
+    if (settingsConnectUrlEl) settingsConnectUrlEl.value = remoteUrl;
+    if (settingsSshKeyUrlEl) settingsSshKeyUrlEl.value = remoteUrl;
+    if (settingsGithubUrlEl) settingsGithubUrlEl.value = remoteUrl;
+    if (settingsGitlabUrlEl) settingsGitlabUrlEl.value = remoteUrl;
+  }
+  document.getElementById("sync-section")?.scrollIntoView({ block: "start" });
+}
+
 function openSettingsModal() {
   if (!settingsModalOverlayEl) return;
   if (settingsVaultPathEl) settingsVaultPathEl.textContent = currentVaultPath ?? "";
@@ -1459,6 +1603,14 @@ function el<K extends keyof HTMLElementTagNameMap>(
 
 function dispatchWizard(action: WizardAction) {
   wizardState = reduceWizard(wizardState, action);
+  if (isWizardSwitchedToManual(wizardState)) {
+    // Ticket 11: close this wizard's own chrome and open the "Sync" section
+    // instead of rendering a step -- reads `wizardState.remoteUrl` before
+    // it's reset by the next `openConnectWizard`, same as `closeConnectWizard`
+    // below leaves it alone until then.
+    handleWizardManualSetupClick();
+    return;
+  }
   renderWizardStep();
   if (isWizardDone(wizardState)) {
     closeConnectWizard();
@@ -1485,18 +1637,16 @@ function closeConnectWizard() {
 }
 
 /**
- * Ticket 09's stub for ticket 11's "Switch to manual setup" escape hatch:
- * every step carries this link, but the real standalone manual flow is
- * ticket 11's job. For now it just closes the wizard back to Settings' own
- * raw connect sections (tickets 04/06/07), which already work end to end.
+ * Ticket 11's "Switch to manual setup" escape hatch: closes this wizard's
+ * own chrome and opens Settings' always-visible "Sync" section instead,
+ * carrying over `wizardState.remoteUrl` if the wizard had already committed
+ * one (a pasted/created/picked repository URL) -- see `openSyncManualForm`'s
+ * doc comment for what "carrying over" does and doesn't cover.
  */
-async function handleWizardManualSetupClick() {
-  await messageDialog(
-    "Manual setup isn't a separate flow yet -- use the \"Connect a git remote\" / \"Sign in with GitHub\" / " +
-      "\"Sign in with GitLab\" sections below instead.",
-    { title: "Switch to manual setup", kind: "info" },
-  );
+function handleWizardManualSetupClick() {
+  const remoteUrl = wizardState.remoteUrl ?? "";
   closeConnectWizard();
+  openSyncManualForm(remoteUrl);
 }
 
 function providerLabel(provider: WizardProvider | null): string {
@@ -2092,6 +2242,12 @@ let cloneWizardGeneration = 0;
 
 function dispatchCloneWizard(action: CloneWizardAction) {
   cloneWizardState = reduceCloneWizard(cloneWizardState, action);
+  if (isCloneWizardSwitchedToManual(cloneWizardState)) {
+    // Ticket 11: tear down the full-screen wizard and open the standalone
+    // "git clone" dialog instead of rendering a step.
+    handleCloneWizardManualSetupClick();
+    return;
+  }
   renderCloneWizardStep();
   if (isCloneWizardDone(cloneWizardState)) {
     // The clone already opened the vault (server side) -- swap the
@@ -2100,6 +2256,21 @@ function dispatchCloneWizard(action: CloneWizardAction) {
     closeCloneWizard();
     void finishCloneWizardIntoWorkspace();
   }
+}
+
+/**
+ * Ticket 11's "Switch to manual setup" escape hatch for the clone wizard:
+ * tears down the full-screen surface (back to the first-run folder-picker,
+ * same as `closeCloneWizard` normally does) and opens the standalone
+ * "git clone" dialog, carrying over `remoteUrl`/`destination` if either was
+ * already committed -- same accepted "may re-ask for values" limitation as
+ * the connect wizard's equivalent, per ticket 08's answer.
+ */
+function handleCloneWizardManualSetupClick() {
+  const remoteUrl = cloneWizardState.remoteUrl ?? "";
+  const destination = cloneWizardState.destination ?? "";
+  closeCloneWizard();
+  openCloneManualDialog(remoteUrl, destination);
 }
 
 async function finishCloneWizardIntoWorkspace() {
@@ -2625,6 +2796,281 @@ async function renderCloneCommitAuthorStep() {
   cloneWizardBodyEl.appendChild(errorEl);
 }
 
+// --- Ticket 11: the standalone "git clone" manual dialog -------------------
+//
+// Variant B's raw-git-vocabulary door into `clone_and_open_vault` (ticket
+// 10) -- reachable with no vault/Settings surface to anchor it to (the
+// first-run screen's own link), and from the guided clone wizard's
+// persistent "Switch to manual setup" link. Same shape as the Sync section
+// above: a credential-kind selector reveals one of four sub-forms, each
+// calling the same device-flow/key/token mechanisms tickets 04-07 already
+// expose, and the actual `cloneAndOpenVault` call is the same real
+// test-fetch-then-persist gate the guided wizard uses -- nothing here
+// bypasses it.
+
+let cloneManualGithubToken: { accessToken: string; refreshToken: string; accessTokenExpiresAt: string } | null =
+  null;
+let cloneManualGitlabToken: { accessToken: string; refreshToken?: string; accessTokenExpiresAt: string } | null =
+  null;
+let cloneManualSshKey: SshKeyInfo | null = null;
+/** Bumped on every open/close so a stale device-flow poll loop from a previous attempt can tell it's been abandoned -- same pattern as `wizardGeneration`/`cloneWizardGeneration`. */
+let cloneManualGeneration = 0;
+
+function updateCloneManualSubformVisibility() {
+  const kind = cloneManualCredentialKindEl?.value ?? "accessToken";
+  document.querySelectorAll<HTMLElement>("#clone-manual-dialog .sync-subform").forEach((subform) => {
+    subform.hidden = subform.dataset.cloneKind !== kind;
+  });
+}
+
+function resetCloneManualStatuses() {
+  for (const statusEl of [cloneManualStatusEl, cloneManualSshKeyStatusEl, cloneManualGithubStatusEl, cloneManualGitlabStatusEl]) {
+    if (!statusEl) continue;
+    statusEl.textContent = "";
+    statusEl.setAttribute("hidden", "");
+  }
+  cloneManualGithubDeviceCodeEl?.setAttribute("hidden", "");
+  cloneManualGitlabDeviceCodeEl?.setAttribute("hidden", "");
+}
+
+function showCloneManualError(message: string) {
+  if (!cloneManualStatusEl) return;
+  cloneManualStatusEl.textContent = message;
+  cloneManualStatusEl.removeAttribute("hidden");
+}
+
+/** Opens the dialog fresh, optionally prefilled (ticket 11's wizard-switch carry-over) with a remote URL and/or destination already committed elsewhere. */
+function openCloneManualDialog(prefillRemoteUrl = "", prefillDestination = "") {
+  if (!cloneManualOverlayEl) return;
+  cloneManualGeneration += 1;
+  cloneManualGithubToken = null;
+  cloneManualGitlabToken = null;
+  cloneManualSshKey = null;
+  if (cloneManualUrlEl) cloneManualUrlEl.value = prefillRemoteUrl;
+  if (cloneManualDestinationEl) cloneManualDestinationEl.value = prefillDestination;
+  if (cloneManualCredentialKindEl) cloneManualCredentialKindEl.value = "accessToken";
+  if (cloneManualTokenUsernameEl) cloneManualTokenUsernameEl.value = "";
+  if (cloneManualTokenValueEl) cloneManualTokenValueEl.value = "";
+  updateCloneManualSubformVisibility();
+  resetCloneManualStatuses();
+  cloneManualOverlayEl.removeAttribute("hidden");
+}
+
+function closeCloneManualDialog() {
+  cloneManualGeneration += 1; // invalidates any in-flight poll loop/clone
+  cloneManualOverlayEl?.setAttribute("hidden", "");
+}
+
+async function handleCloneManualDestinationClick() {
+  try {
+    const path = await pickVaultFolder();
+    if (!path) return; // user cancelled
+    if (cloneManualDestinationEl) cloneManualDestinationEl.value = path;
+  } catch (err) {
+    showCloneManualError(String(err));
+  }
+}
+
+async function handleCloneManualSshKeyGenerateClick() {
+  if (!cloneManualSshKeyStatusEl) return;
+  cloneManualSshKeyStatusEl.textContent = "Generating…";
+  cloneManualSshKeyStatusEl.removeAttribute("hidden");
+  try {
+    cloneManualSshKey = await generateSshKey();
+    cloneManualSshKeyStatusEl.textContent =
+      `Key ready (fingerprint ${cloneManualSshKey.fingerprintSha256}). Add the public key to your provider, then Clone.`;
+  } catch (err) {
+    cloneManualSshKeyStatusEl.textContent = String(err);
+  }
+}
+
+async function handleCloneManualSshKeyImportClick() {
+  if (!cloneManualSshKeyStatusEl) return;
+  const privateKeyOpenssh = window.prompt("Paste the private key (OpenSSH format):");
+  if (privateKeyOpenssh === null || !privateKeyOpenssh.trim()) return;
+  const passphrase = window.prompt("Passphrase (leave blank if none):") ?? undefined;
+
+  cloneManualSshKeyStatusEl.textContent = "Importing…";
+  cloneManualSshKeyStatusEl.removeAttribute("hidden");
+  try {
+    cloneManualSshKey = await importSshKey(privateKeyOpenssh, passphrase || undefined);
+    cloneManualSshKeyStatusEl.textContent =
+      `Key imported (fingerprint ${cloneManualSshKey.fingerprintSha256}). Add the public key to your provider, then Clone.`;
+  } catch (err) {
+    cloneManualSshKeyStatusEl.textContent = String(err);
+  }
+}
+
+/** The device-flow sign-in shared shape (tickets 06/07), landing in `cloneManualGithubToken`/`cloneManualGitlabToken` instead of dispatching a wizard action -- this dialog has no reducer of its own to drive. */
+async function runCloneManualOauthSignIn(provider: "github" | "gitlab") {
+  const signinButtonEl = provider === "github" ? cloneManualGithubSigninButtonEl : cloneManualGitlabSigninButtonEl;
+  const deviceCodeEl = provider === "github" ? cloneManualGithubDeviceCodeEl : cloneManualGitlabDeviceCodeEl;
+  const statusEl = provider === "github" ? cloneManualGithubStatusEl : cloneManualGitlabStatusEl;
+  if (!statusEl) return;
+  const label = provider === "github" ? "GitHub" : "GitLab";
+  const generation = cloneManualGeneration;
+
+  const setStatus = (text: string) => {
+    statusEl.textContent = text;
+    statusEl.removeAttribute("hidden");
+  };
+
+  signinButtonEl?.setAttribute("disabled", "");
+  deviceCodeEl?.setAttribute("hidden", "");
+  try {
+    setStatus(`Requesting a device code from ${label}…`);
+    const device = provider === "github" ? await startGithubDeviceFlow() : await startGitlabDeviceFlow();
+    if (generation !== cloneManualGeneration) return;
+
+    if (deviceCodeEl) {
+      deviceCodeEl.innerHTML = "";
+      const link = el("a", undefined, device.verificationUri);
+      link.href = device.verificationUri;
+      link.target = "_blank";
+      link.rel = "noopener";
+      const codeText = el("p");
+      codeText.appendChild(document.createTextNode("Go to "));
+      codeText.appendChild(link);
+      codeText.appendChild(document.createTextNode(" and enter code: "));
+      codeText.appendChild(el("strong", undefined, device.userCode));
+      deviceCodeEl.appendChild(codeText);
+      deviceCodeEl.removeAttribute("hidden");
+    }
+    setStatus("Waiting for you to approve in the browser…");
+
+    const deadline = Date.now() + device.expiresInSecs * 1000;
+    let intervalMs = Math.max(device.intervalSecs, 1) * 1000;
+
+    // Declared as one shared union-typed triple (same shape `runCloneOauthSignIn`
+    // above uses) rather than branching on `provider` inside the loop, so
+    // `refreshToken`'s type (required for GitHub, optional for GitLab) stays
+    // whatever the poll result actually reported instead of being narrowed
+    // away by an `if (provider === ...)` TypeScript can't tie back to it.
+    let accessToken: string;
+    let refreshToken: string | undefined;
+    let accessTokenExpiresAt: string;
+
+    for (;;) {
+      if (generation !== cloneManualGeneration) return;
+      if (Date.now() >= deadline) throw new Error(`The ${label} sign-in code expired before it was confirmed.`);
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      if (generation !== cloneManualGeneration) return;
+
+      const result =
+        provider === "github" ? await pollGithubDeviceFlow(device.deviceCode) : await pollGitlabDeviceFlow(device.deviceCode);
+      if (result.outcome === "pending") continue;
+      if (result.outcome === "slowDown") {
+        intervalMs += 5000;
+        continue;
+      }
+      if (result.outcome === "denied") throw new Error(`${label} sign-in was denied.`);
+      if (result.outcome === "expired") throw new Error(`The ${label} sign-in code expired before it was confirmed.`);
+      if (result.outcome === "error") throw new Error(result.message);
+
+      accessToken = result.accessToken;
+      refreshToken = result.refreshToken;
+      accessTokenExpiresAt = result.accessTokenExpiresAt;
+      break;
+    }
+
+    if (provider === "github") {
+      cloneManualGithubToken = { accessToken, refreshToken: refreshToken ?? "", accessTokenExpiresAt };
+    } else {
+      cloneManualGitlabToken = { accessToken, refreshToken, accessTokenExpiresAt };
+    }
+
+    deviceCodeEl?.setAttribute("hidden", "");
+    setStatus("Signed in. Click Clone to continue.");
+  } catch (err) {
+    deviceCodeEl?.setAttribute("hidden", "");
+    setStatus(String(err));
+  } finally {
+    signinButtonEl?.removeAttribute("disabled");
+  }
+}
+
+/**
+ * Ticket 11 checklist item 4: the same test-fetch-before-save gate as every
+ * other door into these mechanisms -- this just builds whichever
+ * `CloneCredential` the selected kind needs (identical union `performClone`
+ * above builds from the guided wizard's own state) and calls
+ * `cloneAndOpenVault` directly. A failure leaves the dialog open with
+ * nothing persisted; success tears the dialog down, opens the workspace, and
+ * opens Settings so the user can confirm ticket 08's "Commit as" step (the
+ * Settings modal already shows it, prefilled -- no separate step needed
+ * here).
+ */
+async function handleCloneManualSubmitClick() {
+  if (!cloneManualUrlEl || !cloneManualDestinationEl) return;
+  const remoteUrl = cloneManualUrlEl.value.trim();
+  const destination = cloneManualDestinationEl.value.trim();
+  const kind = cloneManualCredentialKindEl?.value ?? "accessToken";
+
+  if (!remoteUrl) {
+    showCloneManualError("Repository URL is required.");
+    return;
+  }
+  if (!destination) {
+    showCloneManualError("Choose a destination folder first.");
+    return;
+  }
+
+  let credential: CloneCredential;
+  try {
+    if (kind === "accessToken") {
+      const username = cloneManualTokenUsernameEl?.value.trim() ?? "";
+      const token = cloneManualTokenValueEl?.value ?? "";
+      if (!username || !token) throw new Error("Username and access token are both required.");
+      credential = { kind: "accessToken", username, token };
+    } else if (kind === "sshKey") {
+      if (!cloneManualSshKey) throw new Error("Generate or import an SSH key first.");
+      credential = {
+        kind: "sshKey",
+        privateKeyOpenssh: cloneManualSshKey.privateKeyOpenssh,
+        passphrase: cloneManualSshKey.passphrase,
+      };
+    } else if (kind === "githubOauth") {
+      if (!cloneManualGithubToken) throw new Error("Sign in with GitHub first.");
+      const installation = await checkGithubInstallation(remoteUrl, cloneManualGithubToken.accessToken);
+      if (installation.status === "notInstalled") {
+        throw new Error(
+          `Cerebrite isn't installed on this repository yet. Install it at ${installation.installUrl}, then try again.`,
+        );
+      }
+      credential = { kind: "githubOauth", ...cloneManualGithubToken };
+    } else {
+      if (!cloneManualGitlabToken) throw new Error("Sign in with GitLab first.");
+      credential = { kind: "gitlabOauth", ...cloneManualGitlabToken };
+    }
+  } catch (err) {
+    showCloneManualError(String(err));
+    return;
+  }
+
+  cloneManualSubmitButtonEl?.setAttribute("disabled", "");
+  if (cloneManualStatusEl) {
+    cloneManualStatusEl.textContent = "Cloning…";
+    cloneManualStatusEl.removeAttribute("hidden");
+  }
+  const generation = cloneManualGeneration;
+  try {
+    const result = await cloneAndOpenVault(remoteUrl, destination, credential);
+    if (generation !== cloneManualGeneration) return;
+    closeCloneManualDialog();
+    currentVaultPath = result.vault.path;
+    if (settingsVaultPathEl) settingsVaultPathEl.textContent = result.vault.path;
+    showWorkspace();
+    await loadPages();
+    await loadTrash();
+    openSettingsModal();
+  } catch (err) {
+    if (generation !== cloneManualGeneration) return;
+    showCloneManualError(`Couldn't clone: ${String(err)}`);
+  } finally {
+    if (generation === cloneManualGeneration) cloneManualSubmitButtonEl?.removeAttribute("disabled");
+  }
+}
+
 function closeSettingsModal() {
   settingsModalOverlayEl?.setAttribute("hidden", "");
 }
@@ -2696,13 +3142,14 @@ async function init() {
   connectWizardOpenButtonEl?.addEventListener("click", openConnectWizard);
   connectWizardCloseButtonEl?.addEventListener("click", closeConnectWizard);
   connectWizardBackButtonEl?.addEventListener("click", () => dispatchWizard({ type: "back" }));
-  connectWizardManualButtonEl?.addEventListener("click", () => void handleWizardManualSetupClick());
+  connectWizardManualButtonEl?.addEventListener("click", () => dispatchWizard({ type: "switchToManual" }));
   connectWizardOverlayEl?.addEventListener("click", (event) => {
     if (event.target === connectWizardOverlayEl) closeConnectWizard();
   });
   cloneWizardOpenButtonEl?.addEventListener("click", openCloneWizard);
   cloneWizardCloseButtonEl?.addEventListener("click", closeCloneWizard);
   cloneWizardBackButtonEl?.addEventListener("click", () => dispatchCloneWizard({ type: "back" }));
+  cloneWizardManualButtonEl?.addEventListener("click", () => dispatchCloneWizard({ type: "switchToManual" }));
   cloneWizardOverlayEl?.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !isCloneWizardBusyStep(cloneWizardState.step)) {
       event.preventDefault();
@@ -2717,11 +3164,39 @@ async function init() {
     }
   });
 
+  // Ticket 11: the standalone "git clone" manual dialog's wiring.
+  cloneManualOpenButtonEl?.addEventListener("click", () => openCloneManualDialog());
+  cloneManualCloseButtonEl?.addEventListener("click", closeCloneManualDialog);
+  cloneManualOverlayEl?.addEventListener("click", (event) => {
+    if (event.target === cloneManualOverlayEl) closeCloneManualDialog();
+  });
+  cloneManualOverlayEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeCloneManualDialog();
+    }
+  });
+  cloneManualCredentialKindEl?.addEventListener("change", updateCloneManualSubformVisibility);
+  cloneManualDestinationButtonEl?.addEventListener("click", () => void handleCloneManualDestinationClick());
+  cloneManualSshKeyGenerateButtonEl?.addEventListener("click", () => void handleCloneManualSshKeyGenerateClick());
+  cloneManualSshKeyImportButtonEl?.addEventListener("click", () => void handleCloneManualSshKeyImportClick());
+  cloneManualGithubSigninButtonEl?.addEventListener("click", () => void runCloneManualOauthSignIn("github"));
+  cloneManualGitlabSigninButtonEl?.addEventListener("click", () => void runCloneManualOauthSignIn("gitlab"));
+  cloneManualSubmitButtonEl?.addEventListener("click", () => void handleCloneManualSubmitClick());
+
   settingsConnectFormEl?.addEventListener("submit", (e) => void handleConnectFormSubmit(e));
   settingsGithubFormEl?.addEventListener("submit", (e) => void handleGithubFormSubmit(e));
   settingsGithubInstallContinueButtonEl?.addEventListener("click", () => void handleGithubInstallContinueClick());
   settingsGitlabFormEl?.addEventListener("submit", (e) => void handleGitlabFormSubmit(e));
   settingsCommitAuthorFormEl?.addEventListener("submit", (e) => void handleCommitAuthorFormSubmit(e));
+
+  // Ticket 11: the always-visible "Sync" section's credential-kind toggle
+  // and its new raw SSH key sub-form.
+  syncCredentialKindEl?.addEventListener("change", updateSyncSubformVisibility);
+  updateSyncSubformVisibility();
+  settingsSshKeyGenerateButtonEl?.addEventListener("click", () => void handleSettingsSshKeyGenerateClick());
+  settingsSshKeyImportButtonEl?.addEventListener("click", () => void handleSettingsSshKeyImportClick());
+  settingsSshKeyConnectButtonEl?.addEventListener("click", () => void handleSettingsSshKeyConnectClick());
   // Clicking the dimmed backdrop (not the modal card itself) closes it.
   settingsModalOverlayEl?.addEventListener("click", (event) => {
     if (event.target === settingsModalOverlayEl) closeSettingsModal();

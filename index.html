@@ -20,8 +20,89 @@
       <p class="vault-picker-alt">
         Setting up a new device? <button id="clone-wizard-open-button" class="link-button" type="button">I already have a repository…</button>
       </p>
+      <!-- Ticket 11: clone's manual/raw escape hatch, reachable even here --
+           there is no vault/Settings surface yet to anchor it to, so it gets
+           its own first-run entry point next to the guided wizard's. -->
+      <p class="vault-picker-alt">
+        <button id="clone-manual-open-button" class="link-button" type="button">Or clone with raw git fields…</button>
+      </p>
       <p id="vault-picker-error" class="error" hidden></p>
     </section>
+
+    <!-- Ticket 11: the standalone "git clone" manual form -- variant B's
+         transparent, full-git-vocabulary door into the same
+         `clone_and_open_vault` command the guided clone wizard (ticket 10)
+         uses, reachable from the first-run screen above and from that
+         wizard's own persistent "Switch to manual setup" link. Same
+         test-fetch-then-persist gate as the guided wizard: nothing is saved
+         unless `clone_and_open_vault` itself succeeds. -->
+    <div id="clone-manual-overlay" class="settings-modal-overlay" hidden>
+      <div id="clone-manual-dialog" class="settings-modal" role="dialog" aria-modal="true" aria-label="Clone a repository (manual)">
+        <div class="settings-modal-header">
+          <h2>Clone a repository</h2>
+          <button id="clone-manual-close-button" type="button" aria-label="Close">✕</button>
+        </div>
+        <div class="settings-section">
+          <label>
+            Remote URL
+            <input id="clone-manual-url" type="text" placeholder="https://example.com/user/repo.git" />
+          </label>
+          <label>
+            Branch
+            <input id="clone-manual-branch" type="text" value="(the repository's default branch)" disabled />
+          </label>
+          <label>
+            Destination folder
+            <input id="clone-manual-destination" type="text" readonly placeholder="Choose a folder…" />
+          </label>
+          <button id="clone-manual-destination-button" type="button">Choose folder…</button>
+
+          <label>
+            Credential kind
+            <select id="clone-manual-credential-kind">
+              <option value="accessToken">Access token</option>
+              <option value="sshKey">SSH key</option>
+              <option value="githubOauth">GitHub sign-in</option>
+              <option value="gitlabOauth">GitLab sign-in</option>
+            </select>
+          </label>
+
+          <div class="settings-connect-form sync-subform" data-clone-kind="accessToken">
+            <label>
+              Username
+              <input id="clone-manual-token-username" type="text" />
+            </label>
+            <label>
+              Access token
+              <input id="clone-manual-token-value" type="password" />
+            </label>
+          </div>
+
+          <div class="settings-connect-form sync-subform" data-clone-kind="sshKey" hidden>
+            <div class="wizard-button-row">
+              <button id="clone-manual-sshkey-generate-button" type="button">Generate a new key</button>
+              <button id="clone-manual-sshkey-import-button" type="button">Import an existing key</button>
+            </div>
+            <p id="clone-manual-sshkey-status" class="settings-connect-status" hidden></p>
+          </div>
+
+          <div class="settings-connect-form sync-subform" data-clone-kind="githubOauth" hidden>
+            <button id="clone-manual-github-signin-button" type="button">Sign in with GitHub</button>
+            <div id="clone-manual-github-device-code" class="settings-connect-status" hidden></div>
+            <p id="clone-manual-github-status" class="settings-connect-status" hidden></p>
+          </div>
+
+          <div class="settings-connect-form sync-subform" data-clone-kind="gitlabOauth" hidden>
+            <button id="clone-manual-gitlab-signin-button" type="button">Sign in with GitLab</button>
+            <div id="clone-manual-gitlab-device-code" class="settings-connect-status" hidden></div>
+            <p id="clone-manual-gitlab-status" class="settings-connect-status" hidden></p>
+          </div>
+
+          <button id="clone-manual-submit-button" type="button" class="wizard-primary-action">Clone</button>
+          <p id="clone-manual-status" class="settings-connect-status" hidden></p>
+        </div>
+      </div>
+    </div>
 
     <!-- Ticket 10: the guided clone wizard's full-screen surface.
          `#clone-wizard-body` is rebuilt per-step by main.ts
@@ -38,6 +119,7 @@
         <div id="clone-wizard-body" class="clone-wizard-body"></div>
         <div class="clone-wizard-footer">
           <button id="clone-wizard-back-button" type="button">Back</button>
+          <button id="clone-wizard-manual-button" type="button">Switch to manual setup</button>
         </div>
       </div>
     </section>
@@ -217,9 +299,11 @@
                modal (opened on top of this one, not full-screen: that's
                clone's treatment, ticket 10) that walks branching/pick vs.
                create/credential-kind/"Commit as" steps end to end, reusing
-               the raw forms' backend commands under the hood. The raw forms
-               below (tickets 04/06/07) stay in place as a fallback/escape
-               hatch and for anyone who prefers the direct path. -->
+               the raw forms' backend commands under the hood. Ticket 11's
+               always-visible "Sync" section below is the escape hatch for
+               anyone who prefers the direct, raw-git-vocabulary path -- both
+               this wizard and the clone wizard link to it via "Switch to
+               manual setup". -->
           <div class="settings-section">
             <h3>Connect a repository</h3>
             <p class="settings-wizard-intro">
@@ -228,13 +312,44 @@
             <button id="connect-wizard-open-button" type="button">Connect…</button>
           </div>
 
-          <!-- Ticket 04: minimal/raw connect form -- the generic access-token
-               path for any HTTPS git host that isn't GitHub/GitLab sign-in.
-               No wizard polish (provider detection, OAuth, SSH) -- that's
-               tickets 09/10; this just establishes the mechanism end-to-end. -->
-          <div class="settings-section">
-            <h3>Connect a git remote (access token)</h3>
-            <form id="settings-connect-form" class="settings-connect-form">
+          <!-- Ticket 11: the always-visible "Sync" section -- variant B's
+               transparent, full-git-vocabulary door into the exact same
+               connect_* commands tickets 04/05/06/07 already expose (no
+               logic is duplicated here, only a different UI): raw remote
+               URL + branch fields, plus a credential-kind selector that
+               reveals the matching sub-form below. This is the target of
+               both wizards' persistent "Switch to manual setup" link, and
+               stays usable on its own for anyone who prefers the direct
+               path over the guided wizard entirely. -->
+          <div class="settings-section" id="sync-section">
+            <h3>Sync</h3>
+            <p class="settings-wizard-intro">
+              Connect this vault to a remote repository directly, using raw git fields.
+            </p>
+            <label>
+              Branch
+              <!-- No connect_* command takes a branch parameter (tickets
+                   03-07): a connect attaches a remote to an already-cloned
+                   local repo, and every fetch/push already operates on
+                   that repo's current HEAD branch -- there is nothing to
+                   choose here. Shown read-only, in full git vocabulary, so
+                   this still reads as a "raw fields" form per the ticket
+                   rather than silently omitting the concept. -->
+              <input id="sync-branch" type="text" value="(the repository's current branch)" disabled />
+            </label>
+            <label>
+              Credential kind
+              <select id="sync-credential-kind">
+                <option value="accessToken">Access token</option>
+                <option value="sshKey">SSH key</option>
+                <option value="githubOauth">GitHub sign-in</option>
+                <option value="gitlabOauth">GitLab sign-in</option>
+              </select>
+            </label>
+
+            <!-- Ticket 04's access-token form, unchanged -- just relocated
+                 under the Sync section and toggled by the selector above. -->
+            <form id="settings-connect-form" class="settings-connect-form sync-subform" data-sync-kind="accessToken">
               <label>
                 Repository URL
                 <input id="settings-connect-url" type="text" placeholder="https://example.com/user/repo.git" required />
@@ -250,20 +365,30 @@
               <button id="settings-connect-button" type="submit">Connect</button>
               <p id="settings-connect-status" class="settings-connect-status" hidden></p>
             </form>
-          </div>
 
-          <!-- Ticket 06: minimal device-flow "Sign in with GitHub" UI --
-               shows the device code + verification URL GitHub's device
-               flow hands back, then (once a token is acquired) either the
-               app-installation CTA or a plain "Connected" status. No
-               wizard polish (that's tickets 09/10) -- this just gets the
-               mechanism working end-to-end, same scope as ticket 04's raw
-               access-token form above. Requires a real registered GitHub
-               App client id (currently a placeholder, see
-               src-tauri/src/github_oauth.rs) to actually work. -->
-          <div class="settings-section">
-            <h3>Sign in with GitHub</h3>
-            <form id="settings-github-form" class="settings-connect-form">
+            <!-- Ticket 05's SSH key path had no raw Settings form before
+                 this ticket (only the guided wizard exercised it) -- this
+                 is new UI around the exact same generate/import/connect
+                 commands the wizard already calls. -->
+            <div id="settings-sshkey-section" class="settings-connect-form sync-subform" data-sync-kind="sshKey" hidden>
+              <label>
+                Repository URL
+                <input id="settings-sshkey-url" type="text" placeholder="git@example.com:user/repo.git" />
+              </label>
+              <div class="wizard-button-row">
+                <button id="settings-sshkey-generate-button" type="button">Generate a new key</button>
+                <button id="settings-sshkey-import-button" type="button">Import an existing key</button>
+              </div>
+              <button id="settings-sshkey-connect-button" type="button">Connect</button>
+              <p id="settings-sshkey-status" class="settings-connect-status" hidden></p>
+            </div>
+
+            <!-- Ticket 06's minimal device-flow "Sign in with GitHub" form,
+                 unchanged -- just relocated under the Sync section. Requires
+                 a real registered GitHub App client id (currently a
+                 placeholder, see src-tauri/src/github_oauth.rs) to actually
+                 work. -->
+            <form id="settings-github-form" class="settings-connect-form sync-subform" data-sync-kind="githubOauth" hidden>
               <label>
                 Repository URL
                 <input
@@ -274,37 +399,29 @@
                 />
               </label>
               <button id="settings-github-button" type="submit">Sign in with GitHub</button>
+              <div id="settings-github-device-code" class="settings-connect-status" hidden>
+                <p>
+                  Go to <a id="settings-github-verification-link" href="#" target="_blank" rel="noopener"></a> and
+                  enter code: <strong id="settings-github-user-code"></strong>
+                </p>
+              </div>
+              <p id="settings-github-status" class="settings-connect-status" hidden></p>
+              <div id="settings-github-install" class="settings-connect-status" hidden>
+                <p>
+                  GitHub is signed in, but Cerebrite isn't installed on this repository yet.
+                  <a id="settings-github-install-link" href="#" target="_blank" rel="noopener">Install the app</a>,
+                  then continue.
+                </p>
+                <button id="settings-github-install-continue-button" type="button">I've installed it, continue</button>
+              </div>
             </form>
-            <div id="settings-github-device-code" class="settings-connect-status" hidden>
-              <p>
-                Go to <a id="settings-github-verification-link" href="#" target="_blank" rel="noopener"></a> and
-                enter code: <strong id="settings-github-user-code"></strong>
-              </p>
-            </div>
-            <p id="settings-github-status" class="settings-connect-status" hidden></p>
-            <div id="settings-github-install" class="settings-connect-status" hidden>
-              <p>
-                GitHub is signed in, but Cerebrite isn't installed on this repository yet.
-                <a id="settings-github-install-link" href="#" target="_blank" rel="noopener">Install the app</a>,
-                then continue.
-              </p>
-              <button id="settings-github-install-continue-button" type="button">I've installed it, continue</button>
-            </div>
-          </div>
 
-          <!-- Ticket 07: minimal device-flow "Sign in with GitLab" UI --
-               same shape as the "Sign in with GitHub" section above, minus
-               an app-installation step (GitLab OAuth applications reach
-               every repo the authorizing user can, with no separate
-               per-repo "install" concept). Requires a real registered
-               GitLab application client id (currently a placeholder, see
-               src-tauri/src/gitlab_oauth.rs) to actually work, and the live
-               spike that ticket's still-pending (write_repository scope
-               sufficiency, refresh token presence, secretless refresh)
-               hasn't been run yet either. -->
-          <div class="settings-section">
-            <h3>Sign in with GitLab</h3>
-            <form id="settings-gitlab-form" class="settings-connect-form">
+            <!-- Ticket 07's minimal device-flow "Sign in with GitLab" form,
+                 unchanged -- just relocated under the Sync section. Requires
+                 a real registered GitLab application client id (currently a
+                 placeholder, see src-tauri/src/gitlab_oauth.rs) to actually
+                 work. -->
+            <form id="settings-gitlab-form" class="settings-connect-form sync-subform" data-sync-kind="gitlabOauth" hidden>
               <label>
                 Repository URL
                 <input
@@ -315,14 +432,14 @@
                 />
               </label>
               <button id="settings-gitlab-button" type="submit">Sign in with GitLab</button>
+              <div id="settings-gitlab-device-code" class="settings-connect-status" hidden>
+                <p>
+                  Go to <a id="settings-gitlab-verification-link" href="#" target="_blank" rel="noopener"></a> and
+                  enter code: <strong id="settings-gitlab-user-code"></strong>
+                </p>
+              </div>
+              <p id="settings-gitlab-status" class="settings-connect-status" hidden></p>
             </form>
-            <div id="settings-gitlab-device-code" class="settings-connect-status" hidden>
-              <p>
-                Go to <a id="settings-gitlab-verification-link" href="#" target="_blank" rel="noopener"></a> and
-                enter code: <strong id="settings-gitlab-user-code"></strong>
-              </p>
-            </div>
-            <p id="settings-gitlab-status" class="settings-connect-status" hidden></p>
           </div>
         </div>
       </div>

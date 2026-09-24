@@ -54,7 +54,15 @@ export type CloneWizardStep =
   /** Ticket 08's "Commit as" step, prefilled by the backend from the cloned repo's config or the provider -- always the wizard's last step before it reports completion. */
   | "commitAuthor"
   /** Terminal: the wizard is done, the vault is open, and the caller should tear down the full-screen surface in favor of the ordinary workspace. */
-  | "done";
+  | "done"
+  /**
+   * Terminal (ticket 11): the user clicked "Switch to manual setup" from
+   * *any* step -- mirrors connect-wizard's `switchedToManual`. The caller
+   * tears down the full-screen surface (same as `done`) but opens the
+   * standalone "git clone" dialog instead of the workspace, carrying over
+   * `remoteUrl`/`destination` if either was already committed.
+   */
+  | "switchedToManual";
 
 export interface CloneWizardState {
   step: CloneWizardStep;
@@ -94,7 +102,9 @@ export type CloneWizardAction =
   | { type: "retry" }
   | { type: "commitAuthorConfirmed" }
   | { type: "back" }
-  | { type: "reset" };
+  | { type: "reset" }
+  /** Ticket 11's "Switch to manual setup" escape hatch -- accepted from every step, mirroring connect-wizard's own action of the same name. */
+  | { type: "switchToManual" };
 
 /**
  * The pure transition function. Unknown/out-of-order actions for the
@@ -104,6 +114,13 @@ export type CloneWizardAction =
  * wizard.
  */
 export function reduceCloneWizard(state: CloneWizardState, action: CloneWizardAction): CloneWizardState {
+  // Ticket 11: checked before the step-specific switch below, same
+  // rationale as connect-wizard's `reduceWizard` -- reachable from every
+  // step without a per-step allowance.
+  if (action.type === "switchToManual") {
+    return { ...state, step: "switchedToManual" };
+  }
+
   switch (action.type) {
     case "chooseProvider": {
       if (state.step !== "providerChoice") return state;
@@ -204,6 +221,8 @@ function previousStep(state: CloneWizardState): CloneWizardStep {
       return "commitAuthor"; // cloning already succeeded -- nothing to undo
     case "done":
       return "done";
+    case "switchedToManual":
+      return "switchedToManual"; // terminal, same as "done" -- back is hidden by then
   }
 }
 
@@ -215,4 +234,9 @@ export function isCloneWizardBusyStep(step: CloneWizardStep): boolean {
 /** Whether the wizard has reached its terminal "close me" state. */
 export function isCloneWizardDone(state: CloneWizardState): boolean {
   return state.step === "done";
+}
+
+/** Whether the wizard has been switched to ticket 11's manual setup form -- the caller should tear down the full-screen surface and open the standalone "git clone" dialog instead of treating this as a normal `isCloneWizardDone` completion. */
+export function isCloneWizardSwitchedToManual(state: CloneWizardState): boolean {
+  return state.step === "switchedToManual";
 }
