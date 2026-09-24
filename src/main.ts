@@ -24,6 +24,10 @@ import {
   startGitlabDeviceFlow,
   pollGitlabDeviceFlow,
   connectGitlabOauth,
+  commitAuthorPrefill,
+  getCommitAuthor,
+  confirmCommitAuthor,
+  type CommitAuthor,
   type PageSummary,
   type PageResolution,
   type TrashedPageSummary,
@@ -135,6 +139,15 @@ const settingsGitlabVerificationLinkEl = document.querySelector<HTMLAnchorElemen
 );
 const settingsGitlabUserCodeEl = document.querySelector<HTMLElement>("#settings-gitlab-user-code");
 const settingsGitlabStatusEl = document.querySelector<HTMLElement>("#settings-gitlab-status");
+
+// Ticket 08: the editable "Commit as" field -- prefilled from
+// `commitAuthorPrefill`'s precedence chain when nothing is confirmed yet,
+// or the vault's currently confirmed author otherwise (`getCommitAuthor`).
+const settingsCommitAuthorFormEl = document.querySelector<HTMLFormElement>("#settings-commit-author-form");
+const settingsCommitAuthorNameEl = document.querySelector<HTMLInputElement>("#settings-commit-author-name");
+const settingsCommitAuthorEmailEl = document.querySelector<HTMLInputElement>("#settings-commit-author-email");
+const settingsCommitAuthorButtonEl = document.querySelector<HTMLButtonElement>("#settings-commit-author-button");
+const settingsCommitAuthorStatusEl = document.querySelector<HTMLElement>("#settings-commit-author-status");
 
 // The page currently loaded in the editor: either a persisted page (has an
 // id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
@@ -1161,9 +1174,10 @@ async function finishGithubConnect(remoteUrl: string) {
 
   settingsGithubInstallEl?.setAttribute("hidden", "");
   settingsGithubStatusEl.textContent = "Connecting…";
-  await connectGithubOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt);
+  const result = await connectGithubOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt);
   settingsGithubStatusEl.textContent = "Connected.";
   pendingGithubTokenPair = null;
+  await maybeOfferProviderCommitAuthorSwitch(result.providerSuggestedAuthor);
 }
 
 async function handleGithubInstallContinueClick() {
@@ -1250,8 +1264,9 @@ async function handleGitlabFormSubmit(event: SubmitEvent) {
 
     settingsGitlabDeviceCodeEl?.setAttribute("hidden", "");
     setStatus("Connecting…");
-    await connectGitlabOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt);
+    const connectResult = await connectGitlabOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt);
     setStatus("Connected.");
+    await maybeOfferProviderCommitAuthorSwitch(connectResult.providerSuggestedAuthor);
   } catch (err) {
     settingsGitlabDeviceCodeEl?.setAttribute("hidden", "");
     setStatus(String(err));
@@ -1264,6 +1279,73 @@ function openSettingsModal() {
   if (!settingsModalOverlayEl) return;
   if (settingsVaultPathEl) settingsVaultPathEl.textContent = currentVaultPath ?? "";
   settingsModalOverlayEl.removeAttribute("hidden");
+  void refreshCommitAuthorFields();
+}
+
+/**
+ * Ticket 08 checklist item 6/8: fills the Settings "Commit as" fields with
+ * the vault's currently confirmed author, or -- if nothing has been
+ * confirmed yet -- the best available prefill (repo-local -> global ->
+ * empty; the provider tier only ever applies during an OAuth connect, see
+ * `maybeOfferProviderCommitAuthorSwitch`). Silently does nothing if no
+ * vault is open (the commands themselves require one).
+ */
+async function refreshCommitAuthorFields() {
+  if (!settingsCommitAuthorNameEl || !settingsCommitAuthorEmailEl) return;
+  try {
+    const confirmed = await getCommitAuthor();
+    const author = confirmed ?? (await commitAuthorPrefill()).author;
+    settingsCommitAuthorNameEl.value = author?.name ?? "";
+    settingsCommitAuthorEmailEl.value = author?.email ?? "";
+  } catch {
+    // No vault open yet -- leave the fields blank rather than erroring the
+    // whole Settings modal open.
+  }
+}
+
+/**
+ * Ticket 08 checklist item 4/7: validates and writes the "Commit as" name
+ * and email to the vault's repo-local git config. A hard validation
+ * failure (empty name, malformed email) is shown as an error; an
+ * unrealistic-but-well-formed domain (`.local`, `localhost`, no dot) is
+ * shown as a warning alongside the "Saved." confirmation -- never blocked.
+ */
+async function handleCommitAuthorFormSubmit(event: SubmitEvent) {
+  event.preventDefault();
+  if (!settingsCommitAuthorNameEl || !settingsCommitAuthorEmailEl || !settingsCommitAuthorStatusEl) return;
+  const name = settingsCommitAuthorNameEl.value.trim();
+  const email = settingsCommitAuthorEmailEl.value.trim();
+
+  settingsCommitAuthorButtonEl?.setAttribute("disabled", "");
+  try {
+    const result = await confirmCommitAuthor(name, email);
+    settingsCommitAuthorStatusEl.textContent = result.warning ? `Saved. ${result.warning}` : "Saved.";
+    settingsCommitAuthorStatusEl.removeAttribute("hidden");
+  } catch (err) {
+    settingsCommitAuthorStatusEl.textContent = String(err);
+    settingsCommitAuthorStatusEl.removeAttribute("hidden");
+  } finally {
+    settingsCommitAuthorButtonEl?.removeAttribute("disabled");
+  }
+}
+
+/**
+ * Ticket 08 checklist item 5: the one-time "switch to the provider's
+ * address?" offer after an OAuth sign-in connect, shown only when the vault
+ * already had a *different* confirmed author (`suggested` is `undefined`/
+ * `null` otherwise -- see `connectGithubOauth`/`connectGitlabOauth`'s doc
+ * comments). Default (Cancel, or dismissing the dialog) keeps the current
+ * author -- this never switches silently.
+ */
+async function maybeOfferProviderCommitAuthorSwitch(suggested: CommitAuthor | null | undefined) {
+  if (!suggested) return;
+  const switchToProvider = await confirmDialog(
+    `Commit as ${suggested.name} <${suggested.email}> from now on? This keeps your real email address private.`,
+    { title: "Switch commit author?", kind: "info" },
+  );
+  if (!switchToProvider) return;
+  await confirmCommitAuthor(suggested.name, suggested.email);
+  await refreshCommitAuthorFields();
 }
 
 function closeSettingsModal() {
@@ -1338,6 +1420,7 @@ async function init() {
   settingsGithubFormEl?.addEventListener("submit", (e) => void handleGithubFormSubmit(e));
   settingsGithubInstallContinueButtonEl?.addEventListener("click", () => void handleGithubInstallContinueClick());
   settingsGitlabFormEl?.addEventListener("submit", (e) => void handleGitlabFormSubmit(e));
+  settingsCommitAuthorFormEl?.addEventListener("submit", (e) => void handleCommitAuthorFormSubmit(e));
   // Clicking the dimmed backdrop (not the modal card itself) closes it.
   settingsModalOverlayEl?.addEventListener("click", (event) => {
     if (event.target === settingsModalOverlayEl) closeSettingsModal();

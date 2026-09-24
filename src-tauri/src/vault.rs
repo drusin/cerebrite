@@ -221,10 +221,20 @@ pub fn commit_all(repo_root: &Path, message: &str) -> Result<()> {
     }
 
     let tree = repo.find_tree(tree_id).context("looking up written tree")?;
+    // Ticket 08 / ticket 11: the `Cerebrite <cerebrite@local>` fallback that
+    // used to live here is gone outright. `Repository::signature()` already
+    // resolves `user.name`/`user.email` through git's normal layered lookup
+    // (repo-local overriding global), so once a "Commit as" author has been
+    // confirmed (`author::confirm`, which writes repo-locally) this always
+    // succeeds; on a vault with no author configured anywhere -- repo-local
+    // or global -- it fails with `NotFound`, and that failure is left to
+    // propagate as an ordinary error rather than being papered over. The
+    // caller (a Tauri command, or `sync`'s background loop) is responsible
+    // for having already walked the user through confirming an author
+    // before the first commit -- see `author.rs`'s module doc comment.
     let signature = repo
         .signature()
-        .or_else(|_| git2::Signature::now("Cerebrite", "cerebrite@local"))
-        .context("building commit signature")?;
+        .context("no commit author is confirmed for this vault yet -- confirm a \"Commit as\" name and email before committing")?;
 
     let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
     repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents)
@@ -237,6 +247,53 @@ pub fn commit_all(repo_root: &Path, message: &str) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Redirects git2's system/global/XDG config search paths to an empty,
+    /// nonexistent directory, once per process -- isolates
+    /// `repo.signature()` (and any other git2 config lookup) in this test
+    /// binary from whatever real `~/.gitconfig` happens to exist on the
+    /// machine running the tests. The sandbox this ticket was implemented
+    /// in has one (`user.name`/`user.email` set globally), which would
+    /// otherwise make `commit_all_errors_when_no_author_is_confirmed_anywhere`
+    /// below pass by accident -- picking up the *real* host identity rather
+    /// than proving the "nowhere" case ticket 08 checklist item 10 asks for.
+    /// Safe across tests/threads: every caller redirects to the same
+    /// (nonexistent) path, so repeated/concurrent calls are idempotent, and
+    /// no test in this crate relies on the real host global git config
+    /// being reachable (every other fixture that needs an author confirms
+    /// one repo-locally via `author::confirm_test_author`, which always
+    /// wins over global regardless).
+    pub(crate) fn isolate_from_host_git_config() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let empty = std::env::temp_dir().join("cerebrite-test-empty-gitconfig");
+            fs::create_dir_all(&empty).expect("creating empty test gitconfig dir");
+            for level in [git2::ConfigLevel::System, git2::ConfigLevel::Global, git2::ConfigLevel::XDG] {
+                unsafe {
+                    git2::opts::set_search_path(level, &empty).expect("redirecting git2 config search path");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn commit_all_errors_when_no_author_is_confirmed_anywhere() {
+        isolate_from_host_git_config();
+        let dir = tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("page.md"), "---\nid: abc\n---\nBody.\n").unwrap();
+
+        let result = commit_all(dir.path(), "Create page");
+
+        assert!(
+            result.is_err(),
+            "expected commit_all to error without a confirmed author, got {result:?}"
+        );
+        // No commit was created -- the repo still has no HEAD at all.
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        assert!(repo.head().is_err());
+    }
 
     #[test]
     fn ensure_git_repo_inits_a_fresh_folder_and_creates_vault_subdir() {
@@ -309,6 +366,7 @@ mod tests {
     fn ensure_git_repo_migrates_a_root_level_vault_into_a_vault_subdirectory() {
         let dir = tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: abc\ntitle: Page\n---\nBody.\n").unwrap();
         fs::create_dir_all(dir.path().join(".cerebrite")).unwrap();
         fs::write(dir.path().join(".cerebrite/redirects.tsv"), "").unwrap();
@@ -353,6 +411,7 @@ mod tests {
     fn ensure_git_repo_migration_is_a_single_commit() {
         let dir = tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: abc\n---\nBody.\n").unwrap();
         fs::create_dir_all(dir.path().join(".cerebrite")).unwrap();
         fs::write(dir.path().join(".cerebrite/redirects.tsv"), "").unwrap();
@@ -374,6 +433,7 @@ mod tests {
     fn commit_all_creates_a_commit_with_the_expected_message_and_diff() {
         let dir = tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
 
         let file_path = dir.path().join("page.md");
         fs::write(&file_path, "---\nid: abc\n---\nOriginal body.\n").unwrap();
@@ -410,6 +470,7 @@ mod tests {
     fn commit_all_is_a_noop_when_nothing_changed() {
         let dir = tempdir().unwrap();
         let repo = git2::Repository::init(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
 
         fs::write(dir.path().join("page.md"), "---\nid: abc\n---\nBody.\n").unwrap();
         commit_all(dir.path(), "Update Page").unwrap();

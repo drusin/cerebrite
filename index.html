@@ -160,6 +160,33 @@
             </div>
           </div>
 
+          <!-- Ticket 08: the editable "Commit as" name/email. Prefilled
+               (repo-local -> global -> empty) whenever the modal opens;
+               confirming writes it to the vault's repo-local `.git/config`
+               only. Affects future commits only -- history is never
+               rewritten. The vault-setup "Commit as" step (pick/create/
+               clone, before the first commit) reuses the exact same
+               `confirm_commit_author` command -- its own dedicated wizard
+               UI is tickets 09/10, out of this ticket's scope. -->
+          <div class="settings-section">
+            <h3>Commit as</h3>
+            <form id="settings-commit-author-form" class="settings-connect-form">
+              <label>
+                Name
+                <input id="settings-commit-author-name" type="text" required />
+              </label>
+              <label>
+                Email
+                <input id="settings-commit-author-email" type="text" required />
+              </label>
+              <button id="settings-commit-author-button" type="submit">Save</button>
+              <p id="settings-commit-author-status" class="settings-connect-status" hidden></p>
+              <p class="settings-commit-author-note">
+                Affects future commits only -- past history is never rewritten.
+              </p>
+            </form>
+          </div>
+
           <!-- Ticket 04: minimal/raw connect form -- the generic access-token
                path for any HTTPS git host that isn't GitHub/GitLab sign-in.
                No wizard polish (provider detection, OAuth, SSH) -- that's

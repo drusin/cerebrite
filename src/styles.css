@@ -757,6 +757,14 @@ body {
   margin: 0;
 }
 
+/* Ticket 08: the "Commit as" field's "future commits only" note -- same
+   muted, small-print treatment as `.settings-connect-status` above. */
+.settings-commit-author-note {
+  font-size: 0.8em;
+  opacity: 0.65;
+  margin: 0;
+}
+
 /* Forced color scheme (Settings): `[data-theme="dark"]` overrides the same
    variables the `prefers-color-scheme` block below sets, and `:not([data-
    theme="light"])` keeps the OS-driven default working for "System" (no

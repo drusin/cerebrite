@@ -526,6 +526,7 @@ mod tests {
     fn cleanup_and_prune_rewrites_stale_links_preserves_frontmatter_and_commits() {
         let dir = tempdir().unwrap();
         let vault_path = vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
 
         write_page(
             &vault_path,
@@ -582,6 +583,7 @@ mod tests {
     fn cleanup_and_prune_keeps_an_entry_still_referenced_by_a_stale_link() {
         let dir = tempdir().unwrap();
         let vault_path = vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
 
         write_page(
             &vault_path,

@@ -450,6 +450,7 @@ mod tests {
     fn trash_excluded_by_default_and_included_when_asked() {
         let dir = TempDir::new().unwrap();
         let vault_path = vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(
             vault_path.join("ghost.md"),
             "---\nid: ghost\ntitle: Ghost Page\n---\nA spooky mention of pumpkins.\n",

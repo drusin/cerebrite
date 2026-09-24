@@ -581,10 +581,14 @@ pub fn run_sync(
         .write_tree_to(&repo)
         .context("writing merged tree")?;
     let tree = repo.find_tree(tree_id).context("looking up merged tree")?;
+    // Ticket 08 / ticket 11: same deletion as `vault::commit_all`'s -- no
+    // `Cerebrite <cerebrite@local>` fallback. A vault synced with no
+    // confirmed author (repo-local or global) fails this merge commit
+    // outright rather than inventing one; the caller (`perform_sync` in
+    // `lib.rs`) reports that as an ordinary sync failure.
     let signature = repo
         .signature()
-        .or_else(|_| git2::Signature::now("Cerebrite", "cerebrite@local"))
-        .context("building merge commit signature")?;
+        .context("no commit author is confirmed for this vault yet -- confirm a \"Commit as\" name and email before syncing")?;
     repo.commit(
         Some(&format!("refs/heads/{branch}")),
         &signature,
@@ -679,6 +683,7 @@ mod tests {
 
         let device_a_dir = tempdir().unwrap();
         vault::ensure_git_repo(device_a_dir.path()).unwrap();
+        crate::author::confirm_test_author(device_a_dir.path());
         fs::write(device_a_dir.path().join("page.md"), "---\nid: p1\n---\nOriginal.\n").unwrap();
         vault::commit_all(device_a_dir.path(), "Create page").unwrap();
 
@@ -703,10 +708,80 @@ mod tests {
         device_b_dir
     }
 
+    /// See `vault.rs`'s test helper of the same name -- duplicated rather
+    /// than shared (matching this crate's existing precedent of duplicating
+    /// small test helpers across modules, e.g. `github_oauth.rs`/
+    /// `gitlab_oauth.rs`'s `mock_server`) so this module's tests stay
+    /// independently readable. Idempotent and safe across threads: every
+    /// caller redirects git2's system/global/XDG config search paths to the
+    /// same nonexistent directory.
+    fn isolate_from_host_git_config() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let empty = std::env::temp_dir().join("cerebrite-test-empty-gitconfig");
+            fs::create_dir_all(&empty).expect("creating empty test gitconfig dir");
+            for level in [git2::ConfigLevel::System, git2::ConfigLevel::Global, git2::ConfigLevel::XDG] {
+                unsafe {
+                    git2::opts::set_search_path(level, &empty).expect("redirecting git2 config search path");
+                }
+            }
+        });
+    }
+
+    // -- ticket 08: the merge-commit path's `Cerebrite <cerebrite@local>`
+    // fallback is gone too, not just `vault::commit_all`'s --
+
+    #[test]
+    fn a_clean_three_way_merge_fails_without_a_confirmed_author_instead_of_inventing_one() {
+        isolate_from_host_git_config();
+        let (bare_dir, device_a_dir, branch) = setup_remote_and_first_device();
+        let device_b_dir = clone_second_device(&bare_dir);
+        // Device B needs an author for its own local commit below, but the
+        // point of this test is that the *merge* commit -- not device B's
+        // own edit -- has nothing to sign with, so its author is stripped
+        // again right after committing.
+        crate::author::confirm_test_author(device_b_dir.path());
+
+        // Device A pushes a change to one file.
+        fs::write(device_a_dir.path().join("other.md"), "---\nid: other\n---\nFrom A.\n").unwrap();
+        vault::commit_all(device_a_dir.path(), "Add other from A").unwrap();
+        let repo_a = git2::Repository::open(device_a_dir.path()).unwrap();
+        let mut remote_a = repo_a.find_remote("origin").unwrap();
+        remote_a
+            .push(&[format!("refs/heads/{branch}:refs/heads/{branch}").as_str()], None)
+            .unwrap();
+
+        // Device B, without ever syncing, commits a change to a *different*
+        // file -- a clean, non-conflicting divergence that reaches the
+        // merge-commit code path (not the conflict-backup one).
+        fs::write(device_b_dir.path().join("mine.md"), "---\nid: mine\n---\nFrom B.\n").unwrap();
+        vault::commit_all(device_b_dir.path(), "Add mine from B").unwrap();
+
+        // Strip device B's confirmed author, simulating a vault that never
+        // had one (or lost it) by the time the background sync loop tries
+        // to materialize the merge commit.
+        let repo_b = git2::Repository::open(device_b_dir.path()).unwrap();
+        let mut local_config = repo_b.config().unwrap().open_level(git2::ConfigLevel::Local).unwrap();
+        local_config.remove("user.name").unwrap();
+        local_config.remove("user.email").unwrap();
+
+        let result = run_sync(device_b_dir.path(), None, None);
+
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("commit author"),
+                "expected an error about the missing commit author, got: {e}"
+            ),
+            Ok(_) => panic!("expected the merge commit to fail cleanly without a confirmed author, but it succeeded"),
+        }
+    }
+
     #[test]
     fn detached_head_errors_cleanly_instead_of_pushing_a_branch_literally_named_head() {
         let dir = tempdir().unwrap();
         vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(dir.path(), "Create page").unwrap();
 
@@ -738,6 +813,7 @@ mod tests {
     fn no_remote_configured_is_a_graceful_noop() {
         let dir = tempdir().unwrap();
         vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(dir.path(), "Create page").unwrap();
 
@@ -782,6 +858,7 @@ mod tests {
     fn local_only_commits_are_pushed_when_remote_has_nothing_new() {
         let (bare_dir, _device_a_dir, branch) = setup_remote_and_first_device();
         let device_b_dir = clone_second_device(&bare_dir);
+        crate::author::confirm_test_author(device_b_dir.path());
 
         fs::write(
             device_b_dir.path().join("page.md"),
@@ -814,6 +891,7 @@ mod tests {
     ) {
         let (bare_dir, device_a_dir, branch) = setup_remote_and_first_device();
         let device_b_dir = clone_second_device(&bare_dir);
+        crate::author::confirm_test_author(device_b_dir.path());
 
         // Device A edits and pushes.
         fs::write(device_a_dir.path().join("page.md"), "---\nid: p1\n---\nFrom device A.\n").unwrap();
@@ -930,6 +1008,7 @@ mod tests {
     fn unreachable_remote_lands_in_transient() {
         let dir = tempdir().unwrap();
         vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(dir.path(), "Create page").unwrap();
 
@@ -951,6 +1030,7 @@ mod tests {
     fn rejected_credential_lands_in_needs_attention() {
         let dir = tempdir().unwrap();
         vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(dir.path(), "Create page").unwrap();
 
@@ -981,6 +1061,7 @@ mod tests {
     fn rejected_access_token_names_its_credential_kind() {
         let dir = tempdir().unwrap();
         vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(dir.path(), "Create page").unwrap();
 
@@ -1039,6 +1120,7 @@ mod tests {
     fn a_rejected_gitlab_oauth_connection_with_no_refresh_token_surfaces_as_reconnect_required() {
         let dir = tempdir().unwrap();
         vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(dir.path(), "Create page").unwrap();
 
@@ -1070,6 +1152,7 @@ mod tests {
     fn a_rejected_gitlab_oauth_connection_with_a_refresh_token_is_an_ordinary_credential_rejection() {
         let dir = tempdir().unwrap();
         vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(dir.path(), "Create page").unwrap();
 

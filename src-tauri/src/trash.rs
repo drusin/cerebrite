@@ -242,6 +242,7 @@ mod tests {
     fn trash_page_moves_the_file_and_commits() {
         let dir = tempdir().unwrap();
         crate::vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         let repo = git2::Repository::open(dir.path()).unwrap();
         let page_path = write_page(dir.path(), "hello.md", "---\nid: abc\ntitle: Hello\n---\nBody.\n");
         crate::vault::commit_all(dir.path(), "Create Hello").unwrap();
@@ -263,6 +264,7 @@ mod tests {
     fn trash_page_disambiguates_a_filename_collision() {
         let dir = tempdir().unwrap();
         crate::vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
 
         // First page named hello.md gets trashed.
         let first_path = write_page(dir.path(), "hello.md", "---\nid: first\ntitle: Hello\n---\nOne.\n");
@@ -287,6 +289,7 @@ mod tests {
     fn restore_page_moves_the_file_back_and_preserves_the_id() {
         let dir = tempdir().unwrap();
         crate::vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         let repo = git2::Repository::open(dir.path()).unwrap();
         let page_path = write_page(dir.path(), "hello.md", "---\nid: abc\ntitle: Hello\n---\nBody.\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
@@ -313,6 +316,7 @@ mod tests {
     fn restore_page_recreates_a_missing_parent_directory() {
         let dir = tempdir().unwrap();
         crate::vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         fs::create_dir_all(dir.path().join("notes")).unwrap();
         let page_path = write_page(dir.path().join("notes").as_path(), "nested.md", "---\nid: n1\ntitle: Nested\n---\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
@@ -331,6 +335,7 @@ mod tests {
     fn empty_trash_permanently_removes_files_and_commits() {
         let dir = tempdir().unwrap();
         crate::vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         let repo = git2::Repository::open(dir.path()).unwrap();
         let page_path = write_page(dir.path(), "hello.md", "---\nid: abc\ntitle: Hello\n---\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
@@ -350,6 +355,7 @@ mod tests {
     fn list_trashed_pages_reports_id_title_and_original_path() {
         let dir = tempdir().unwrap();
         crate::vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         let page_path = write_page(dir.path(), "hello.md", "---\nid: abc\ntitle: Hello World\n---\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
         trash_page(dir.path(), dir.path(), &page_path, "abc", "Trash Hello").unwrap();
@@ -366,6 +372,7 @@ mod tests {
     fn list_trashed_pages_is_empty_when_there_is_no_trash_dir() {
         let dir = tempdir().unwrap();
         crate::vault::ensure_git_repo(dir.path()).unwrap();
+        crate::author::confirm_test_author(dir.path());
         assert!(list_trashed_pages(dir.path()).unwrap().is_empty());
     }
 }

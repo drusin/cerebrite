@@ -636,6 +636,7 @@ mod tests {
     fn try_connect_persists_the_record_and_secret_once_the_test_fetch_succeeds() {
         let repo_dir = tempdir().unwrap();
         vault::ensure_git_repo(repo_dir.path()).unwrap();
+        crate::author::confirm_test_author(repo_dir.path());
         fs::write(repo_dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(repo_dir.path(), "Create page").unwrap();
 

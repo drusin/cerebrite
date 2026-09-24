@@ -1,3 +1,4 @@
+mod author;
 mod connection;
 mod connection_record;
 mod credential;
@@ -486,6 +487,61 @@ fn get_sync_status(state: State<AppState>) -> sync::SyncStatus {
     state.sync_status.lock().unwrap().clone()
 }
 
+/// Ticket 08 checklist item 3/8: the "Commit as" prefill for the currently
+/// open vault -- repo-local `.git/config` -> global `~/.gitconfig` -> empty.
+/// Deliberately never includes the provider tier: this command has no
+/// access token to call `GET /user` with, and is meant to be callable
+/// generically during vault setup (pick/create/clone, before any connection
+/// exists at all) as well as from Settings. The one-time provider-suggested
+/// tier only ever shows up as `OauthConnectResult::provider_suggested_author`
+/// on `connect_github_oauth`/`connect_gitlab_oauth` below, where a real
+/// access token is already in hand.
+#[tauri::command]
+fn commit_author_prefill(state: State<AppState>) -> Result<author::PrefillResult, String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+    let repo_local = author::read_repo_local(&repo_root).map_err(|e| e.to_string())?;
+    let global = author::read_global().unwrap_or(None);
+    Ok(author::prefill(repo_local, global, None))
+}
+
+/// Ticket 08 checklist item 6/8: reads the currently confirmed "Commit as"
+/// author (repo-local only -- `None` means nothing has been confirmed for
+/// this vault yet), for Settings to show the current value.
+#[tauri::command]
+fn get_commit_author(state: State<AppState>) -> Result<Option<author::CommitAuthor>, String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+    author::read_repo_local(&repo_root).map_err(|e| e.to_string())
+}
+
+/// Ticket 08 checklist item 4/6/7: validates `name`/`email` (ticket 11's
+/// minimal checks -- a warning, never a hard block, for an unrealistic-
+/// looking domain) and, if they pass, writes them to the vault's repo-local
+/// `.git/config` -- never the global config. Callable both as the
+/// vault-setup "Commit as" step (pick/create/clone, before the first
+/// commit) and from Settings' editable "Commit as" field; the write itself
+/// is identical either way.
+#[tauri::command]
+fn confirm_commit_author(state: State<AppState>, name: String, email: String) -> Result<author::ValidationOutcome, String> {
+    let outcome = author::validate(&name, &email).map_err(|e| e.to_string())?;
+
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+    author::confirm(&repo_root, &author::CommitAuthor { name, email }).map_err(|e| e.to_string())?;
+
+    Ok(outcome)
+}
+
 /// Ticket 04's minimal/raw "connect with an access token" entry point -- the
 /// generic HTTPS path for any git host that isn't GitHub/GitLab sign-in
 /// (Bitbucket Cloud, Gitea, Forgejo, Codeberg, a bare HTTPS remote). Reuses
@@ -785,6 +841,21 @@ fn check_github_installation(remote_url: String, access_token: String) -> Result
     github_oauth::check_installation(&endpoints, &access_token, &owner, &repo).map_err(|e| e.to_string())
 }
 
+/// Ticket 08 checklist item 5: what a successful `connect_github_oauth`/
+/// `connect_gitlab_oauth` hands back alongside "connected" -- the one-time
+/// "switch to the provider's address?" offer. `provider_suggested_author`
+/// is populated *only* when the vault already had a confirmed repo-local
+/// author that differs from what the provider suggests; when there's no
+/// confirmed author yet, that's the ordinary prefill case
+/// (`commit_author_prefill`), not a switch offer, so it stays `None`. The
+/// frontend surfaces both values and defaults to a no-op -- ticket 11: "The
+/// default is to keep the current author. It never switches silently."
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OauthConnectResult {
+    provider_suggested_author: Option<author::CommitAuthor>,
+}
+
 /// Ticket 06 step 4-6: finishes GitHub sign-in the same way
 /// `connect_access_token` finishes an access-token connection -- reuses
 /// `connection::try_connect` as-is, so a real test fetch with
@@ -803,7 +874,7 @@ fn connect_github_oauth(
     access_token: String,
     refresh_token: String,
     access_token_expires_at: String,
-) -> Result<(), String> {
+) -> Result<OauthConnectResult, String> {
     let remote_url = remote_url.trim().to_string();
     if remote_url.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
         return Err("Repository URL, access token, and refresh token are all required".to_string());
@@ -834,7 +905,7 @@ fn connect_github_oauth(
     };
 
     let secret = github_oauth::OauthSecret {
-        access_token,
+        access_token: access_token.clone(),
         refresh_token,
     };
 
@@ -854,7 +925,21 @@ fn connect_github_oauth(
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
-    Ok(())
+
+    // Ticket 08 checklist item 5: the one-time "switch to the provider's
+    // address?" offer, only when the vault already had a *different*
+    // confirmed author -- a fetch failure here (no real GitHub App
+    // registered yet, see `github_oauth.rs`'s module doc comment) just
+    // means no offer is made, never a failed connect.
+    let existing_author = author::read_repo_local(&repo_root).unwrap_or(None);
+    let endpoints = github_oauth::GitHubEndpoints::production();
+    let provider_identity = author::fetch_github_identity(&endpoints.api_base_url, &access_token).ok();
+    let provider_suggested_author = match (&existing_author, &provider_identity) {
+        (Some(existing), Some(suggested)) if existing != suggested => Some(suggested.clone()),
+        _ => None,
+    };
+
+    Ok(OauthConnectResult { provider_suggested_author })
 }
 
 /// Ticket 07 step 1: requests a fresh device/user code pair from GitLab and
@@ -931,7 +1016,7 @@ fn connect_gitlab_oauth(
     access_token: String,
     refresh_token: Option<String>,
     access_token_expires_at: String,
-) -> Result<(), String> {
+) -> Result<OauthConnectResult, String> {
     let remote_url = remote_url.trim().to_string();
     if remote_url.is_empty() || access_token.is_empty() {
         return Err("Repository URL and access token are both required".to_string());
@@ -962,7 +1047,7 @@ fn connect_gitlab_oauth(
     };
 
     let secret = gitlab_oauth::OauthSecret {
-        access_token,
+        access_token: access_token.clone(),
         refresh_token,
     };
 
@@ -982,7 +1067,27 @@ fn connect_gitlab_oauth(
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
-    Ok(())
+
+    // Ticket 08 checklist item 5, GitLab half -- see `connect_github_oauth`'s
+    // matching comment. GitLab's `GET /user` may not carry `commit_email` at
+    // all (ticket 11's GitLab contingency: only confirmed once the pending
+    // live spike settles which scope actually returns it), in which case
+    // `fetch_gitlab_identity` returns `Ok(None)` and no offer is made --
+    // same "no offer" outcome as a hard fetch failure.
+    let existing_author = author::read_repo_local(&repo_root).unwrap_or(None);
+    // GitLab's REST API root -- not otherwise modeled in `gitlab_oauth.rs`
+    // (unlike GitHub's, which has an `api_base_url` on `GitHubEndpoints` for
+    // its own installation check), so it's named here directly.
+    const GITLAB_API_BASE_URL: &str = "https://gitlab.com/api/v4";
+    let provider_identity = author::fetch_gitlab_identity(GITLAB_API_BASE_URL, &access_token)
+        .ok()
+        .flatten();
+    let provider_suggested_author = match (&existing_author, &provider_identity) {
+        (Some(existing), Some(suggested)) if existing != suggested => Some(suggested.clone()),
+        _ => None,
+    };
+
+    Ok(OauthConnectResult { provider_suggested_author })
 }
 
 /// Provider hosts recognized as `Provider::GitHub`/`Provider::GitLab`;
@@ -1692,6 +1797,9 @@ pub fn run() {
             list_trashed_pages,
             search_pages,
             get_sync_status,
+            commit_author_prefill,
+            get_commit_author,
+            confirm_commit_author,
             connect_access_token,
             generate_ssh_key,
             import_ssh_key,
@@ -1730,6 +1838,14 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         index::build_index(&mut conn, &vault_path).unwrap();
+
+        // Ticket 08: `commit_all`/`run_sync`'s merge path no longer fall
+        // back to `Cerebrite <cerebrite@local>` -- every fixture that goes
+        // on to save/create/rename/trash/restore a page (all of which
+        // commit) needs a confirmed repo-local author first, same as
+        // `vault.rs`/`sync.rs`/`trash.rs`/`redirects.rs`/`connection.rs`'s
+        // own test fixtures.
+        author::confirm_test_author(dir.path());
 
         AppState {
             vault_path: Mutex::new(Some(vault_path)),

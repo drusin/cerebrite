@@ -316,6 +316,16 @@ export function checkGithubInstallation(remoteUrl: string, accessToken: string):
   return invoke("check_github_installation", { remoteUrl, accessToken });
 }
 
+/// Ticket 08 checklist item 5: what a successful `connectGithubOauth`/
+/// `connectGitlabOauth` hands back alongside "connected". `providerSuggestedAuthor`
+/// is present only when the vault already had a *different* confirmed
+/// "Commit as" author -- the one-time "switch to the provider's address?"
+/// offer. The frontend shows both values and defaults to a no-op; it must
+/// never switch silently.
+export interface OauthConnectResult {
+  providerSuggestedAuthor?: CommitAuthor | null;
+}
+
 /// Finishes GitHub sign-in: runs a real test fetch with the access token
 /// (`x-access-token` HTTPS Basic-auth convention) before persisting
 /// anything, same gate as `connectAccessToken`/`connectSshKey`. Stores the
@@ -325,7 +335,7 @@ export function connectGithubOauth(
   accessToken: string,
   refreshToken: string,
   accessTokenExpiresAt: string,
-): Promise<void> {
+): Promise<OauthConnectResult> {
   return invoke("connect_github_oauth", { remoteUrl, accessToken, refreshToken, accessTokenExpiresAt });
 }
 
@@ -373,6 +383,57 @@ export function connectGitlabOauth(
   accessToken: string,
   refreshToken: string | undefined,
   accessTokenExpiresAt: string,
-): Promise<void> {
+): Promise<OauthConnectResult> {
   return invoke("connect_gitlab_oauth", { remoteUrl, accessToken, refreshToken, accessTokenExpiresAt });
+}
+
+/// Ticket 08's "Commit as" author identity -- see
+/// `src-tauri/src/author.rs`'s module doc comment for the full resolved
+/// decision this implements. Stored exclusively in the vault's repo-local
+/// `.git/config`; never synced, never in `.git/cerebrite/connection.json`.
+export interface CommitAuthor {
+  name: string;
+  email: string;
+}
+
+/// Where a `commitAuthorPrefill` result's author came from -- lets the UI
+/// say *why* a value showed up rather than displaying it unexplained.
+export type PrefillSource = "repo_local" | "global" | "provider" | "empty";
+
+export interface CommitAuthorPrefillResult {
+  author: CommitAuthor | null;
+  source: PrefillSource;
+}
+
+/// The "Commit as" prefill for the currently open vault: repo-local
+/// `.git/config` -> global `~/.gitconfig` -> empty. Callable during vault
+/// setup (pick/create/clone, before the first commit) as well as from
+/// Settings.
+export function commitAuthorPrefill(): Promise<CommitAuthorPrefillResult> {
+  return invoke("commit_author_prefill");
+}
+
+/// The currently confirmed "Commit as" author for the open vault (repo-local
+/// only) -- `null` means nothing has been confirmed yet. Used by Settings to
+/// show the current value.
+export function getCommitAuthor(): Promise<CommitAuthor | null> {
+  return invoke("get_commit_author");
+}
+
+/// What `confirmCommitAuthor` hands back once `name`/`email` pass
+/// validation -- `warning`, when present, is ticket 11's "warn, never
+/// block" case for a domain that can't be real (`.local`, `localhost`, no
+/// dot). A rejected promise means a hard validation failure (empty name, or
+/// an email missing `@` or carrying an unsafe domain).
+export interface CommitAuthorValidation {
+  warning?: string | null;
+}
+
+/// Validates and, on success, writes `name`/`email` to the vault's
+/// repo-local `.git/config` as the confirmed "Commit as" author -- never
+/// the global config. Callable both as the vault-setup "Commit as" step and
+/// from Settings' editable field; affects future commits only, never
+/// rewrites history.
+export function confirmCommitAuthor(name: string, email: string): Promise<CommitAuthorValidation> {
+  return invoke("confirm_commit_author", { name, email });
 }
