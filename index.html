@@ -13,7 +13,33 @@
       <h1>Cerebrite</h1>
       <p>Select a folder to use as your vault. It doesn't need to be a git repo yet.</p>
       <button id="select-vault-button" type="button">Select vault folder…</button>
+      <!-- Ticket 10: the guided *clone* wizard's entry point -- device #2,
+           no local vault exists yet. A full-screen takeover (below), not a
+           modal: unlike ticket 09's connect wizard, there is no
+           window/vault yet to anchor a modal on top of. -->
+      <p class="vault-picker-alt">
+        Setting up a new device? <button id="clone-wizard-open-button" class="link-button" type="button">I already have a repository…</button>
+      </p>
       <p id="vault-picker-error" class="error" hidden></p>
+    </section>
+
+    <!-- Ticket 10: the guided clone wizard's full-screen surface.
+         `#clone-wizard-body` is rebuilt per-step by main.ts
+         (clone-wizard.ts's pure reducer drives *which* step; main.ts owns
+         rendering it and the actual `invoke` calls), mirroring ticket 09's
+         connect wizard's rendering pattern exactly, just full-screen instead
+         of a modal layered over Settings. -->
+    <section id="clone-wizard-overlay" class="clone-wizard-overlay" hidden>
+      <div id="clone-wizard" class="clone-wizard" role="dialog" aria-modal="true" aria-label="Clone a repository">
+        <div class="clone-wizard-header">
+          <h1>Clone a repository</h1>
+          <button id="clone-wizard-close-button" type="button" aria-label="Cancel">✕</button>
+        </div>
+        <div id="clone-wizard-body" class="clone-wizard-body"></div>
+        <div class="clone-wizard-footer">
+          <button id="clone-wizard-back-button" type="button">Back</button>
+        </div>
+      </div>
     </section>
 
     <div id="workspace" class="workspace" hidden>

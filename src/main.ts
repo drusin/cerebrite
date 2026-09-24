@@ -34,6 +34,7 @@ import {
   commitAuthorPrefill,
   getCommitAuthor,
   confirmCommitAuthor,
+  cloneAndOpenVault,
   type CommitAuthor,
   type PageSummary,
   type PageResolution,
@@ -42,6 +43,8 @@ import {
   type Theme,
   type RepoInfo,
   type SshKeyInfo,
+  type CloneCredential,
+  type CommitAuthorPrefillResult,
 } from "./vault-api";
 import {
   reduceWizard,
@@ -52,6 +55,14 @@ import {
   type WizardAction,
   type WizardProvider,
 } from "./connect-wizard";
+import {
+  reduceCloneWizard,
+  initialCloneWizardState,
+  isCloneWizardDone,
+  isCloneWizardBusyStep,
+  type CloneWizardState,
+  type CloneWizardAction,
+} from "./clone-wizard";
 // `confirm`/`message` from the dialog plugin, not `window.confirm`/`window.alert`:
 // tauri-plugin-dialog's auto-injected webview shim (init-iife.js in the 2.7.3
 // crate) overrides those globals to call a `plugin:dialog|confirm` IPC
@@ -73,6 +84,14 @@ const AUTOSAVE_DEBOUNCE_MS = 1500;
 const vaultPickerEl = document.querySelector<HTMLElement>("#vault-picker");
 const vaultPickerErrorEl = document.querySelector<HTMLElement>("#vault-picker-error");
 const selectVaultButtonEl = document.querySelector<HTMLButtonElement>("#select-vault-button");
+
+// Ticket 10: the guided clone wizard's full-screen DOM handles -- entry
+// point lives on the first-run folder-picker screen above.
+const cloneWizardOpenButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-open-button");
+const cloneWizardOverlayEl = document.querySelector<HTMLElement>("#clone-wizard-overlay");
+const cloneWizardBodyEl = document.querySelector<HTMLElement>("#clone-wizard-body");
+const cloneWizardCloseButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-close-button");
+const cloneWizardBackButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-back-button");
 
 const workspaceEl = document.querySelector<HTMLElement>("#workspace");
 const sidebarEl = document.querySelector<HTMLElement>("#sidebar");
@@ -2045,6 +2064,567 @@ async function renderCommitAuthorStep() {
   connectWizardBodyEl.appendChild(errorEl);
 }
 
+// --- Ticket 10: guided clone wizard (device #2, full-screen) -------------
+//
+// Same architecture as ticket 09's connect wizard section above (a pure
+// `reduceCloneWizard` state machine plus this section owning rendering and
+// the actual `invoke` calls), but full-screen instead of a modal, and with
+// clone's own ordering: authenticate first, then pick/paste a repository,
+// then pick a destination folder, then the real clone (`clone_and_open_vault`
+// -- the clone itself is the test that gates persistence), then "Commit as".
+//
+// Ephemeral data the reducer doesn't track lives in these module-level
+// variables, reset every time the wizard is (re)opened -- same pattern as
+// `wizardAccessToken`/`wizardRepos`/etc above.
+
+let cloneWizardState: CloneWizardState = initialCloneWizardState;
+let cloneWizardAccessToken: string | null = null;
+let cloneWizardRefreshToken: string | undefined;
+let cloneWizardAccessTokenExpiresAt = "";
+let cloneWizardRepos: RepoInfo[] = [];
+let cloneWizardSshKey: SshKeyInfo | null = null;
+/** Holds the pasted-URL access-token form's values between `pasteUrl` and `destinationPicker`, since the reducer only tracks `remoteUrl` -- mirrors `wizardPendingAccessTokenConnect`. */
+let cloneWizardPendingAccessTokenConnect: { remoteUrl: string; username: string; token: string } | null = null;
+/** What the backend's `cloneAndOpenVault` returned once the clone itself succeeds -- the "Commit as" step reads its prefill straight from here instead of a second round trip (see `cloneAndOpenVault`'s doc comment for why the prefill has to be computed at clone time, not via the ordinary `commitAuthorPrefill` command). */
+let cloneWizardAuthorPrefill: CommitAuthorPrefillResult | null = null;
+/** Bumped on every open/close so a stale device-flow poll loop or in-flight clone from a previous attempt can tell it's been abandoned. */
+let cloneWizardGeneration = 0;
+
+function dispatchCloneWizard(action: CloneWizardAction) {
+  cloneWizardState = reduceCloneWizard(cloneWizardState, action);
+  renderCloneWizardStep();
+  if (isCloneWizardDone(cloneWizardState)) {
+    // The clone already opened the vault (server side) -- swap the
+    // full-screen wizard for the ordinary workspace, same tail
+    // `openVaultAndLoad` runs after a plain first-run pick.
+    closeCloneWizard();
+    void finishCloneWizardIntoWorkspace();
+  }
+}
+
+async function finishCloneWizardIntoWorkspace() {
+  const path = cloneWizardClonedPath;
+  if (!path) return;
+  currentVaultPath = path;
+  if (settingsVaultPathEl) settingsVaultPathEl.textContent = path;
+  showWorkspace();
+  await loadPages();
+  await loadTrash();
+}
+
+/** Set once `clone_and_open_vault` succeeds -- the vault path the finishing tail above opens the workspace onto. */
+let cloneWizardClonedPath: string | null = null;
+
+function openCloneWizard() {
+  if (!cloneWizardOverlayEl) return;
+  cloneWizardGeneration += 1;
+  cloneWizardState = { ...initialCloneWizardState };
+  cloneWizardAccessToken = null;
+  cloneWizardRefreshToken = undefined;
+  cloneWizardAccessTokenExpiresAt = "";
+  cloneWizardRepos = [];
+  cloneWizardSshKey = null;
+  cloneWizardPendingAccessTokenConnect = null;
+  cloneWizardAuthorPrefill = null;
+  cloneWizardClonedPath = null;
+  vaultPickerEl?.setAttribute("hidden", "");
+  cloneWizardOverlayEl.removeAttribute("hidden");
+  renderCloneWizardStep();
+}
+
+/** Cancels the wizard and returns to the first-run folder-picker screen -- there is no vault to fall back into (unlike closing ticket 09's connect wizard, which just returns to Settings). */
+function closeCloneWizard() {
+  cloneWizardGeneration += 1; // invalidates any in-flight poll loop/clone
+  cloneWizardOverlayEl?.setAttribute("hidden", "");
+  if (!isCloneWizardDone(cloneWizardState)) {
+    vaultPickerEl?.removeAttribute("hidden");
+  }
+}
+
+/** Renders the current step's content into `#clone-wizard-body`, and updates the shared "Back" button's visibility. */
+function renderCloneWizardStep() {
+  if (!cloneWizardBodyEl) return;
+  cloneWizardBodyEl.innerHTML = "";
+
+  const canGoBack = !isCloneWizardBusyStep(cloneWizardState.step) && cloneWizardState.step !== "providerChoice";
+  if (cloneWizardBackButtonEl) cloneWizardBackButtonEl.hidden = !canGoBack;
+
+  switch (cloneWizardState.step) {
+    case "providerChoice":
+      renderCloneProviderChoiceStep();
+      break;
+    case "credentialChoice":
+      renderCloneCredentialChoiceStep();
+      break;
+    case "otherCredentialKindChoice":
+      renderCloneOtherCredentialKindChoiceStep();
+      break;
+    case "oauthSignIn":
+      renderCloneOauthSignInStep();
+      break;
+    case "repoPicker":
+      renderCloneRepoPickerStep();
+      break;
+    case "pasteUrl":
+      renderClonePasteUrlStep();
+      break;
+    case "destinationPicker":
+      renderCloneDestinationPickerStep();
+      break;
+    case "cloning":
+      renderCloningStep();
+      break;
+    case "cloneError":
+      renderCloneErrorStep();
+      break;
+    case "commitAuthor":
+      void renderCloneCommitAuthorStep();
+      break;
+    case "done":
+      break;
+  }
+}
+
+function renderCloneProviderChoiceStep() {
+  if (!cloneWizardBodyEl) return;
+  cloneWizardBodyEl.appendChild(el("p", "wizard-question", "Which provider is the repository on?"));
+  const row = el("div", "wizard-button-row");
+
+  const githubButton = el("button", undefined, "GitHub");
+  githubButton.type = "button";
+  githubButton.addEventListener("click", () => dispatchCloneWizard({ type: "chooseProvider", provider: "github" }));
+  row.appendChild(githubButton);
+
+  const gitlabButton = el("button", undefined, "GitLab");
+  gitlabButton.type = "button";
+  gitlabButton.addEventListener("click", () => dispatchCloneWizard({ type: "chooseProvider", provider: "gitlab" }));
+  row.appendChild(gitlabButton);
+
+  const otherButton = el("button", undefined, "Another provider");
+  otherButton.type = "button";
+  otherButton.addEventListener("click", () => dispatchCloneWizard({ type: "chooseProvider", provider: "other" }));
+  row.appendChild(otherButton);
+
+  cloneWizardBodyEl.appendChild(row);
+}
+
+function renderCloneCredentialChoiceStep() {
+  if (!cloneWizardBodyEl) return;
+  const label = providerLabel(cloneWizardState.provider);
+  cloneWizardBodyEl.appendChild(el("p", "wizard-question", `How do you want to connect to ${label}?`));
+
+  const signInButton = el("button", "wizard-primary-action", `Sign in with ${label}`);
+  signInButton.type = "button";
+  signInButton.addEventListener("click", () => dispatchCloneWizard({ type: "chooseOauthSignIn" }));
+  cloneWizardBodyEl.appendChild(signInButton);
+
+  const otherWaysButton = el("button", "wizard-secondary-action", "Other ways to connect");
+  otherWaysButton.type = "button";
+  otherWaysButton.addEventListener("click", () => dispatchCloneWizard({ type: "chooseOtherWaysToConnect" }));
+  cloneWizardBodyEl.appendChild(otherWaysButton);
+}
+
+function renderCloneOtherCredentialKindChoiceStep() {
+  if (!cloneWizardBodyEl) return;
+  cloneWizardBodyEl.appendChild(el("p", "wizard-question", "How do you want to authenticate?"));
+  const row = el("div", "wizard-button-row");
+
+  const tokenButton = el("button", undefined, "Access token");
+  tokenButton.type = "button";
+  tokenButton.addEventListener("click", () =>
+    dispatchCloneWizard({ type: "chooseOtherCredentialKind", kind: "accessToken" }),
+  );
+  row.appendChild(tokenButton);
+
+  const sshButton = el("button", undefined, "SSH key");
+  sshButton.type = "button";
+  sshButton.addEventListener("click", () =>
+    dispatchCloneWizard({ type: "chooseOtherCredentialKind", kind: "sshKey" }),
+  );
+  row.appendChild(sshButton);
+
+  cloneWizardBodyEl.appendChild(row);
+}
+
+/** Ticket 06/07's device-flow steps -- same mechanics as `runOauthSignIn` above, landing on `dispatchCloneWizard` transitions instead. */
+function renderCloneOauthSignInStep() {
+  if (!cloneWizardBodyEl) return;
+  const provider = cloneWizardState.provider;
+  const statusEl = el("p", "settings-connect-status", `Requesting a device code from ${providerLabel(provider)}…`);
+  cloneWizardBodyEl.appendChild(statusEl);
+  const codeEl = el("div", "settings-connect-status");
+  codeEl.hidden = true;
+  cloneWizardBodyEl.appendChild(codeEl);
+
+  const generation = cloneWizardGeneration;
+  void runCloneOauthSignIn(provider, statusEl, codeEl, generation);
+}
+
+async function runCloneOauthSignIn(
+  provider: WizardProvider | null,
+  statusEl: HTMLElement,
+  codeEl: HTMLElement,
+  generation: number,
+) {
+  const stale = () => generation !== cloneWizardGeneration;
+  try {
+    const device = provider === "gitlab" ? await startGitlabDeviceFlow() : await startGithubDeviceFlow();
+    if (stale()) return;
+
+    const link = el("a", undefined, device.verificationUri);
+    link.href = device.verificationUri;
+    link.target = "_blank";
+    link.rel = "noopener";
+    const codeText = el("p");
+    codeText.appendChild(document.createTextNode("Go to "));
+    codeText.appendChild(link);
+    codeText.appendChild(document.createTextNode(" and enter code: "));
+    codeText.appendChild(el("strong", undefined, device.userCode));
+    codeEl.innerHTML = "";
+    codeEl.appendChild(codeText);
+    codeEl.hidden = false;
+    statusEl.textContent = "Waiting for you to approve in the browser…";
+
+    const deadline = Date.now() + device.expiresInSecs * 1000;
+    let intervalMs = Math.max(device.intervalSecs, 1) * 1000;
+    let accessToken: string;
+    let refreshToken: string | undefined;
+    let accessTokenExpiresAt: string;
+
+    for (;;) {
+      if (stale()) return;
+      if (Date.now() >= deadline)
+        throw new Error(`The ${providerLabel(provider)} sign-in code expired before it was confirmed.`);
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      if (stale()) return;
+
+      const result =
+        provider === "gitlab" ? await pollGitlabDeviceFlow(device.deviceCode) : await pollGithubDeviceFlow(device.deviceCode);
+      if (result.outcome === "pending") continue;
+      if (result.outcome === "slowDown") {
+        intervalMs += 5000;
+        continue;
+      }
+      if (result.outcome === "denied") throw new Error(`${providerLabel(provider)} sign-in was denied.`);
+      if (result.outcome === "expired")
+        throw new Error(`The ${providerLabel(provider)} sign-in code expired before it was confirmed.`);
+      if (result.outcome === "error") throw new Error(result.message);
+
+      accessToken = result.accessToken;
+      refreshToken = result.refreshToken;
+      accessTokenExpiresAt = result.accessTokenExpiresAt;
+      break;
+    }
+
+    if (stale()) return;
+
+    cloneWizardAccessToken = accessToken;
+    cloneWizardRefreshToken = refreshToken;
+    cloneWizardAccessTokenExpiresAt = accessTokenExpiresAt;
+    codeEl.hidden = true;
+    dispatchCloneWizard({ type: "oauthSignInSucceeded" });
+  } catch (err) {
+    if (stale()) return;
+    statusEl.textContent = String(err);
+    codeEl.hidden = true;
+  }
+}
+
+function renderCloneRepoPickerStep() {
+  if (!cloneWizardBodyEl) return;
+  const statusEl = el("p", "settings-connect-status", "Loading your repositories…");
+  cloneWizardBodyEl.appendChild(statusEl);
+  const listEl = el("ul", "wizard-repo-list");
+  cloneWizardBodyEl.appendChild(listEl);
+
+  const generation = cloneWizardGeneration;
+  void loadCloneRepoPicker(statusEl, listEl, generation);
+}
+
+async function loadCloneRepoPicker(statusEl: HTMLElement, listEl: HTMLElement, generation: number) {
+  if (!cloneWizardAccessToken) {
+    statusEl.textContent = "Sign-in is required before listing repositories.";
+    return;
+  }
+  try {
+    cloneWizardRepos =
+      cloneWizardState.provider === "gitlab"
+        ? await listGitlabRepositories(cloneWizardAccessToken)
+        : await listGithubRepositories(cloneWizardAccessToken);
+    if (generation !== cloneWizardGeneration) return;
+
+    if (cloneWizardRepos.length === 0) {
+      statusEl.textContent = "No repositories found for this account.";
+      return;
+    }
+    statusEl.textContent = "Pick a repository to clone:";
+    for (const repo of cloneWizardRepos) {
+      const item = el("li");
+      const button = el("button", "wizard-repo-item");
+      button.type = "button";
+      button.appendChild(el("span", "wizard-repo-name", repo.fullName));
+      button.appendChild(el("span", "wizard-repo-visibility", repo.private ? "Private" : "Public"));
+      button.addEventListener("click", () => dispatchCloneWizard({ type: "repoSelected", remoteUrl: repo.cloneUrl }));
+      item.appendChild(button);
+      listEl.appendChild(item);
+    }
+  } catch (err) {
+    if (generation !== cloneWizardGeneration) return;
+    statusEl.textContent = `Couldn't load repositories: ${String(err)}`;
+  }
+}
+
+function renderClonePasteUrlStep() {
+  if (!cloneWizardBodyEl) return;
+  cloneWizardBodyEl.appendChild(el("p", "wizard-question", "Enter the repository's URL:"));
+
+  const urlInput = el("input");
+  urlInput.type = "text";
+  urlInput.placeholder = "https://example.com/user/repo.git";
+  cloneWizardBodyEl.appendChild(urlInput);
+
+  if (cloneWizardState.credentialKind === "accessToken") {
+    const usernameInput = el("input");
+    usernameInput.type = "text";
+    usernameInput.placeholder = "Username";
+    cloneWizardBodyEl.appendChild(usernameInput);
+    const tokenInput = el("input");
+    tokenInput.type = "password";
+    tokenInput.placeholder = "Access token";
+    cloneWizardBodyEl.appendChild(tokenInput);
+
+    const errorEl = el("p", "error wizard-inline-error");
+    errorEl.hidden = true;
+
+    const nextButton = el("button", "wizard-primary-action", "Continue");
+    nextButton.type = "button";
+    nextButton.addEventListener("click", () => {
+      const remoteUrl = urlInput.value.trim();
+      const username = usernameInput.value.trim();
+      const token = tokenInput.value;
+      if (!remoteUrl || !username || !token) {
+        errorEl.textContent = "Repository URL, username, and access token are all required.";
+        errorEl.hidden = false;
+        return;
+      }
+      errorEl.hidden = true;
+      cloneWizardPendingAccessTokenConnect = { remoteUrl, username, token };
+      dispatchCloneWizard({ type: "urlEntered", remoteUrl });
+    });
+    cloneWizardBodyEl.appendChild(nextButton);
+    cloneWizardBodyEl.appendChild(errorEl);
+    return;
+  }
+
+  // SSH key path (ticket 05): generate (default) or import, then continue.
+  const keyStatusEl = el("p", "settings-connect-status");
+  cloneWizardBodyEl.appendChild(keyStatusEl);
+
+  const generateButton = el("button", undefined, "Generate a new key");
+  generateButton.type = "button";
+  generateButton.addEventListener("click", () => void handleCloneWizardGenerateSshKey(keyStatusEl));
+  cloneWizardBodyEl.appendChild(generateButton);
+
+  const importButton = el("button", undefined, "Import an existing key");
+  importButton.type = "button";
+  importButton.addEventListener("click", () => void handleCloneWizardImportSshKey(keyStatusEl));
+  cloneWizardBodyEl.appendChild(importButton);
+
+  const nextButton = el("button", "wizard-primary-action", "Continue");
+  nextButton.type = "button";
+  nextButton.addEventListener("click", () => {
+    const remoteUrl = urlInput.value.trim();
+    if (!remoteUrl) {
+      keyStatusEl.textContent = "Enter the repository's URL first.";
+      return;
+    }
+    if (!cloneWizardSshKey) {
+      keyStatusEl.textContent = "Generate (or import) a key first.";
+      return;
+    }
+    dispatchCloneWizard({ type: "urlEntered", remoteUrl });
+  });
+  cloneWizardBodyEl.appendChild(nextButton);
+}
+
+async function handleCloneWizardGenerateSshKey(statusEl: HTMLElement) {
+  statusEl.textContent = "Generating…";
+  try {
+    cloneWizardSshKey = await generateSshKey();
+    statusEl.textContent = `Key ready (fingerprint ${cloneWizardSshKey.fingerprintSha256}). Add the public key to your provider, then Continue.`;
+  } catch (err) {
+    statusEl.textContent = String(err);
+  }
+}
+
+async function handleCloneWizardImportSshKey(statusEl: HTMLElement) {
+  const privateKeyOpenssh = window.prompt("Paste the private key (OpenSSH format):");
+  if (privateKeyOpenssh === null || !privateKeyOpenssh.trim()) return;
+  const passphrase = window.prompt("Passphrase (leave blank if none):") ?? undefined;
+
+  statusEl.textContent = "Importing…";
+  try {
+    cloneWizardSshKey = await importSshKey(privateKeyOpenssh, passphrase || undefined);
+    statusEl.textContent = `Key imported (fingerprint ${cloneWizardSshKey.fingerprintSha256}). Add the public key to your provider, then Continue.`;
+  } catch (err) {
+    statusEl.textContent = String(err);
+  }
+}
+
+/** Ticket 10 checklist item 3: pick a destination folder, reusing the exact same native folder-picker mechanism (`pickVaultFolder`) the first-run screen already uses -- there is nothing vault-specific about it, it just opens a directory picker. */
+function renderCloneDestinationPickerStep() {
+  if (!cloneWizardBodyEl) return;
+  cloneWizardBodyEl.appendChild(
+    el("p", "wizard-question", "Pick an empty folder to clone into:"),
+  );
+  const statusEl = el("p", "settings-connect-status");
+  cloneWizardBodyEl.appendChild(statusEl);
+
+  const pickButton = el("button", "wizard-primary-action", "Choose folder…");
+  pickButton.type = "button";
+  pickButton.addEventListener("click", () => void handleCloneDestinationPickClick(statusEl));
+  cloneWizardBodyEl.appendChild(pickButton);
+}
+
+async function handleCloneDestinationPickClick(statusEl: HTMLElement) {
+  try {
+    const path = await pickVaultFolder();
+    if (!path) return; // user cancelled
+    dispatchCloneWizard({ type: "destinationChosen", destination: path });
+  } catch (err) {
+    statusEl.textContent = String(err);
+  }
+}
+
+function renderCloningStep() {
+  if (!cloneWizardBodyEl) return;
+  cloneWizardBodyEl.appendChild(el("p", "settings-connect-status", "Cloning…"));
+  const generation = cloneWizardGeneration;
+  void performClone(generation);
+}
+
+/**
+ * Ticket 10 checklist item 4/5/7: the real clone -- `clone_and_open_vault`
+ * authenticates with whichever credential this wizard obtained, clones,
+ * classifies the four post-clone states, and only *then* persists the
+ * Connection + remembered vault path. A failure here (network, credential,
+ * or the "refused" classification) turns into `cloneFailed` (a clear
+ * in-wizard error, nothing saved); success turns into `cloneSucceeded` (->
+ * "Commit as").
+ */
+async function performClone(generation: number) {
+  const remoteUrl = cloneWizardState.remoteUrl;
+  const destination = cloneWizardState.destination;
+  if (!remoteUrl || !destination) {
+    dispatchCloneWizard({ type: "cloneFailed", message: "No repository or destination folder to clone into." });
+    return;
+  }
+  try {
+    let credential: CloneCredential;
+    if (cloneWizardState.credentialKind === "oauth") {
+      if (!cloneWizardAccessToken) throw new Error("Sign-in is required before cloning.");
+      if (cloneWizardState.provider === "github") {
+        const installation = await checkGithubInstallation(remoteUrl, cloneWizardAccessToken);
+        if (installation.status === "notInstalled") {
+          throw new Error(
+            `Cerebrite isn't installed on this repository yet. Install it at ${installation.installUrl}, then try again.`,
+          );
+        }
+        credential = {
+          kind: "githubOauth",
+          accessToken: cloneWizardAccessToken,
+          refreshToken: cloneWizardRefreshToken ?? "",
+          accessTokenExpiresAt: cloneWizardAccessTokenExpiresAt,
+        };
+      } else {
+        credential = {
+          kind: "gitlabOauth",
+          accessToken: cloneWizardAccessToken,
+          refreshToken: cloneWizardRefreshToken,
+          accessTokenExpiresAt: cloneWizardAccessTokenExpiresAt,
+        };
+      }
+    } else if (cloneWizardState.credentialKind === "accessToken") {
+      if (!cloneWizardPendingAccessTokenConnect) throw new Error("Missing access token details.");
+      credential = {
+        kind: "accessToken",
+        username: cloneWizardPendingAccessTokenConnect.username,
+        token: cloneWizardPendingAccessTokenConnect.token,
+      };
+    } else if (cloneWizardState.credentialKind === "sshKey") {
+      if (!cloneWizardSshKey) throw new Error("Generate or import an SSH key first.");
+      credential = {
+        kind: "sshKey",
+        privateKeyOpenssh: cloneWizardSshKey.privateKeyOpenssh,
+        passphrase: cloneWizardSshKey.passphrase,
+      };
+    } else {
+      throw new Error("No authentication method was chosen.");
+    }
+
+    const result = await cloneAndOpenVault(remoteUrl, destination, credential);
+    if (generation !== cloneWizardGeneration) return;
+    cloneWizardClonedPath = result.vault.path;
+    cloneWizardAuthorPrefill = result.authorPrefill;
+    dispatchCloneWizard({ type: "cloneSucceeded" });
+  } catch (err) {
+    if (generation !== cloneWizardGeneration) return;
+    dispatchCloneWizard({ type: "cloneFailed", message: `Couldn't clone: ${String(err)}` });
+  }
+}
+
+function renderCloneErrorStep() {
+  if (!cloneWizardBodyEl) return;
+  cloneWizardBodyEl.appendChild(el("p", "error", cloneWizardState.error ?? "Couldn't clone."));
+  const retryButton = el("button", "wizard-primary-action", "Pick a different folder and try again");
+  retryButton.type = "button";
+  retryButton.addEventListener("click", () => dispatchCloneWizard({ type: "retry" }));
+  cloneWizardBodyEl.appendChild(retryButton);
+}
+
+/** Ticket 10's last step, reusing ticket 08's exact commands -- prefilled from `cloneWizardAuthorPrefill` (computed by the backend at clone time, see its declaration above) rather than a second `commitAuthorPrefill` round trip. */
+async function renderCloneCommitAuthorStep() {
+  if (!cloneWizardBodyEl) return;
+  cloneWizardBodyEl.appendChild(el("p", "wizard-question", "Commit as:"));
+
+  const nameInput = el("input");
+  nameInput.type = "text";
+  nameInput.placeholder = "Name";
+  const emailInput = el("input");
+  emailInput.type = "text";
+  emailInput.placeholder = "Email";
+
+  const author = cloneWizardAuthorPrefill?.author ?? null;
+  nameInput.value = author?.name ?? "";
+  emailInput.value = author?.email ?? "";
+
+  cloneWizardBodyEl.appendChild(nameInput);
+  cloneWizardBodyEl.appendChild(emailInput);
+
+  const errorEl = el("p", "error wizard-inline-error");
+  errorEl.hidden = true;
+
+  const saveButton = el("button", "wizard-primary-action", "Finish");
+  saveButton.type = "button";
+  saveButton.addEventListener("click", () => {
+    void (async () => {
+      try {
+        // `confirmCommitAuthor` operates on `AppState`'s currently open
+        // vault -- `clone_and_open_vault` already opened it server-side by
+        // this point, so this is the same call ticket 08's own commands use.
+        await confirmCommitAuthor(nameInput.value.trim(), emailInput.value.trim());
+        await refreshCommitAuthorFields();
+        dispatchCloneWizard({ type: "commitAuthorConfirmed" });
+      } catch (err) {
+        errorEl.textContent = String(err);
+        errorEl.hidden = false;
+      }
+    })();
+  });
+  cloneWizardBodyEl.appendChild(saveButton);
+  cloneWizardBodyEl.appendChild(errorEl);
+}
+
 function closeSettingsModal() {
   settingsModalOverlayEl?.setAttribute("hidden", "");
 }
@@ -2120,6 +2700,16 @@ async function init() {
   connectWizardOverlayEl?.addEventListener("click", (event) => {
     if (event.target === connectWizardOverlayEl) closeConnectWizard();
   });
+  cloneWizardOpenButtonEl?.addEventListener("click", openCloneWizard);
+  cloneWizardCloseButtonEl?.addEventListener("click", closeCloneWizard);
+  cloneWizardBackButtonEl?.addEventListener("click", () => dispatchCloneWizard({ type: "back" }));
+  cloneWizardOverlayEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !isCloneWizardBusyStep(cloneWizardState.step)) {
+      event.preventDefault();
+      closeCloneWizard();
+    }
+  });
+
   connectWizardOverlayEl?.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       event.preventDefault();

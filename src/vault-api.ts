@@ -481,3 +481,43 @@ export interface CommitAuthorValidation {
 export function confirmCommitAuthor(name: string, email: string): Promise<CommitAuthorValidation> {
   return invoke("confirm_commit_author", { name, email });
 }
+
+/// Ticket 10's clone credential, mirroring `src-tauri/src/lib.rs`'s
+/// `CloneCredential` enum's `#[serde(tag = "kind", rename_all =
+/// "camelCase")]` shape exactly -- `kind` selects which of the four already-
+/// working credential mechanisms (tickets 04/05/06/07) authenticates the
+/// clone.
+export type CloneCredential =
+  | { kind: "accessToken"; username: string; token: string }
+  | { kind: "sshKey"; privateKeyOpenssh: string; passphrase?: string }
+  | { kind: "githubOauth"; accessToken: string; refreshToken: string; accessTokenExpiresAt: string }
+  | { kind: "gitlabOauth"; accessToken: string; refreshToken?: string; accessTokenExpiresAt: string };
+
+/// What `cloneAndOpenVault` hands back on success: the newly opened vault
+/// (same shape `openVault` returns) plus the "Commit as" prefill for the
+/// clone wizard's final step -- computed server-side because it includes
+/// the provider tier `commitAuthorPrefill` deliberately never does (see
+/// that function's doc comment), which only applies once an OAuth
+/// credential has actually authenticated something.
+export interface CloneAndOpenVaultResult {
+  vault: VaultInfo;
+  authorPrefill: CommitAuthorPrefillResult;
+}
+
+/// Ticket 10's guided clone wizard (device #2 -- no local vault exists yet):
+/// authenticates with `credential` (already obtained by the wizard via the
+/// same device-flow/manual-credential commands ticket 09's connect wizard
+/// uses), clones `remoteUrl` into `destination` (which must already exist
+/// and be empty), and classifies the result into one of the four post-clone
+/// states from ticket 01 -- creating/adopting `vault/` as needed, or
+/// rejecting this promise with a clear explanation if the remote's `vault/`
+/// entry looks incompatible. Per the ticket, the clone itself *is* the test
+/// that gates persistence: nothing is saved (no Connection, no remembered
+/// vault path) unless the clone and classification both succeed.
+export function cloneAndOpenVault(
+  remoteUrl: string,
+  destination: string,
+  credential: CloneCredential,
+): Promise<CloneAndOpenVaultResult> {
+  return invoke("clone_and_open_vault", { remoteUrl, destination, credential });
+}

@@ -1151,6 +1151,317 @@ fn infer_provider(remote_url: &str) -> connection_record::Provider {
     }
 }
 
+/// Ticket 10's guided *clone* wizard (device #2 -- no local vault exists
+/// yet): which of the four already-working credential mechanisms
+/// (tickets 04/05/06/07) the just-completed authentication step used. Unlike
+/// `connect_access_token`/`connect_ssh_key`/`connect_github_oauth`/
+/// `connect_gitlab_oauth`, this can't be four separate commands that each
+/// build their own `ConnectionRecord` the way those do, because clone has
+/// exactly one shared "clone, classify, then persist" tail regardless of
+/// which credential authenticated it -- a single command dispatching on this
+/// enum keeps that tail from being duplicated four times.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum CloneCredential {
+    /// Ticket 04's manual path.
+    AccessToken { username: String, token: String },
+    /// Ticket 05's manual path.
+    SshKey {
+        private_key_openssh: String,
+        passphrase: Option<String>,
+    },
+    /// Ticket 06's device flow, already completed by the wizard before this
+    /// command is called.
+    GithubOauth {
+        access_token: String,
+        refresh_token: String,
+        access_token_expires_at: String,
+    },
+    /// Ticket 07's device flow -- `refresh_token` mirrors
+    /// `connect_gitlab_oauth`'s own `Option` (GitLab's device grant may not
+    /// return one).
+    GitlabOauth {
+        access_token: String,
+        refresh_token: Option<String>,
+        access_token_expires_at: String,
+    },
+}
+
+/// What `clone_and_open_vault` hands back on success: the newly opened
+/// vault (same shape `open_vault` returns) plus the "Commit as" prefill for
+/// the wizard's final step. Computed here rather than via a follow-up call
+/// to `commit_author_prefill` because that command deliberately never
+/// includes the provider tier (see its doc comment) -- clone's own ordering
+/// (ticket 10: "prefilled from the cloned repo's config if present, else the
+/// provider") needs the provider fallback that only `connect_github_oauth`/
+/// `connect_gitlab_oauth` otherwise compute, and only when an OAuth
+/// credential authenticated this clone. In practice the "cloned repo's
+/// config" half of that precedence is close to moot: repo-local git config
+/// never travels with a repository's tracked content (author.rs's module
+/// doc comment), so a freshly cloned repo's repo-local tier is essentially
+/// always empty on a device that has never confirmed an author for it
+/// before -- this still checks it first for correctness (and because
+/// nothing stops a future device from writing one before this ever runs),
+/// it just rarely wins in practice.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloneAndOpenVaultResult {
+    vault: VaultInfo,
+    author_prefill: author::PrefillResult,
+}
+
+/// Ticket 10's clone entry point: authenticates with whichever credential
+/// the wizard already obtained (`credential`), clones `remote_url` into
+/// `destination` (which must exist and be empty -- the wizard's folder
+/// picker, like the first-run one, only ever returns an existing directory),
+/// classifies the result into one of `vault::ClonedVaultState`'s cases
+/// (creating/adopting `vault/` as needed, or refusing), and only then opens
+/// it as the app's vault and persists the Connection -- mirroring
+/// `connection::try_connect`'s "no connection is persisted until a test
+/// fetch succeeds" gate, except here the clone itself *is* the test (per the
+/// ticket): a failed clone leaves no Connection, no settings change, and no
+/// usable vault behind.
+///
+/// `destination` is deliberately checked empty (not merely "a directory")
+/// before attempting anything: libgit2 already refuses to clone into a
+/// non-empty directory, but with a much less actionable message than naming
+/// the problem up front.
+#[tauri::command]
+fn clone_and_open_vault(
+    app: AppHandle,
+    state: State<AppState>,
+    remote_url: String,
+    destination: String,
+    credential: CloneCredential,
+) -> Result<CloneAndOpenVaultResult, String> {
+    let remote_url = remote_url.trim().to_string();
+    if remote_url.is_empty() {
+        return Err("Repository URL is required".to_string());
+    }
+
+    let destination_path = PathBuf::from(&destination);
+    if !destination_path.is_dir() {
+        return Err(format!("'{destination}' is not a directory"));
+    }
+    if std::fs::read_dir(&destination_path)
+        .map_err(|e| e.to_string())?
+        .next()
+        .is_some()
+    {
+        return Err(format!(
+            "'{destination}' is not empty -- pick an empty folder to clone into."
+        ));
+    }
+
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let plaintext = credential::PlaintextStore::new(&config_dir);
+    let known_hosts_path = credential::known_hosts_path(&config_dir).ok();
+
+    let provider = infer_provider(&remote_url);
+
+    // Per-kind validation + record shape, mirroring each `connect_*`
+    // command's own checks -- `uses_ssh_host_check` decides whether
+    // `known_hosts_path` is consulted at all (ticket 05: meaningless over
+    // HTTPS/TLS, same as every `connect_*` command above already treats it).
+    let (record_kind, https_username, token_expiry, secret_bytes, uses_ssh_host_check) = match &credential {
+        CloneCredential::AccessToken { username, token } => {
+            let username = username.trim().to_string();
+            if username.is_empty() || token.is_empty() {
+                return Err("Username and access token are both required".to_string());
+            }
+            (
+                connection_record::CredentialKind::AccessToken,
+                Some(username),
+                None,
+                token.clone().into_bytes(),
+                false,
+            )
+        }
+        CloneCredential::SshKey {
+            private_key_openssh,
+            passphrase,
+        } => {
+            if private_key_openssh.trim().is_empty() {
+                return Err("An SSH private key is required".to_string());
+            }
+            (
+                connection_record::CredentialKind::SshKey,
+                None,
+                None,
+                ssh_key::SshSecret {
+                    private_key_openssh: private_key_openssh.clone(),
+                    passphrase: passphrase.clone(),
+                }
+                .to_bytes(),
+                true,
+            )
+        }
+        CloneCredential::GithubOauth {
+            access_token,
+            refresh_token,
+            access_token_expires_at,
+        } => {
+            if access_token.is_empty() || refresh_token.is_empty() {
+                return Err("A GitHub access token and refresh token are both required".to_string());
+            }
+            (
+                connection_record::CredentialKind::OauthSignIn,
+                Some("x-access-token".to_string()),
+                Some(access_token_expires_at.clone()),
+                github_oauth::OauthSecret {
+                    access_token: access_token.clone(),
+                    refresh_token: refresh_token.clone(),
+                }
+                .to_bytes(),
+                false,
+            )
+        }
+        CloneCredential::GitlabOauth {
+            access_token,
+            refresh_token,
+            access_token_expires_at,
+        } => {
+            if access_token.is_empty() {
+                return Err("A GitLab access token is required".to_string());
+            }
+            (
+                connection_record::CredentialKind::OauthSignIn,
+                Some(gitlab_oauth::GITLAB_HTTPS_USERNAME.to_string()),
+                Some(access_token_expires_at.clone()),
+                gitlab_oauth::OauthSecret {
+                    access_token: access_token.clone(),
+                    refresh_token: refresh_token.clone(),
+                }
+                .to_bytes(),
+                false,
+            )
+        }
+    };
+
+    let keychain = credential::KeychainBackend::platform().ok();
+    let store_kind = match &keychain {
+        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
+        _ => connection_record::StoreKind::Plaintext,
+    };
+
+    let record = connection_record::ConnectionRecord {
+        connection_id: uuid::Uuid::new_v4().to_string(),
+        credential_kind: record_kind,
+        provider,
+        https_username,
+        token_expiry,
+        credential_store: store_kind,
+    };
+
+    let connection = connection::Connection::from_parts(record.clone(), secret_bytes.clone());
+    let effective_known_hosts = if uses_ssh_host_check {
+        known_hosts_path.as_deref()
+    } else {
+        None
+    };
+
+    // The clone itself is the test (ticket 10): a credential/network/host-key
+    // failure here is reported the same way `try_connect`'s test fetch
+    // reports one, and leaves the destination folder exactly as empty as it
+    // was found -- nothing is persisted, and any partial clone debris is
+    // best-effort cleaned up so the same destination can be retried
+    // immediately rather than failing a second time with "not empty".
+    let clone_result = vault::clone_repo(&remote_url, &destination_path, &connection, effective_known_hosts);
+    let cloned_repo = match clone_result {
+        Ok(repo) => repo,
+        Err(e) => {
+            cleanup_failed_clone(&destination_path);
+            return Err(sync::classify_git_error_for(&e, Some(&connection)).to_string());
+        }
+    };
+    drop(cloned_repo);
+
+    let (_clone_state, vault_path) = match vault::classify_cloned_repo(&destination_path) {
+        Ok(result) => result,
+        Err(e) => {
+            cleanup_failed_clone(&destination_path);
+            return Err(e.to_string());
+        }
+    };
+    let repo_root = destination_path.clone();
+
+    // Only now, with a real cloned-and-classified repository in hand, is
+    // anything persisted -- the secret, the connection record, and the
+    // remembered vault path.
+    match store_kind {
+        connection_record::StoreKind::Keychain => keychain
+            .as_ref()
+            .ok_or_else(|| "no keychain backend is available".to_string())?
+            .set_secret(&record.connection_id, &secret_bytes, credential::CallUrgency::Interactive)
+            .map_err(|e| e.to_string())?,
+        connection_record::StoreKind::Plaintext => plaintext
+            .set_secret(&record.connection_id, &secret_bytes)
+            .map_err(|e| e.to_string())?,
+    }
+    connection_record::write(&repo_root, &record).map_err(|e| e.to_string())?;
+
+    settings::set_vault_path(&app, &repo_root).map_err(|e| e.to_string())?;
+    let device_id = vault::load_or_create_device_id(&app).map_err(|e| e.to_string())?;
+
+    let db_file = derived_index_path(&app)?;
+    let _ = std::fs::remove_file(&db_file);
+    let mut conn = Connection::open(&db_file).map_err(|e| e.to_string())?;
+    let page_count = index::build_index(&mut conn, &vault_path).map_err(|e| e.to_string())?;
+    redirects::cleanup_and_prune(&vault_path, &repo_root, &conn).map_err(|e| e.to_string())?;
+
+    *state.vault_path.lock().unwrap() = Some(vault_path.clone());
+    *state.db.lock().unwrap() = Some(conn);
+    *state.device_id.lock().unwrap() = Some(device_id);
+
+    let (tx, rx) = mpsc::channel();
+    *state.sync_tx.lock().unwrap() = Some(tx);
+    spawn_sync_loop(app.clone(), vault_path.clone(), repo_root.clone(), rx);
+
+    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    notify_sync(&state);
+
+    // Ticket 10 checklist: "Wizard ends on the 'Commit as' step, prefilled
+    // from the cloned repo's config if any, or the provider" -- see
+    // `CloneAndOpenVaultResult`'s doc comment for why this is computed here
+    // rather than via the ordinary `commit_author_prefill` command.
+    let repo_local = author::read_repo_local(&repo_root).unwrap_or(None);
+    let global = author::read_global().unwrap_or(None);
+    let provider_identity = match &credential {
+        CloneCredential::GithubOauth { access_token, .. } => {
+            let endpoints = github_oauth::GitHubEndpoints::production();
+            author::fetch_github_identity(&endpoints.api_base_url, access_token).ok()
+        }
+        CloneCredential::GitlabOauth { access_token, .. } => {
+            const GITLAB_API_BASE_URL: &str = "https://gitlab.com/api/v4";
+            author::fetch_gitlab_identity(GITLAB_API_BASE_URL, access_token).ok().flatten()
+        }
+        CloneCredential::AccessToken { .. } | CloneCredential::SshKey { .. } => None,
+    };
+    let author_prefill = author::prefill(repo_local, global, provider_identity);
+
+    Ok(CloneAndOpenVaultResult {
+        vault: VaultInfo {
+            path: vault_path.to_string_lossy().to_string(),
+            page_count,
+        },
+        author_prefill,
+    })
+}
+
+/// Best-effort cleanup after a failed clone/classify attempt: `destination`
+/// was verified empty immediately before the attempt (`clone_and_open_vault`
+/// checks this up front), so anything found there now is debris from this
+/// attempt alone -- safe to discard and recreate empty so the wizard can
+/// retry the same destination without a confusing "not empty" error on the
+/// very next attempt. Deliberately silent about its own failure (e.g. a
+/// permissions issue) -- leaving debris behind is a lesser problem than
+/// this cleanup itself turning "clone failed" into a different, more
+/// confusing error.
+fn cleanup_failed_clone(destination: &Path) {
+    let _ = std::fs::remove_dir_all(destination);
+    let _ = std::fs::create_dir_all(destination);
+}
+
 /// Lists every persisted page's id/title, flat and alphabetical.
 #[tauri::command]
 fn list_pages(state: State<AppState>) -> Result<Vec<PageSummary>, String> {
@@ -1858,6 +2169,7 @@ pub fn run() {
             connect_gitlab_oauth,
             create_gitlab_repository,
             list_gitlab_repositories,
+            clone_and_open_vault,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

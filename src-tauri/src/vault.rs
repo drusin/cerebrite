@@ -243,6 +243,118 @@ pub fn commit_all(repo_root: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ticket 10: which of the post-*clone* states a freshly cloned repository
+/// ended up in, returned by `classify_cloned_repo` alongside the vault path
+/// it settled on. Distinct from (but deliberately mirrors) the four cases
+/// `ensure_git_repo`'s doc comment lists for a *locally picked* repo --
+/// clone's starting point is a remote's history rather than a folder
+/// already on disk, so the case split is slightly different: there is no
+/// "picked a folder nested inside an existing repo" case (the destination
+/// is always freshly cloned into, never discovered), but there is a new
+/// "empty remote" case ensure_git_repo never sees (a locally picked folder
+/// that isn't a repo yet always becomes one via `git init`, which is never
+/// literally empty of *possibility* the way a freshly cloned empty remote
+/// is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClonedVaultState {
+    /// The remote had no commits at all (`Repository::is_empty()`) -- there
+    /// is nothing to adopt, so `vault/` is simply created fresh, exactly
+    /// like `ensure_git_repo`'s fresh-folder case.
+    EmptyRemote,
+    /// The remote already has a `vault/` directory at its root -- the
+    /// ordinary case, nothing to create or adopt.
+    Ordinary,
+    /// The remote has commits/content but no `vault/` at its root -- adopted
+    /// exactly like `ensure_git_repo`'s case 3: `vault/` is created fresh
+    /// and existing root content is left untouched beside it.
+    Adopted,
+}
+
+/// Ticket 10's post-clone counterpart to `ensure_git_repo`: `repo_root` must
+/// already be the root of a just-cloned repository (not merely discovered --
+/// clone always makes the destination the root, so there is no "nested
+/// folder" case to refuse the way `ensure_git_repo` does for a locally
+/// picked path). Classifies which of the three adoptable states the clone
+/// landed in and creates `vault/` where needed, or refuses with an
+/// explanation for the one state judged *not* safely adoptable.
+///
+/// # The refusal case
+///
+/// The ticket asks for a fourth state -- "the remote has an unrelated
+/// `vault/` history that looks pre-existing-but-foreign" -- refused rather
+/// than silently adopted, and leaves the exact signal to implementation
+/// judgement. Unlike `ensure_git_repo`'s `looks_like_a_legacy_root_vault`
+/// (which has a real, previously-established signal to key off: a
+/// root-level `.cerebrite/` directory only an earlier Cerebrite version
+/// could have created), nothing about a remote's `vault/` directory's
+/// *contents* reliably distinguishes "a foreign, unrelated vault/" from "an
+/// ordinary Cerebrite vault/ that simply hasn't been touched yet" -- a
+/// vault/ with zero pages looks identical either way, and one with pages
+/// looks like an ordinary vault regardless of who created it. Rather than
+/// invent a heuristic over content that has no real distinguishing signal
+/// (and risk refusing a perfectly good ordinary clone, which is a worse
+/// failure mode than under-refusing), this reserves "refused" for a
+/// concrete bad state actually discovered while wiring this up: a root-level
+/// path named `vault` that exists but *isn't a directory* (a plain file, a
+/// symlink to one, etc). That state can never be produced by
+/// `ensure_git_repo`/`commit_all` (which only ever create/write inside a
+/// `vault/` directory), so it is unambiguous evidence of something else
+/// entirely occupying that name -- genuinely incompatible, not just
+/// unfamiliar -- and adopting "beside" it the way case 3 does isn't
+/// possible (the directory `vault/` this app needs can't be created where a
+/// file of the same name already sits). Every other "has vault/" case is
+/// treated as the ordinary case, per the ticket's own permitted fallback.
+pub fn classify_cloned_repo(repo_root: &Path) -> Result<(ClonedVaultState, PathBuf)> {
+    let repo = git2::Repository::open(repo_root).context("opening freshly cloned repository")?;
+    let vault_dir = repo_root.join(VAULT_SUBDIR);
+
+    if repo
+        .is_empty()
+        .context("checking whether the cloned repository is empty")?
+    {
+        fs::create_dir_all(&vault_dir).context("creating vault/ subdirectory in an empty cloned repository")?;
+        return Ok((ClonedVaultState::EmptyRemote, vault_dir));
+    }
+
+    if vault_dir.exists() {
+        if vault_dir.is_dir() {
+            return Ok((ClonedVaultState::Ordinary, vault_dir));
+        }
+        bail!(
+            "The cloned repository has a 'vault' entry at its root that isn't a directory, so it \
+             can't be used as a Cerebrite vault. Clone into a new, empty folder, or resolve that \
+             conflict on the remote first."
+        );
+    }
+
+    fs::create_dir_all(&vault_dir).context("creating vault/ subdirectory to adopt existing repository content")?;
+    Ok((ClonedVaultState::Adopted, vault_dir))
+}
+
+/// Ticket 10: clones `remote_url` into `destination` (which must already
+/// exist and be empty -- callers check this before calling, since a
+/// friendlier message than libgit2's own is worth giving up front) using
+/// `connection`'s one credential kind and nothing else, exactly the way
+/// `sync::test_fetch` authenticates a plain test fetch for `connect_*`
+/// (ADR-0012: no fallback chain). Per the ticket: "the clone itself IS the
+/// test" -- there is no separate pre-flight fetch before this, a failed
+/// clone (bad credential, unreachable remote, rejected host key) is the
+/// same signal `try_connect`'s test fetch gives, just produced by an actual
+/// clone instead of a bare `connect_auth` handshake.
+pub fn clone_repo(
+    remote_url: &str,
+    destination: &Path,
+    connection: &crate::connection::Connection,
+    known_hosts_path: Option<&Path>,
+) -> std::result::Result<git2::Repository, git2::Error> {
+    let callbacks = connection.make_callbacks(known_hosts_path);
+    let mut fetch_options = git2::FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(fetch_options);
+    builder.clone(remote_url, destination)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +593,178 @@ mod tests {
         let head_after = repo.head().unwrap().peel_to_commit().unwrap().id();
 
         assert_eq!(head_before, head_after);
+    }
+
+    // -- ticket 10: clone_repo / classify_cloned_repo ----------------------
+    //
+    // A local bare repo (same fixture pattern as `connection.rs`'s
+    // `try_connect` tests) needs no credentials at all, so these exercise
+    // `clone_repo`'s real libgit2 clone end to end without any network
+    // dependency, and `classify_cloned_repo`'s four post-clone states.
+
+    fn test_connection() -> crate::connection::Connection {
+        let record = crate::connection_record::ConnectionRecord {
+            connection_id: "clone-test".to_string(),
+            credential_kind: crate::connection_record::CredentialKind::AccessToken,
+            provider: crate::connection_record::Provider::Other("test-host".to_string()),
+            https_username: Some("dawid".to_string()),
+            token_expiry: None,
+            credential_store: crate::connection_record::StoreKind::Plaintext,
+        };
+        crate::connection::Connection::from_parts(record, b"unused-against-a-local-remote".to_vec())
+    }
+
+    #[test]
+    fn classify_cloned_repo_creates_vault_fresh_from_an_empty_remote() {
+        let bare_dir = tempdir().unwrap();
+        git2::Repository::init_bare(bare_dir.path()).unwrap();
+
+        let destination = tempdir().unwrap();
+        // `tempdir()` already creates an empty directory -- clone into it
+        // directly, matching what the real command does once it has
+        // verified the picked destination is empty.
+        fs::remove_dir(destination.path()).unwrap();
+        let repo = clone_repo(
+            bare_dir.path().to_str().unwrap(),
+            destination.path(),
+            &test_connection(),
+            None,
+        )
+        .unwrap();
+        drop(repo);
+
+        let (state, vault_path) = classify_cloned_repo(destination.path()).unwrap();
+        assert_eq!(state, ClonedVaultState::EmptyRemote);
+        assert_eq!(vault_path, destination.path().join("vault"));
+        assert!(vault_path.is_dir());
+        assert!(fs::read_dir(&vault_path).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn classify_cloned_repo_is_the_ordinary_case_when_the_remote_already_has_a_vault_directory() {
+        let source_dir = tempdir().unwrap();
+        git2::Repository::init(source_dir.path()).unwrap();
+        crate::author::confirm_test_author(source_dir.path());
+        fs::create_dir_all(source_dir.path().join("vault")).unwrap();
+        fs::write(source_dir.path().join("vault/existing.md"), "---\nid: x\n---\nHi.\n").unwrap();
+        commit_all(source_dir.path(), "Initial commit").unwrap();
+
+        let bare_dir = tempdir().unwrap();
+        git2::Repository::init_bare(bare_dir.path()).unwrap();
+        push_to_bare(source_dir.path(), bare_dir.path());
+
+        let destination = tempdir().unwrap();
+        fs::remove_dir(destination.path()).unwrap();
+        let repo = clone_repo(
+            bare_dir.path().to_str().unwrap(),
+            destination.path(),
+            &test_connection(),
+            None,
+        )
+        .unwrap();
+        drop(repo);
+
+        let (state, vault_path) = classify_cloned_repo(destination.path()).unwrap();
+        assert_eq!(state, ClonedVaultState::Ordinary);
+        assert_eq!(vault_path, destination.path().join("vault"));
+        assert!(vault_path.join("existing.md").exists());
+    }
+
+    #[test]
+    fn classify_cloned_repo_adopts_a_content_bearing_remote_with_no_vault_directory() {
+        let source_dir = tempdir().unwrap();
+        git2::Repository::init(source_dir.path()).unwrap();
+        crate::author::confirm_test_author(source_dir.path());
+        fs::write(source_dir.path().join("README.md"), "# A project\n").unwrap();
+        commit_all(source_dir.path(), "Initial commit").unwrap();
+
+        let bare_dir = tempdir().unwrap();
+        git2::Repository::init_bare(bare_dir.path()).unwrap();
+        push_to_bare(source_dir.path(), bare_dir.path());
+
+        let destination = tempdir().unwrap();
+        fs::remove_dir(destination.path()).unwrap();
+        let repo = clone_repo(
+            bare_dir.path().to_str().unwrap(),
+            destination.path(),
+            &test_connection(),
+            None,
+        )
+        .unwrap();
+        drop(repo);
+
+        let (state, vault_path) = classify_cloned_repo(destination.path()).unwrap();
+        assert_eq!(state, ClonedVaultState::Adopted);
+        assert_eq!(vault_path, destination.path().join("vault"));
+        assert!(vault_path.is_dir());
+        assert!(fs::read_dir(&vault_path).unwrap().next().is_none());
+        // Existing root content is left exactly where it was.
+        assert!(destination.path().join("README.md").exists());
+    }
+
+    #[test]
+    fn classify_cloned_repo_refuses_a_remote_where_vault_is_not_a_directory() {
+        let source_dir = tempdir().unwrap();
+        git2::Repository::init(source_dir.path()).unwrap();
+        crate::author::confirm_test_author(source_dir.path());
+        // A root-level *file* named `vault` -- a concrete, unambiguous
+        // conflict no real `ensure_git_repo`/`commit_all`-managed vault
+        // could ever have produced (see `classify_cloned_repo`'s doc
+        // comment for why this is the refusal signal chosen).
+        fs::write(source_dir.path().join("vault"), "not a directory\n").unwrap();
+        commit_all(source_dir.path(), "Initial commit").unwrap();
+
+        let bare_dir = tempdir().unwrap();
+        git2::Repository::init_bare(bare_dir.path()).unwrap();
+        push_to_bare(source_dir.path(), bare_dir.path());
+
+        let destination = tempdir().unwrap();
+        fs::remove_dir(destination.path()).unwrap();
+        let repo = clone_repo(
+            bare_dir.path().to_str().unwrap(),
+            destination.path(),
+            &test_connection(),
+            None,
+        )
+        .unwrap();
+        drop(repo);
+
+        let err = classify_cloned_repo(destination.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("isn't a directory"),
+            "expected a refusal naming the non-directory vault entry, got: {err}"
+        );
+    }
+
+    #[test]
+    fn clone_repo_fails_cleanly_against_an_unreachable_remote() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let remote_url = format!("http://127.0.0.1:{port}/repo.git");
+
+        let destination = tempdir().unwrap();
+        fs::remove_dir(destination.path()).unwrap();
+
+        let result = clone_repo(&remote_url, destination.path(), &test_connection(), None);
+
+        assert!(result.is_err());
+        // Nothing usable was left behind for classify to look at.
+        assert!(!destination.path().exists() || fs::read_dir(destination.path()).unwrap().next().is_none());
+    }
+
+    /// Pushes `source_dir`'s current `HEAD` branch to `bare_dir` -- the same
+    /// "push a real local repo to a bare remote" pattern `connection.rs`'s
+    /// `try_connect_persists_the_record_and_secret_once_the_test_fetch_succeeds`
+    /// test already uses, factored out here since several clone tests need
+    /// it.
+    fn push_to_bare(source_dir: &Path, bare_dir: &Path) {
+        let repo = git2::Repository::open(source_dir).unwrap();
+        repo.remote("origin", bare_dir.to_str().unwrap()).unwrap();
+        let mut remote = repo.find_remote("origin").unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        remote
+            .push(&[format!("refs/heads/{branch}:refs/heads/{branch}").as_str()], None)
+            .unwrap();
     }
 }
