@@ -4,12 +4,15 @@
 // persist -- no migration path needed, since there's no released version
 // with an existing `vault.json` to preserve.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
+
+use crate::connection_record::StoreKind;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -26,6 +29,16 @@ pub struct Settings {
     pub vault_path: Option<String>,
     #[serde(default)]
     pub theme: Theme,
+    /// Ticket 02 / ADR-0013: an app-wide index of every connection ID
+    /// Cerebrite has ever stored a secret for, and which credential store
+    /// (keychain or plaintext) currently holds it. This is *not* where the
+    /// secret lives -- see `credential::KeychainBackend` /
+    /// `credential::PlaintextStore` for that -- it exists so a startup scan
+    /// can offer to clean up orphaned entries (their repository deleted
+    /// outside the app) and so "Remove all stored Cerebrite credentials"
+    /// knows what to remove without walking every vault on disk.
+    #[serde(default)]
+    pub connections: BTreeMap<String, StoreKind>,
 }
 
 fn settings_file_path(app: &AppHandle) -> Result<PathBuf> {
@@ -68,5 +81,28 @@ pub fn set_vault_path(app: &AppHandle, vault_path: &Path) -> Result<()> {
 pub fn set_theme(app: &AppHandle, theme: Theme) -> Result<()> {
     let mut settings = load(app);
     settings.theme = theme;
+    save(app, &settings)
+}
+
+/// Records (or updates) which credential store a connection ID's secret is
+/// in. Called whenever a secret is first stored and whenever "Move to
+/// keychain" (ticket 02) succeeds.
+///
+/// No caller yet -- wiring a real connection into a vault starts at ticket
+/// 04 -- so `#[allow(dead_code)]` is deliberate here, not an oversight.
+#[allow(dead_code)]
+pub fn set_connection_store(app: &AppHandle, connection_id: &str, store: StoreKind) -> Result<()> {
+    let mut settings = load(app);
+    settings.connections.insert(connection_id.to_string(), store);
+    save(app, &settings)
+}
+
+/// Removes a connection ID from the index -- called on Disconnect (ticket
+/// 14) and by "Remove all stored Cerebrite credentials" (ticket 02) once
+/// the underlying secret has actually been deleted.
+#[allow(dead_code)]
+pub fn remove_connection(app: &AppHandle, connection_id: &str) -> Result<()> {
+    let mut settings = load(app);
+    settings.connections.remove(connection_id);
     save(app, &settings)
 }

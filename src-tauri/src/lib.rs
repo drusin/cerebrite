@@ -1,3 +1,5 @@
+mod connection_record;
+mod credential;
 mod frontmatter;
 mod heading_slug;
 mod index;
