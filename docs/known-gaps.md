@@ -116,3 +116,91 @@ the full diff. Not urgent bugs unless marked **bug**.
 - General editor touch/IME behavior on Android was reviewed at the code
   level only (tappable, not hover-gated; no keyboard-only paths to core
   actions) — never confirmed on an actual touchscreen.
+
+# Git provider integration (tickets 01–14)
+
+Implemented by 14 separate commits (`750692f`..`ae06351`, one per ticket in
+[`.scratch/git-provider-integration-implementation/issues/`](../.scratch/git-provider-integration-implementation/issues/)),
+plus a follow-up fix commit (`e30286b`) addressing the highest-severity
+findings from a `/code-review` pass across the full diff. The rest of that
+review's findings — below — are left for a human to pick up.
+
+## Blocking manual follow-up (must happen before this ships)
+
+- **GitHub App not registered.** `src-tauri/src/github_oauth.rs` has
+  placeholder `GITHUB_CLIENT_ID`/`GITHUB_APP_SLUG` constants
+  (`"TODO_REGISTER_GITHUB_APP"`). A human needs to register Cerebrite as a
+  GitHub App (Device Flow enabled, "Contents: Read and write" scope) and
+  swap in the real values. Until then, "Sign in with GitHub" cannot work.
+- **GitLab application not registered, and its live spike (ticket 07) was
+  never run.** `src-tauri/src/gitlab_oauth.rs` has a placeholder
+  `GITLAB_CLIENT_ID`. Three facts ticket 07 flagged as needing a live test
+  against gitlab.com are still unverified: whether `write_repository` scope
+  alone is enough to `git push`, whether the device grant actually returns a
+  refresh token, and whether refresh works with no client secret. The code
+  handles both possible outcomes defensively (see
+  `gitlab_oauth::OauthSecret.refresh_token: Option<String>` and
+  `SyncFailureCause::OauthReconnectRequired`), but which branch is real is
+  unconfirmed.
+- **No real manual QA.** Nothing in the sandbox that implemented this could
+  exercise the actual running Tauri app — no wizard, popup, or OS
+  keychain/Secret-Service prompt was ever clicked through by a human. Ticket
+  05 (SSH) is the one exception with real end-to-end coverage, via an
+  in-sandbox `sshd` fixture. Also untested against real infrastructure: the
+  access-token path (ticket 04) against a real non-GitHub/GitLab host, and
+  the OS keychain backends (Windows Credential Manager, Linux Secret
+  Service) — this sandbox has no Secret Service daemon, so ticket 02's
+  keyring integration was only exercised against an in-memory fake store.
+
+## Bugs / correctness gaps
+
+- **Ticket 10**: the guided clone wizard's "remote with an unrelated `vault/`
+  history is refused" case (from ticket 01's four-state classification) is
+  unimplemented — `classify_cloned_repo` only refuses when `vault` exists
+  but isn't a directory; any actual `vault/` directory is accepted
+  regardless of whether it's foreign history. Documented as a deliberate,
+  narrower stand-in in the ticket-10 commit, not a full implementation of
+  the checklist item.
+- **Ticket 13**: the merge-conflict CTA's "resolve via ordinary git tooling"
+  guidance exists only as a code comment — it's never actually surfaced to
+  the user in the needs-attention popup text.
+- **Ticket 06**: the GitHub device-code request sends `scope=repo`, which is
+  an OAuth-App-style scope string; this is a GitHub App using Device Flow,
+  which is permissioned via the app's own installation permissions
+  ("Contents: Read and write"), not OAuth scopes. Worth confirming whether
+  this parameter is actually inert for a GitHub App device-code request or
+  whether it should be removed.
+- **Ticket 06**: `refresh_if_needed`'s in-memory-only fallback branch (what
+  happens when a background token refresh succeeds but the keychain write
+  fails) has no test — ticket 07's equivalent path does.
+
+## Code-health follow-ups (from `/code-review`)
+
+- **Duplicated OAuth device-flow plumbing.** `src-tauri/src/github_oauth.rs`
+  (1065 lines) and `src-tauri/src/gitlab_oauth.rs` (1291 lines) implement
+  near-identical device-grant polling, HTTP/RFC3339 plumbing, and
+  request/response handling. The provider-specific differences (scopes,
+  revoke endpoint, refresh-token optionality) are real, but the shared
+  ~2300 lines of protocol machinery is copy-pasted rather than factored into
+  one `oauth_device_flow` module parameterized by endpoint/quirks — a
+  protocol bugfix currently has to be applied twice.
+- **Duplicated wizard-rendering glue in `src/main.ts`.** `connect-wizard.ts`
+  and `clone-wizard.ts` correctly keep their *state machines* separate (the
+  step ordering genuinely differs — auth happens before the repo is known
+  for clone, after for connect). But the *rendering* halves left in
+  `main.ts` are near line-for-line duplicates per step (e.g.
+  `runOauthSignIn` vs `runCloneOauthSignIn`, `renderProviderChoiceStep` vs
+  `renderCloneProviderChoiceStep`) that were never given the same
+  separate-but-shared treatment.
+- **OAuth token globals as a data clump.** `main.ts` has six loose
+  module-level globals (`wizardAccessToken`/`wizardRefreshToken`/
+  `wizardAccessTokenExpiresAt`, and their `cloneWizard*` twins) that always
+  travel and get updated together — a good candidate for one
+  `OauthTokenState` type reused by both wizards.
+- **`main.ts` divergent change.** Grew from ~1100 to ~3800 lines across
+  these tickets, mixing connect-wizard rendering, clone-wizard rendering,
+  the Settings modal, the disconnect flow, and the commit-author UI in one
+  file, despite the underlying wizard *logic* already being split into
+  `connect-wizard.ts`/`clone-wizard.ts`. The render layer never got the
+  same extraction `lib.rs` got during the MVP (see the code-health section
+  above).
