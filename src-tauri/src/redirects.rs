@@ -275,7 +275,7 @@ pub fn resolve_heading_slug(
 /// This is a deliberate choice over batching everything into a single
 /// commit: it keeps "links were repointed" and "redirect log was pruned"
 /// separately reviewable in git history.
-pub fn cleanup_and_prune(vault_path: &Path, conn: &Connection) -> Result<()> {
+pub fn cleanup_and_prune(vault_path: &Path, repo_root: &Path, conn: &Connection) -> Result<()> {
     let entries = load(vault_path)?;
     if entries.is_empty() {
         return Ok(());
@@ -339,7 +339,7 @@ pub fn cleanup_and_prune(vault_path: &Path, conn: &Connection) -> Result<()> {
     }
 
     if any_file_changed {
-        vault::commit_all(vault_path, "Rewrite links through renamed headings")?;
+        vault::commit_all(repo_root, "Rewrite links through renamed headings")?;
     }
 
     // --- Pass 2: prune redirect entries no longer referenced anywhere. ---
@@ -367,7 +367,7 @@ pub fn cleanup_and_prune(vault_path: &Path, conn: &Connection) -> Result<()> {
         .collect();
 
     save(vault_path, &pruned)?;
-    vault::commit_all(vault_path, "Prune resolved heading redirects")?;
+    vault::commit_all(repo_root, "Prune resolved heading redirects")?;
 
     Ok(())
 }
@@ -525,15 +525,15 @@ mod tests {
     #[test]
     fn cleanup_and_prune_rewrites_stale_links_preserves_frontmatter_and_commits() {
         let dir = tempdir().unwrap();
-        vault::ensure_git_repo(dir.path()).unwrap();
+        let vault_path = vault::ensure_git_repo(dir.path()).unwrap();
 
         write_page(
-            dir.path(),
+            &vault_path,
             "target.md",
             "---\nid: target-id\ntitle: Target\ntags:\n  - keep-me\n---\n## New Heading\n\nBody.\n",
         );
         write_page(
-            dir.path(),
+            &vault_path,
             "source.md",
             "---\nid: source-id\ntitle: Source\n---\nSee [[Target#old-slug]] for details.\n",
         );
@@ -543,17 +543,17 @@ mod tests {
         // redirect log already knows old-slug -> new-heading (the current
         // slug of "## New Heading").
         insert_sorted(
-            dir.path(),
+            &vault_path,
             entry("target-id#old-slug", "target-id#new-heading"),
         )
         .unwrap();
 
         let mut conn = Connection::open_in_memory().unwrap();
-        index::build_index(&mut conn, dir.path()).unwrap();
+        index::build_index(&mut conn, &vault_path).unwrap();
 
-        cleanup_and_prune(dir.path(), &conn).unwrap();
+        cleanup_and_prune(&vault_path, dir.path(), &conn).unwrap();
 
-        let rewritten = fs::read_to_string(dir.path().join("source.md")).unwrap();
+        let rewritten = fs::read_to_string(vault_path.join("source.md")).unwrap();
         assert!(
             rewritten.contains("[[Target#new-heading]]"),
             "expected rewritten link, got: {rewritten}"
@@ -563,12 +563,12 @@ mod tests {
         assert!(rewritten.contains("id: source-id"));
 
         // Target's own frontmatter (a different file) must be untouched too.
-        let target_content = fs::read_to_string(dir.path().join("target.md")).unwrap();
+        let target_content = fs::read_to_string(vault_path.join("target.md")).unwrap();
         assert!(target_content.contains("tags:\n  - keep-me"));
 
         // The redirect entry is now unreferenced (the link points directly at
         // the current slug) -- it must be pruned.
-        let remaining = load(dir.path()).unwrap();
+        let remaining = load(&vault_path).unwrap();
         assert!(remaining.is_empty(), "expected the redirect to be pruned, got {remaining:?}");
 
         // Both passes commit: verify at least one commit happened beyond the
@@ -581,10 +581,10 @@ mod tests {
     #[test]
     fn cleanup_and_prune_keeps_an_entry_still_referenced_by_a_stale_link() {
         let dir = tempdir().unwrap();
-        vault::ensure_git_repo(dir.path()).unwrap();
+        let vault_path = vault::ensure_git_repo(dir.path()).unwrap();
 
         write_page(
-            dir.path(),
+            &vault_path,
             "target.md",
             "---\nid: target-id\ntitle: Target\n---\n## Still Stale Target\n\nBody.\n",
         );
@@ -592,23 +592,23 @@ mod tests {
         // old key at all, and doesn't match any current heading either -- a
         // dangling reference the cleanup pass can't do anything about.
         write_page(
-            dir.path(),
+            &vault_path,
             "source.md",
             "---\nid: source-id\ntitle: Source\n---\nSee [[Target#unrelated-slug]] here.\n",
         );
         vault::commit_all(dir.path(), "Initial fixture").unwrap();
 
-        insert_sorted(dir.path(), entry("target-id#unrelated-slug", "target-id#nowhere")).unwrap();
+        insert_sorted(&vault_path, entry("target-id#unrelated-slug", "target-id#nowhere")).unwrap();
 
         let mut conn = Connection::open_in_memory().unwrap();
-        index::build_index(&mut conn, dir.path()).unwrap();
+        index::build_index(&mut conn, &vault_path).unwrap();
 
-        cleanup_and_prune(dir.path(), &conn).unwrap();
+        cleanup_and_prune(&vault_path, dir.path(), &conn).unwrap();
 
         // Nothing could be resolved to a current heading, so nothing was
         // rewritten -- but the link text still references the redirect's old
         // key, so the entry must survive pruning.
-        let remaining = load(dir.path()).unwrap();
+        let remaining = load(&vault_path).unwrap();
         assert_eq!(remaining.len(), 1);
     }
 

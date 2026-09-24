@@ -221,6 +221,17 @@ fn derived_index_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Derives a vault's git repository root from its `vault/` page directory
+/// (ADR-0011): `state.vault_path` always points at `<repo_root>/vault`
+/// (that's what `vault::ensure_git_repo` guarantees), so the repo root a
+/// commit/sync must operate against is always exactly its parent directory.
+fn repo_root_of(vault_path: &Path) -> Result<PathBuf, String> {
+    vault_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| format!("'{}' has no parent directory to use as the repository root", vault_path.display()))
+}
+
 /// Returns the app's persisted settings (remembered vault path, forced color
 /// scheme) so the frontend can auto-open the vault and apply the theme
 /// without prompting the user again.
@@ -282,13 +293,18 @@ async fn pick_vault_folder(_app: AppHandle) -> Result<Option<String>, String> {
 /// remembered vault, and rebuilds the derived SQLite index from scratch.
 #[tauri::command]
 fn open_vault(app: AppHandle, state: State<AppState>, path: String) -> Result<VaultInfo, String> {
-    let vault_path = PathBuf::from(&path);
-    if !vault_path.is_dir() {
+    let picked_path = PathBuf::from(&path);
+    if !picked_path.is_dir() {
         return Err(format!("'{path}' is not a directory"));
     }
 
-    vault::ensure_git_repo(&vault_path).map_err(|e| e.to_string())?;
-    settings::set_vault_path(&app, &vault_path).map_err(|e| e.to_string())?;
+    // Per ADR-0011, `picked_path` is the *repository* the user chose, not
+    // the vault itself: `ensure_git_repo` turns it into a repository root
+    // (initializing/discovering/refusing as appropriate) and returns the
+    // `vault/` subdirectory that all page I/O below operates under.
+    let vault_path = vault::ensure_git_repo(&picked_path).map_err(|e| e.to_string())?;
+    let repo_root = repo_root_of(&vault_path)?;
+    settings::set_vault_path(&app, &picked_path).map_err(|e| e.to_string())?;
     let device_id = vault::load_or_create_device_id(&app).map_err(|e| e.to_string())?;
 
     let db_file = derived_index_path(&app)?;
@@ -302,7 +318,7 @@ fn open_vault(app: AppHandle, state: State<AppState>, path: String) -> Result<Va
     // rewrite files whose heading links resolve through a redirect chain to
     // a now-current slug, then prune redirect entries nothing references
     // any more.
-    redirects::cleanup_and_prune(&vault_path, &conn).map_err(|e| e.to_string())?;
+    redirects::cleanup_and_prune(&vault_path, &repo_root, &conn).map_err(|e| e.to_string())?;
 
     *state.vault_path.lock().unwrap() = Some(vault_path.clone());
     *state.db.lock().unwrap() = Some(conn);
@@ -313,7 +329,7 @@ fn open_vault(app: AppHandle, state: State<AppState>, path: String) -> Result<Va
     // whatever loop was running for a previously-open vault.
     let (tx, rx) = mpsc::channel();
     *state.sync_tx.lock().unwrap() = Some(tx);
-    spawn_sync_loop(app.clone(), vault_path.clone(), rx);
+    spawn_sync_loop(app.clone(), vault_path.clone(), repo_root, rx);
 
     Ok(VaultInfo {
         path: vault_path.to_string_lossy().to_string(),
@@ -342,7 +358,7 @@ fn notify_sync(state: &AppState) {
 /// Exits cleanly once `rx` disconnects, which happens when `open_vault`
 /// replaces `state.sync_tx` (e.g. a different vault is opened) and drops the
 /// only sender this loop was listening on.
-fn spawn_sync_loop(app: AppHandle, vault_path: PathBuf, rx: std::sync::mpsc::Receiver<()>) {
+fn spawn_sync_loop(app: AppHandle, vault_path: PathBuf, repo_root: PathBuf, rx: std::sync::mpsc::Receiver<()>) {
     thread::spawn(move || loop {
         match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(()) => {
@@ -358,7 +374,7 @@ fn spawn_sync_loop(app: AppHandle, vault_path: PathBuf, rx: std::sync::mpsc::Rec
             Err(RecvTimeoutError::Disconnected) => return,
         }
 
-        perform_sync(&app, &vault_path);
+        perform_sync(&app, &vault_path, &repo_root);
     });
 }
 
@@ -366,12 +382,12 @@ fn spawn_sync_loop(app: AppHandle, vault_path: PathBuf, rx: std::sync::mpsc::Rec
 /// `sync_status` (polled by the frontend via `get_sync_status`), best-effort
 /// emits a `sync-status-changed` event, and rebuilds the derived index
 /// (ADR-0008) when the sync actually changed files on disk.
-fn perform_sync(app: &AppHandle, vault_path: &Path) {
+fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
     let state = app.state::<AppState>();
     *state.sync_status.lock().unwrap() = sync::SyncStatus::Syncing;
     let _ = app.emit("sync-status-changed", &sync::SyncStatus::Syncing);
 
-    let outcome = match sync::run_sync(vault_path) {
+    let outcome = match sync::run_sync(repo_root) {
         Ok(outcome) => outcome,
         Err(e) => sync::SyncOutcome {
             status: sync::SyncStatus::Error { detail: e.to_string() },
@@ -510,7 +526,8 @@ fn save_page_impl(state: &AppState, id: &str, markdown_body: &str) -> Result<(),
         redirects::insert_sorted(&vault_path, redirect_entry).map_err(|e| e.to_string())?;
     }
 
-    vault::commit_all(&vault_path, &format!("Update {title}")).map_err(|e| e.to_string())?;
+    let repo_root = repo_root_of(&vault_path)?;
+    vault::commit_all(&repo_root, &format!("Update {title}")).map_err(|e| e.to_string())?;
     notify_sync(state);
 
     index::update_page_content(conn, id, &parsed.title, &parsed.body, &parsed.tags).map_err(|e| e.to_string())?;
@@ -570,7 +587,8 @@ fn create_page_impl(state: &AppState, title: &str) -> Result<PageSummary, String
     let content = frontmatter::new_page_content(&id, trimmed);
     std::fs::write(&file_path, &content).map_err(|e| e.to_string())?;
 
-    vault::commit_all(&vault_path, &format!("Create {trimmed}")).map_err(|e| e.to_string())?;
+    let repo_root = repo_root_of(&vault_path)?;
+    vault::commit_all(&repo_root, &format!("Create {trimmed}")).map_err(|e| e.to_string())?;
     notify_sync(state);
 
     index::insert_page(conn, &id, trimmed, &file_path, "").map_err(|e| e.to_string())?; // no frontmatter tags on a brand-new page
@@ -698,7 +716,8 @@ fn rename_page_impl(state: &AppState, id: &str, new_title: &str) -> Result<Renam
         affected_page_ids.push(page_id.clone());
     }
 
-    vault::commit_all(&vault_path, &format!("Rename {old_title} to {trimmed}")).map_err(|e| e.to_string())?;
+    let repo_root = repo_root_of(&vault_path)?;
+    vault::commit_all(&repo_root, &format!("Rename {old_title} to {trimmed}")).map_err(|e| e.to_string())?;
     notify_sync(state);
 
     Ok(RenamePageResult {
@@ -965,7 +984,8 @@ fn trash_page_impl(state: &AppState, id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
 
     let page_path = PathBuf::from(&path);
-    trash::trash_page(&vault_path, &page_path, id, &format!("Trash {title}")).map_err(|e| e.to_string())?;
+    let repo_root = repo_root_of(&vault_path)?;
+    trash::trash_page(&vault_path, &repo_root, &page_path, id, &format!("Trash {title}")).map_err(|e| e.to_string())?;
     notify_sync(state);
 
     // Only drop the DB rows once the filesystem move + commit succeeded.
@@ -992,8 +1012,9 @@ fn restore_page_impl(state: &AppState, trashed_filename: &str) -> Result<PageSum
     let trashed_path = trash::trash_dir(&vault_path).join(trashed_filename);
     let parsed = frontmatter::parse_and_ensure_id(&trashed_path).map_err(|e| e.to_string())?;
 
+    let repo_root = repo_root_of(&vault_path)?;
     let restored_path =
-        trash::restore_page(&vault_path, trashed_filename, &format!("Restore {}", parsed.title))
+        trash::restore_page(&vault_path, &repo_root, trashed_filename, &format!("Restore {}", parsed.title))
             .map_err(|e| e.to_string())?;
     notify_sync(state);
 
@@ -1019,7 +1040,8 @@ fn empty_trash(state: State<AppState>) -> Result<(), String> {
         let guard = state.vault_path.lock().unwrap();
         guard.as_ref().ok_or("No vault is open")?.clone()
     };
-    trash::empty_trash(&vault_path).map_err(|e| e.to_string())?;
+    let repo_root = repo_root_of(&vault_path)?;
+    trash::empty_trash(&vault_path, &repo_root).map_err(|e| e.to_string())?;
     notify_sync(&state);
     Ok(())
 }
@@ -1097,14 +1119,20 @@ mod tests {
     /// derived index built from whatever `.md` files already exist there --
     /// mirroring what `open_vault` does, minus the Tauri app-handle/dialog
     /// bits the `_impl` functions under test don't need.
+    /// Per ADR-0011, `write_page` (called before `setup_vault` by every test
+    /// below) writes fixture pages under `dir.path()/vault` -- the fixed
+    /// page directory -- while `setup_vault` itself `git init`s `dir.path()`
+    /// as the repository root and adopts the already-populated `vault/`
+    /// `ensure_git_repo` finds there (no migration triggers, since these
+    /// fixtures never create a root-level `.cerebrite/`).
     fn setup_vault(dir: &TempDir) -> AppState {
-        vault::ensure_git_repo(dir.path()).unwrap();
+        let vault_path = vault::ensure_git_repo(dir.path()).unwrap();
 
         let mut conn = Connection::open_in_memory().unwrap();
-        index::build_index(&mut conn, dir.path()).unwrap();
+        index::build_index(&mut conn, &vault_path).unwrap();
 
         AppState {
-            vault_path: Mutex::new(Some(dir.path().to_path_buf())),
+            vault_path: Mutex::new(Some(vault_path)),
             db: Mutex::new(Some(conn)),
             device_id: Mutex::new(Some("test-device".to_string())),
             sync_status: Mutex::new(sync::SyncStatus::NoRemote),
@@ -1113,7 +1141,9 @@ mod tests {
     }
 
     fn write_page(dir: &TempDir, name: &str, content: &str) {
-        fs::write(dir.path().join(name), content).unwrap();
+        let vault_dir = dir.path().join("vault");
+        fs::create_dir_all(&vault_dir).unwrap();
+        fs::write(vault_dir.join(name), content).unwrap();
     }
 
     #[test]
@@ -1186,7 +1216,7 @@ mod tests {
             materialize_and_save_page_impl(&state, "Fresh Page", "Some freshly typed content.\n")
                 .unwrap();
 
-        let file_path = dir.path().join("fresh-page.md");
+        let file_path = dir.path().join("vault").join("fresh-page.md");
         assert!(file_path.exists(), "materializing should create fresh-page.md");
 
         let content = fs::read_to_string(&file_path).unwrap();
@@ -1231,7 +1261,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Older mtime.
         write_page(&dir, "old-note.md", "---\nid: old\ntitle: Old Note\n---\nSee [[Target Page]] here.\n");
-        let old_path = dir.path().join("old-note.md");
+        let old_path = dir.path().join("vault").join("old-note.md");
         let old_time = filetime::FileTime::from_unix_time(1_000_000, 0);
         filetime::set_file_mtime(&old_path, old_time).unwrap();
 
@@ -1241,7 +1271,7 @@ mod tests {
             "new-note.md",
             "---\nid: new\ntitle: New Note\n---\nFirst [[Target Page]] and again [[Target Page]].\n",
         );
-        let new_path = dir.path().join("new-note.md");
+        let new_path = dir.path().join("vault").join("new-note.md");
         let new_time = filetime::FileTime::from_unix_time(2_000_000, 0);
         filetime::set_file_mtime(&new_path, new_time).unwrap();
 
@@ -1382,7 +1412,7 @@ mod tests {
         // the id/frontmatter and just update the body.
         save_page_impl(&state, &summary.id, "Second write, edited.\n").unwrap();
 
-        let file_path = dir.path().join("growing-page.md");
+        let file_path = dir.path().join("vault").join("growing-page.md");
         let content = fs::read_to_string(&file_path).unwrap();
         assert!(content.contains(&format!("id: {}", summary.id)));
         assert!(content.ends_with("Second write, edited.\n"));
@@ -1413,7 +1443,7 @@ mod tests {
         save_page_impl(&state, "guide", "## Getting Started\n\nBody.\n").unwrap();
 
         // The redirect log now has exactly one sorted entry for this rename.
-        let entries = redirects::load(dir.path()).unwrap();
+        let entries = redirects::load(&dir.path().join("vault")).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].old_key, "guide#setup");
         assert_eq!(entries[0].new_key, "guide#getting-started");
@@ -1439,7 +1469,7 @@ mod tests {
         // mistaken for a rename of "Setup".
         save_page_impl(&state, "guide", "## Setup\n\nBody.\n\n## Usage\n\nMore.\n").unwrap();
 
-        assert!(redirects::load(dir.path()).unwrap().is_empty());
+        assert!(redirects::load(&dir.path().join("vault")).unwrap().is_empty());
     }
 
     #[test]
@@ -1468,8 +1498,8 @@ mod tests {
 
         trash_page_impl(&state, "h1").unwrap();
 
-        assert!(!dir.path().join("hello.md").exists());
-        assert!(dir.path().join(".cerebrite/trash/hello.md").exists());
+        assert!(!dir.path().join("vault").join("hello.md").exists());
+        assert!(dir.path().join("vault/.cerebrite/trash/hello.md").exists());
         let ids: i64 = {
             let guard = state.db.lock().unwrap();
             guard
@@ -1527,8 +1557,8 @@ mod tests {
 
         assert_eq!(summary.id, "h1");
         assert_eq!(summary.title, "Hello World");
-        assert!(dir.path().join("hello.md").exists());
-        assert!(!dir.path().join(".cerebrite/trash/hello.md").exists());
+        assert!(dir.path().join("vault").join("hello.md").exists());
+        assert!(!dir.path().join("vault/.cerebrite/trash/hello.md").exists());
 
         // Ordinary resolve_page again -- no longer in trash.
         let resolution = resolve_page_impl(&state, "Hello World").unwrap();
@@ -1549,7 +1579,7 @@ mod tests {
 
         empty_trash_impl(&state).unwrap();
 
-        assert!(!dir.path().join(".cerebrite/trash/hello.md").exists());
+        assert!(!dir.path().join("vault/.cerebrite/trash/hello.md").exists());
         assert!(list_trashed_pages_impl(&state).unwrap().is_empty());
     }
 
@@ -1565,8 +1595,8 @@ mod tests {
         assert_eq!(result.title, "New Title");
         assert!(result.affected_page_ids.is_empty());
 
-        assert!(!dir.path().join("old-title.md").exists());
-        let new_path = dir.path().join("new-title.md");
+        assert!(!dir.path().join("vault").join("old-title.md").exists());
+        let new_path = dir.path().join("vault").join("new-title.md");
         assert!(new_path.exists());
         let content = fs::read_to_string(&new_path).unwrap();
         assert!(content.contains("id: p1"));
@@ -1597,7 +1627,7 @@ mod tests {
         let result = rename_page_impl(&state, "t1", "New Title").unwrap();
         assert_eq!(result.affected_page_ids, vec!["s1".to_string()]);
 
-        let content = fs::read_to_string(dir.path().join("source.md")).unwrap();
+        let content = fs::read_to_string(dir.path().join("vault").join("source.md")).unwrap();
         assert!(content.contains("See [[New Title]] and [[New Title#Some Heading]] and #[[New Title]]."));
 
         // The index reflects the rewrite too -- old title has no more
@@ -1620,7 +1650,7 @@ mod tests {
 
         rename_page_impl(&state, "p1", "New Title").unwrap();
 
-        let content = fs::read_to_string(dir.path().join("new-title.md")).unwrap();
+        let content = fs::read_to_string(dir.path().join("vault").join("new-title.md")).unwrap();
         assert!(content.contains("See also [[New Title]] (itself).\n"));
     }
 
@@ -1633,7 +1663,7 @@ mod tests {
 
         rename_page_impl(&state, "t1", "To Do").unwrap();
 
-        let content = fs::read_to_string(dir.path().join("source.md")).unwrap();
+        let content = fs::read_to_string(dir.path().join("vault").join("source.md")).unwrap();
         assert_eq!(content, "---\nid: s1\ntitle: Source\n---\nFiled under #[[To Do]].\n");
     }
 
@@ -1647,7 +1677,7 @@ mod tests {
         let err = rename_page_impl(&state, "p1", "  two  ").unwrap_err();
         assert!(err.contains("already exists"));
         // Nothing should have moved.
-        assert!(dir.path().join("one.md").exists());
+        assert!(dir.path().join("vault").join("one.md").exists());
     }
 
     #[test]
@@ -1697,7 +1727,8 @@ mod tests {
     // `State<AppState>` harness.
     fn empty_trash_impl(state: &AppState) -> Result<(), String> {
         let vault_path = state.vault_path.lock().unwrap().as_ref().unwrap().clone();
-        trash::empty_trash(&vault_path).map_err(|e| e.to_string())
+        let repo_root = repo_root_of(&vault_path)?;
+        trash::empty_trash(&vault_path, &repo_root).map_err(|e| e.to_string())
     }
 
     fn list_trashed_pages_impl(state: &AppState) -> Result<Vec<trash::TrashedPage>, String> {

@@ -25,7 +25,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 /// Relative path (from the vault root) of the conflict-backup directory,
@@ -174,7 +174,21 @@ pub fn run_sync(vault_path: &Path) -> Result<SyncOutcome> {
             })
         }
     };
-    let branch = head.shorthand().unwrap_or("main").to_string();
+    // `shorthand()` returns the literal string "HEAD" when the repo is in a
+    // detached-HEAD state (no branch checked out) -- pushing that verbatim
+    // would build the nonsensical refspec `refs/heads/HEAD:refs/heads/HEAD`
+    // rather than erroring, silently creating a branch actually named
+    // "HEAD". Detached HEAD isn't a state Cerebrite's own git usage ever
+    // puts a vault into, but a user could get there with plain git tooling
+    // (e.g. checking out a specific commit) -- treat it as a clean,
+    // actionable error rather than attempting a nonsensical push.
+    let branch = match head.shorthand() {
+        Some("HEAD") | None => bail!(
+            "the vault's repository is in a detached HEAD state (no branch is checked out) -- \
+             check out a branch before syncing"
+        ),
+        Some(name) => name.to_string(),
+    };
     let local_oid = head.target().context("resolving local HEAD oid")?;
     let local_commit = repo.find_commit(local_oid).context("looking up local HEAD commit")?;
 
@@ -350,6 +364,37 @@ mod tests {
         let device_b_dir = tempdir().unwrap();
         git2::Repository::clone(bare_dir.path().to_str().unwrap(), device_b_dir.path()).unwrap();
         device_b_dir
+    }
+
+    #[test]
+    fn detached_head_errors_cleanly_instead_of_pushing_a_branch_literally_named_head() {
+        let dir = tempdir().unwrap();
+        vault::ensure_git_repo(dir.path()).unwrap();
+        fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
+        vault::commit_all(dir.path(), "Create page").unwrap();
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.set_head_detached(head_commit.id()).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand(), Some("HEAD"));
+
+        // A remote is configured so `run_sync` gets past the "no remote"
+        // early return and actually reaches branch-name derivation.
+        let bare_dir = tempdir().unwrap();
+        git2::Repository::init_bare(bare_dir.path()).unwrap();
+        repo.remote("origin", bare_dir.path().to_str().unwrap()).unwrap();
+
+        let result = run_sync(dir.path());
+
+        let err = match result {
+            Ok(_) => panic!("expected a clean error, not a successful sync"),
+            Err(e) => e,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("detached HEAD"),
+            "expected the error to mention detached HEAD, got: {message}"
+        );
     }
 
     #[test]

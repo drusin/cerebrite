@@ -84,9 +84,20 @@ pub struct TrashedPage {
 /// Records the original path in the trash manifest, then git-commits the
 /// move with `message` via `vault::commit_all`.
 ///
+/// `repo_root` is the git repository's root (ADR-0011: distinct from
+/// `vault_path`, since the vault is now a `vault/` subdirectory of the
+/// repository rather than the repository itself) -- `commit_all` opens the
+/// repo there.
+///
 /// The frontmatter (and therefore the id) is never rewritten -- this is a
 /// pure filesystem move.
-pub fn trash_page(vault_path: &Path, page_path: &Path, page_id: &str, message: &str) -> Result<PathBuf> {
+pub fn trash_page(
+    vault_path: &Path,
+    repo_root: &Path,
+    page_path: &Path,
+    page_id: &str,
+    message: &str,
+) -> Result<PathBuf> {
     let dir = trash_dir(vault_path);
     fs::create_dir_all(&dir).context("creating trash directory")?;
 
@@ -124,7 +135,7 @@ pub fn trash_page(vault_path: &Path, page_path: &Path, page_id: &str, message: &
     manifest.insert(trashed_filename, original_relative);
     save_manifest(vault_path, &manifest)?;
 
-    crate::vault::commit_all(vault_path, message).context("committing trash move")?;
+    crate::vault::commit_all(repo_root, message).context("committing trash move")?;
 
     Ok(candidate)
 }
@@ -133,7 +144,12 @@ pub fn trash_page(vault_path: &Path, page_path: &Path, page_id: &str, message: &
 /// -- the manifest key) back to its original path, recreating any parent
 /// directories that no longer exist, then git-commits the restore. The
 /// file's contents (including its frontmatter id) are untouched by the move.
-pub fn restore_page(vault_path: &Path, trashed_filename: &str, message: &str) -> Result<PathBuf> {
+pub fn restore_page(
+    vault_path: &Path,
+    repo_root: &Path,
+    trashed_filename: &str,
+    message: &str,
+) -> Result<PathBuf> {
     let mut manifest = load_manifest(vault_path);
     let original_relative = manifest
         .remove(trashed_filename)
@@ -150,7 +166,7 @@ pub fn restore_page(vault_path: &Path, trashed_filename: &str, message: &str) ->
 
     save_manifest(vault_path, &manifest)?;
 
-    crate::vault::commit_all(vault_path, message).context("committing restore")?;
+    crate::vault::commit_all(repo_root, message).context("committing restore")?;
 
     Ok(original_path)
 }
@@ -158,7 +174,7 @@ pub fn restore_page(vault_path: &Path, trashed_filename: &str, message: &str) ->
 /// Permanently deletes every file under `.cerebrite/trash/` (real filesystem
 /// removal -- this is the only purge path per the ticket; trashing itself
 /// never auto-purges), clears the manifest, and git-commits the removal.
-pub fn empty_trash(vault_path: &Path) -> Result<()> {
+pub fn empty_trash(vault_path: &Path, repo_root: &Path) -> Result<()> {
     let dir = trash_dir(vault_path);
     if dir.is_dir() {
         for entry in fs::read_dir(&dir).context("reading trash directory")? {
@@ -170,7 +186,7 @@ pub fn empty_trash(vault_path: &Path) -> Result<()> {
         }
     }
 
-    crate::vault::commit_all(vault_path, "Empty trash").context("committing empty trash")?;
+    crate::vault::commit_all(repo_root, "Empty trash").context("committing empty trash")?;
     Ok(())
 }
 
@@ -231,7 +247,7 @@ mod tests {
         crate::vault::commit_all(dir.path(), "Create Hello").unwrap();
         let head_before = repo.head().unwrap().peel_to_commit().unwrap().id();
 
-        let trashed_path = trash_page(dir.path(), &page_path, "abc", "Trash Hello").unwrap();
+        let trashed_path = trash_page(dir.path(), dir.path(), &page_path, "abc", "Trash Hello").unwrap();
 
         assert!(!page_path.exists());
         assert!(trashed_path.exists());
@@ -251,13 +267,13 @@ mod tests {
         // First page named hello.md gets trashed.
         let first_path = write_page(dir.path(), "hello.md", "---\nid: first\ntitle: Hello\n---\nOne.\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
-        trash_page(dir.path(), &first_path, "first", "Trash 1").unwrap();
+        trash_page(dir.path(), dir.path(), &first_path, "first", "Trash 1").unwrap();
 
         // A second, unrelated page that also happens to be named hello.md
         // (e.g. re-created after the first was trashed) gets trashed too.
         let second_path = write_page(dir.path(), "hello.md", "---\nid: second\ntitle: Hello Again\n---\nTwo.\n");
         crate::vault::commit_all(dir.path(), "Create 2").unwrap();
-        let trashed_second = trash_page(dir.path(), &second_path, "second", "Trash 2").unwrap();
+        let trashed_second = trash_page(dir.path(), dir.path(), &second_path, "second", "Trash 2").unwrap();
 
         // Both files must coexist under trash, distinctly.
         let trash = trash_dir(dir.path());
@@ -275,11 +291,11 @@ mod tests {
         let page_path = write_page(dir.path(), "hello.md", "---\nid: abc\ntitle: Hello\n---\nBody.\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
 
-        trash_page(dir.path(), &page_path, "abc", "Trash Hello").unwrap();
+        trash_page(dir.path(), dir.path(), &page_path, "abc", "Trash Hello").unwrap();
         assert!(!page_path.exists());
 
         let head_before = repo.head().unwrap().peel_to_commit().unwrap().id();
-        let restored = restore_page(dir.path(), "hello.md", "Restore Hello").unwrap();
+        let restored = restore_page(dir.path(), dir.path(), "hello.md", "Restore Hello").unwrap();
         let head_after = repo.head().unwrap().peel_to_commit().unwrap().id();
 
         assert_eq!(restored, page_path);
@@ -301,12 +317,12 @@ mod tests {
         let page_path = write_page(dir.path().join("notes").as_path(), "nested.md", "---\nid: n1\ntitle: Nested\n---\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
 
-        trash_page(dir.path(), &page_path, "n1", "Trash Nested").unwrap();
+        trash_page(dir.path(), dir.path(), &page_path, "n1", "Trash Nested").unwrap();
         // Remove the now-empty original directory, simulating it having
         // never existed by the time restore runs.
         fs::remove_dir(dir.path().join("notes")).unwrap();
 
-        let restored = restore_page(dir.path(), "nested.md", "Restore Nested").unwrap();
+        let restored = restore_page(dir.path(), dir.path(), "nested.md", "Restore Nested").unwrap();
         assert_eq!(restored, page_path);
         assert!(restored.exists());
     }
@@ -318,10 +334,10 @@ mod tests {
         let repo = git2::Repository::open(dir.path()).unwrap();
         let page_path = write_page(dir.path(), "hello.md", "---\nid: abc\ntitle: Hello\n---\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
-        trash_page(dir.path(), &page_path, "abc", "Trash Hello").unwrap();
+        trash_page(dir.path(), dir.path(), &page_path, "abc", "Trash Hello").unwrap();
 
         let head_before = repo.head().unwrap().peel_to_commit().unwrap().id();
-        empty_trash(dir.path()).unwrap();
+        empty_trash(dir.path(), dir.path()).unwrap();
         let head_after = repo.head().unwrap().peel_to_commit().unwrap().id();
 
         assert!(trash_dir(dir.path()).join("hello.md").is_file() == false);
@@ -336,7 +352,7 @@ mod tests {
         crate::vault::ensure_git_repo(dir.path()).unwrap();
         let page_path = write_page(dir.path(), "hello.md", "---\nid: abc\ntitle: Hello World\n---\n");
         crate::vault::commit_all(dir.path(), "Create").unwrap();
-        trash_page(dir.path(), &page_path, "abc", "Trash Hello").unwrap();
+        trash_page(dir.path(), dir.path(), &page_path, "abc", "Trash Hello").unwrap();
 
         let trashed = list_trashed_pages(dir.path()).unwrap();
         assert_eq!(trashed.len(), 1);

@@ -449,25 +449,30 @@ mod tests {
     #[test]
     fn trash_excluded_by_default_and_included_when_asked() {
         let dir = TempDir::new().unwrap();
-        vault::ensure_git_repo(dir.path()).unwrap();
-        write_page(&dir, "ghost.md", "---\nid: ghost\ntitle: Ghost Page\n---\nA spooky mention of pumpkins.\n");
-        let conn = build_conn(&dir);
+        let vault_path = vault::ensure_git_repo(dir.path()).unwrap();
+        fs::write(
+            vault_path.join("ghost.md"),
+            "---\nid: ghost\ntitle: Ghost Page\n---\nA spooky mention of pumpkins.\n",
+        )
+        .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        index::build_index(&mut conn, &vault_path).unwrap();
 
-        let ghost_path = dir.path().join("ghost.md");
-        crate::trash::trash_page(dir.path(), &ghost_path, "ghost", "Trash Ghost").unwrap();
+        let ghost_path = vault_path.join("ghost.md");
+        crate::trash::trash_page(&vault_path, dir.path(), &ghost_path, "ghost", "Trash Ghost").unwrap();
         index::remove_page(&conn, "ghost").unwrap();
 
-        let excluded = search_pages(&conn, Some(dir.path()), "pumpkins", false).unwrap();
+        let excluded = search_pages(&conn, Some(&vault_path), "pumpkins", false).unwrap();
         assert!(excluded.is_empty(), "trashed page must not appear by default: {excluded:?}");
 
-        let included = search_pages(&conn, Some(dir.path()), "pumpkins", true).unwrap();
+        let included = search_pages(&conn, Some(&vault_path), "pumpkins", true).unwrap();
         assert_eq!(included.len(), 1);
         assert_eq!(included[0].id, "ghost");
         assert!(included[0].in_trash);
         assert!(included[0].snippet.to_lowercase().contains("pumpkins"));
 
         // Also reachable by title while trashed.
-        let by_title = search_pages(&conn, Some(dir.path()), "Ghost Page", true).unwrap();
+        let by_title = search_pages(&conn, Some(&vault_path), "Ghost Page", true).unwrap();
         assert_eq!(by_title.len(), 1);
         assert_eq!(by_title[0].tier, 1);
         assert!(by_title[0].in_trash);
