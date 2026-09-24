@@ -23,7 +23,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Linux webview dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -35,7 +35,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -45,7 +45,7 @@ jobs:
           restore-keys: cargo-${{ matrix.os }}-
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -78,7 +78,7 @@ jobs:
         run: npx tauri build --bundles nsis
 
       - name: Upload built binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cerebrite-${{ matrix.os }}
           path: src-tauri/target/release/cerebrite${{ matrix.os == 'windows-latest' && '.exe' || '' }}
@@ -88,7 +88,7 @@ jobs:
       # "Run anyway" click-through end users will need.
       - name: Upload Windows NSIS installer
         if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cerebrite-windows-nsis-installer
           path: src-tauri/target/release/bundle/nsis/*-setup.exe
@@ -97,7 +97,7 @@ jobs:
       # AppImage -- see docs/install.md for the fuse2 caveat on Arch/CachyOS.
       - name: Upload Linux AppImage
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cerebrite-linux-appimage
           path: src-tauri/target/release/bundle/appimage/*.AppImage
