@@ -1,5 +1,6 @@
 // Thin typed wrapper around the Rust core's vault/page Tauri commands.
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface VaultInfo {
   path: string;
@@ -520,4 +521,72 @@ export function cloneAndOpenVault(
   credential: CloneCredential,
 ): Promise<CloneAndOpenVaultResult> {
   return invoke("clone_and_open_vault", { remoteUrl, destination, credential });
+}
+
+// --- Ticket 12: sidebar sync-status indicator ------------------------------
+//
+// `get_sync_status`/`sync-status-changed` and the `SyncStatus`/
+// `SyncFailureCause` shapes below already existed on the Rust side (ticket
+// 03/05/06/07, `src-tauri/src/sync.rs`) before this ticket -- nothing here
+// changes their shape, this just gives the frontend a typed door into them.
+// `getSyncDetails`/`triggerSyncNow` are this ticket's own thin additions
+// (`get_sync_details`/`trigger_sync_now` in `src-tauri/src/lib.rs`).
+
+/** Mirrors `connection_record::CredentialKind`'s `snake_case` serialization exactly. */
+export type CredentialKind = "oauth_sign_in" | "access_token" | "ssh_key";
+
+/// Mirrors `sync::SyncFailureCause`'s `#[serde(tag = "cause", rename_all = "camelCase")]` shape exactly.
+export type SyncFailureCause =
+  | { cause: "networkUnreachable"; detail: string }
+  | { cause: "credentialRejected"; detail: string; credentialKind: CredentialKind | null }
+  | { cause: "nonFastForwardPush"; detail: string }
+  | { cause: "conflict"; detail: string }
+  | { cause: "other"; detail: string }
+  | { cause: "hostKeyUnconfirmed"; host: string; fingerprint: string }
+  | { cause: "hostKeyMismatch"; host: string; fingerprint: string }
+  | { cause: "oauthReconnectRequired"; detail: string; credentialKind: CredentialKind };
+
+/// Mirrors `sync::SyncStatus`'s `#[serde(tag = "state", rename_all = "camelCase")]` shape exactly.
+export type SyncStatus =
+  | { state: "noRemote" }
+  | { state: "syncing" }
+  | { state: "synced" }
+  | { state: "transient"; cause: SyncFailureCause }
+  | { state: "needsAttention"; cause: SyncFailureCause };
+
+/** Polled on load (and after the popup's own "Sync now" trigger) -- the
+ * background loop also keeps this fresh, but the frontend prefers to react
+ * to `onSyncStatusChanged` rather than re-poll on a timer of its own. */
+export function getSyncStatus(): Promise<SyncStatus> {
+  return invoke("get_sync_status");
+}
+
+/** Subscribes to the best-effort `sync-status-changed` event the Rust core
+ * emits on every sync-status transition. Returns the `unlisten` function --
+ * call it to stop listening (e.g. on teardown, though this app never tears
+ * the sidebar down while a vault is open). */
+export function onSyncStatusChanged(callback: (status: SyncStatus) => void): Promise<UnlistenFn> {
+  return listen<SyncStatus>("sync-status-changed", (event) => callback(event.payload));
+}
+
+/** What the sync-status popup shows once opened: the extra, slightly more
+ * expensive detail `get_sync_status` alone doesn't carry (ticket 12) --
+ * which provider `origin` points at, and when the last successful sync
+ * completed. `provider`/`lastSyncedAt` are `null` when there's nothing to
+ * report yet (no remote configured, or no sync has completed since the app
+ * started). */
+export interface SyncDetails {
+  status: SyncStatus;
+  provider: string | null;
+  lastSyncedAt: number | null;
+}
+
+export function getSyncDetails(): Promise<SyncDetails> {
+  return invoke("get_sync_details");
+}
+
+/** "Sync now": an immediate sync attempt independent of the background
+ * loop's periodic timer (ticket 12). Rejects if no vault is open. */
+export function triggerSyncNow(): Promise<void> {
+  return invoke("trigger_sync_now");
 }

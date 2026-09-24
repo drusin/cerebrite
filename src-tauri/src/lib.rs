@@ -45,11 +45,21 @@ pub struct AppState {
     /// `sync-status-changed` event. Starts `NoRemote` (the honest default
     /// before a vault -- and its remote, if any -- has even been checked).
     sync_status: Mutex<sync::SyncStatus>,
+    /// Unix seconds of the last sync attempt that completed as
+    /// `SyncStatus::Synced` (ticket 12), tracked alongside `sync_status` so
+    /// the sidebar popup can show a "last synced" timestamp without
+    /// `SyncStatus` itself needing a timestamp field. `None` until the first
+    /// successful sync since this vault was opened (not persisted across
+    /// restarts -- a cold-start "last synced" would be misleading anyway
+    /// until the loop has actually run once).
+    last_synced_at: Mutex<Option<u64>>,
     /// Sender the background sync loop listens on: every local auto-commit
     /// sends a ping (see `notify_sync`), which the loop debounces/coalesces;
     /// it also wakes on its own periodic timer regardless. Replacing this
     /// (on a fresh `open_vault`) drops the old sender, which cleanly stops
-    /// the previous vault's loop thread.
+    /// the previous vault's loop thread. Ticket 12's "Sync now" button pings
+    /// this same channel (see `trigger_sync_now`) rather than running a
+    /// second, concurrent sync pass of its own.
     sync_tx: Mutex<Option<Sender<()>>>,
 }
 
@@ -60,6 +70,7 @@ impl Default for AppState {
             db: Mutex::new(None),
             device_id: Mutex::new(None),
             sync_status: Mutex::new(sync::SyncStatus::NoRemote),
+            last_synced_at: Mutex::new(None),
             sync_tx: Mutex::new(None),
         }
     }
@@ -473,8 +484,25 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
         }
     }
 
+    if matches!(outcome.status, sync::SyncStatus::Synced) {
+        *state.last_synced_at.lock().unwrap() = Some(now_unix_secs());
+    }
     *state.sync_status.lock().unwrap() = outcome.status.clone();
     let _ = app.emit("sync-status-changed", &outcome.status);
+}
+
+/// Unix seconds "now" -- used only for `AppState::last_synced_at` (ticket
+/// 12). Deliberately not shared with `sync.rs`'s own private helper of the
+/// same purpose (conflict-backup filenames): that one lives entirely inside
+/// a module this crate keeps Tauri-agnostic on purpose (see its module doc
+/// comment), and duplicating four lines here is cheaper than exporting it
+/// across that boundary for a single caller.
+fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Polled by the frontend for a lightweight sync-status indicator (issue
@@ -485,6 +513,74 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
 #[tauri::command]
 fn get_sync_status(state: State<AppState>) -> sync::SyncStatus {
     state.sync_status.lock().unwrap().clone()
+}
+
+/// What the sidebar sync-status popup (ticket 12) shows once opened, on top
+/// of the `status` `get_sync_status`/`sync-status-changed` already provide:
+/// which provider `origin` points at, and when the last successful sync
+/// completed. A separate command rather than folding these fields into
+/// `get_sync_status` itself, so the existing polled/event-driven icon state
+/// keeps its exact current shape (`sync::SyncStatus` alone) and this only
+/// does the extra (cheap, but non-trivial: opens the repo) work when the
+/// popup actually opens.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncDetails {
+    status: sync::SyncStatus,
+    /// A human-facing name for the connected provider ("GitHub", "GitLab",
+    /// or the bare host for anything else) -- `None` when no `origin`
+    /// remote is configured (mirrors `SyncStatus::NoRemote`) or no vault is
+    /// open at all.
+    provider: Option<String>,
+    /// Unix seconds of the last sync attempt that completed as `Synced`,
+    /// `None` until the first one since this vault was opened.
+    last_synced_at: Option<u64>,
+}
+
+#[tauri::command]
+fn get_sync_details(state: State<AppState>) -> SyncDetails {
+    let status = state.sync_status.lock().unwrap().clone();
+    let last_synced_at = *state.last_synced_at.lock().unwrap();
+    let provider = state
+        .vault_path
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|vault_path| repo_root_of(vault_path).ok())
+        .and_then(|repo_root| sync::origin_remote_url(&repo_root))
+        .map(|url| provider_label(&infer_provider(&url)));
+
+    SyncDetails { status, provider, last_synced_at }
+}
+
+/// A human-facing name for `provider`, used by `get_sync_details` -- "GitHub"
+/// and "GitLab" read better in a popup than `Provider`'s own `snake_case`
+/// serialization, and `Other`'s bare host is already exactly what a user
+/// would recognize as "the provider".
+fn provider_label(provider: &connection_record::Provider) -> String {
+    match provider {
+        connection_record::Provider::GitHub => "GitHub".to_string(),
+        connection_record::Provider::GitLab => "GitLab".to_string(),
+        connection_record::Provider::Other(host) => host.clone(),
+    }
+}
+
+/// Ticket 12's "Sync now": an immediate sync attempt independent of the
+/// background loop's 60s timer. Rather than running a second, concurrent
+/// `perform_sync` on the command's own async thread (which could race the
+/// loop thread over `AppState`/the working tree), this pings the exact same
+/// channel a local auto-commit already pings (`notify_sync`) -- the loop
+/// wakes immediately (well under its 60s timer, only the loop's own ~500ms
+/// debounce window), so this is "immediate" in every user-visible sense
+/// while keeping sync attempts strictly serialized through the one loop
+/// thread that already owns them.
+#[tauri::command]
+fn trigger_sync_now(state: State<AppState>) -> Result<(), String> {
+    if state.sync_tx.lock().unwrap().is_none() {
+        return Err("No vault is open".to_string());
+    }
+    notify_sync(&state);
+    Ok(())
 }
 
 /// Ticket 08 checklist item 3/8: the "Commit as" prefill for the currently
@@ -2150,6 +2246,8 @@ pub fn run() {
             list_trashed_pages,
             search_pages,
             get_sync_status,
+            get_sync_details,
+            trigger_sync_now,
             commit_author_prefill,
             get_commit_author,
             confirm_commit_author,
@@ -2210,6 +2308,7 @@ mod tests {
             db: Mutex::new(Some(conn)),
             device_id: Mutex::new(Some("test-device".to_string())),
             sync_status: Mutex::new(sync::SyncStatus::NoRemote),
+            last_synced_at: Mutex::new(None),
             sync_tx: Mutex::new(None),
         }
     }

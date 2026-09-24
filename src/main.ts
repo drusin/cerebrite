@@ -35,6 +35,10 @@ import {
   getCommitAuthor,
   confirmCommitAuthor,
   cloneAndOpenVault,
+  getSyncStatus,
+  getSyncDetails,
+  triggerSyncNow,
+  onSyncStatusChanged,
   type CommitAuthor,
   type PageSummary,
   type PageResolution,
@@ -45,7 +49,9 @@ import {
   type SshKeyInfo,
   type CloneCredential,
   type CommitAuthorPrefillResult,
+  type SyncStatus,
 } from "./vault-api";
+import { syncIndicatorFor } from "./sync-status";
 import {
   reduceWizard,
   initialWizardState,
@@ -145,6 +151,24 @@ const sidebarRailSearchButtonEl = document.querySelector<HTMLButtonElement>("#si
 const sidebarRailNewPageButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-new-page");
 const settingsButtonEl = document.querySelector<HTMLButtonElement>("#settings-button");
 const sidebarRailSettingsButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-settings");
+
+// Ticket 12: the sidebar sync-status indicator -- footer icon (expanded
+// sidebar/compact drawer) plus the matching collapsed-rail icon, both kept
+// in sync by `applySyncIndicator`, and the popup either one opens.
+const syncStatusButtonEl = document.querySelector<HTMLButtonElement>("#sync-status-button");
+const syncStatusIconEl = document.querySelector<HTMLElement>("#sync-status-icon");
+const syncStatusLabelEl = document.querySelector<HTMLElement>("#sync-status-label");
+const sidebarRailSyncStatusButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-sync-status");
+const sidebarRailSyncStatusIconEl = document.querySelector<HTMLElement>("#sync-status-icon-rail");
+const syncPopupEl = document.querySelector<HTMLElement>("#sync-popup");
+const syncPopupIconEl = document.querySelector<HTMLElement>("#sync-popup-icon");
+const syncPopupStatusTextEl = document.querySelector<HTMLElement>("#sync-popup-status-text");
+const syncPopupProviderEl = document.querySelector<HTMLElement>("#sync-popup-provider");
+const syncPopupLastSyncedEl = document.querySelector<HTMLElement>("#sync-popup-last-synced");
+const syncPopupSyncNowButtonEl = document.querySelector<HTMLButtonElement>("#sync-popup-sync-now-button");
+const syncPopupSettingsLinkEl = document.querySelector<HTMLButtonElement>("#sync-popup-settings-link");
+const syncSectionNotConnectedEl = document.querySelector<HTMLElement>("#sync-section-not-connected");
+const syncSectionConnectButtonEl = document.querySelector<HTMLButtonElement>("#sync-section-connect-button");
 
 const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
@@ -257,6 +281,10 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pageEditor: PageEditor | null = null;
 /** The currently open vault's folder path, shown in the Settings modal. */
 let currentVaultPath: string | null = null;
+/** Ticket 12: the last `SyncStatus` applied to the sidebar icon -- kept so
+ * the Settings "Sync" section's not-connected banner can reflect it without
+ * a separate fetch every time the modal opens. */
+let currentSyncStatus: SyncStatus = { state: "noRemote" };
 
 // --- Recent (issue 12) ---------------------------------------------------
 //
@@ -850,6 +878,7 @@ async function openVaultAndLoad(path: string) {
   showWorkspace();
   await loadPages();
   await loadTrash();
+  await refreshSyncStatus();
 }
 
 async function handleSelectVaultClick() {
@@ -1407,6 +1436,146 @@ function updateSyncSubformVisibility() {
   document.querySelectorAll<HTMLElement>("#sync-section .sync-subform").forEach((subform) => {
     subform.hidden = subform.dataset.syncKind !== kind;
   });
+}
+
+// --- Ticket 12: sidebar sync-status indicator ------------------------------
+//
+// A persistent, quiet icon -- never a toast/banner -- with five states
+// (`syncIndicatorFor` in sync-status.ts does the actual `SyncStatus` ->
+// icon-state mapping, kept pure/testable there). This section owns the DOM
+// side: applying that mapping to both icon locations (expanded sidebar
+// footer + collapsed rail), and the click-to-open popup.
+
+/** Applies `status` to both sync-status icon locations (footer + rail) and,
+ * if the popup is currently open, its own icon/status line too -- called on
+ * load (`get_sync_status`) and on every `sync-status-changed` event, so the
+ * icon "updates live" per the ticket without the frontend polling on a timer
+ * of its own. Also refreshes the Settings "Sync" section's not-connected
+ * banner, since that must never show stale state while Settings is open. */
+function applySyncIndicator(status: SyncStatus) {
+  currentSyncStatus = status;
+  const indicator = syncIndicatorFor(status);
+
+  for (const iconEl of [syncStatusIconEl, sidebarRailSyncStatusIconEl, syncPopupIconEl]) {
+    if (!iconEl) continue;
+    iconEl.textContent = indicator.glyph;
+    iconEl.dataset.state = indicator.iconState;
+  }
+  if (syncStatusLabelEl) syncStatusLabelEl.textContent = indicator.statusText;
+  const ariaLabel = `Sync status: ${indicator.statusText}`;
+  syncStatusButtonEl?.setAttribute("aria-label", ariaLabel);
+  sidebarRailSyncStatusButtonEl?.setAttribute("aria-label", ariaLabel);
+  sidebarRailSyncStatusButtonEl?.setAttribute("title", ariaLabel);
+  if (syncPopupStatusTextEl) syncPopupStatusTextEl.textContent = indicator.statusText;
+
+  updateSyncSectionNotConnectedBanner();
+}
+
+/** Ticket 12 checklist item 5: the plain "Not connected -- connect a
+ * repository" message, shown only while `currentSyncStatus` is `NoRemote` --
+ * never nags otherwise. Called whenever the status changes and whenever
+ * Settings opens, so it can't go stale while the modal is up. */
+function updateSyncSectionNotConnectedBanner() {
+  if (!syncSectionNotConnectedEl) return;
+  syncSectionNotConnectedEl.hidden = currentSyncStatus.state !== "noRemote";
+}
+
+/** Loads the current sync status once (on app start, and again once a vault
+ * finishes opening) -- live updates after that come from
+ * `sync-status-changed` alone, not further polling. */
+async function refreshSyncStatus() {
+  try {
+    applySyncIndicator(await getSyncStatus());
+  } catch {
+    // No vault open yet, or the command otherwise unavailable -- leave the
+    // icon at its default "not connected" state rather than erroring.
+  }
+}
+
+function isSyncPopupOpen(): boolean {
+  return !!syncPopupEl && !syncPopupEl.hasAttribute("hidden");
+}
+
+/** Positions `#sync-popup` just above/beside whichever icon (footer or
+ * rail, whichever is actually visible) was clicked, then shows it and loads
+ * the popup-only detail (`get_sync_details`) -- never auto-opened, only in
+ * response to a click, per the ticket. */
+function openSyncPopup(anchor: HTMLElement) {
+  if (!syncPopupEl) return;
+  const anchorRect = anchor.getBoundingClientRect();
+  syncPopupEl.style.left = `${Math.round(anchorRect.left)}px`;
+  syncPopupEl.style.bottom = `${Math.round(window.innerHeight - anchorRect.top + 8)}px`;
+  syncPopupEl.style.top = "auto";
+  syncPopupEl.removeAttribute("hidden");
+  syncStatusButtonEl?.setAttribute("aria-expanded", "true");
+  sidebarRailSyncStatusButtonEl?.setAttribute("aria-expanded", "true");
+  void refreshSyncPopupDetails();
+}
+
+function closeSyncPopup() {
+  if (!syncPopupEl) return;
+  syncPopupEl.setAttribute("hidden", "");
+  syncStatusButtonEl?.setAttribute("aria-expanded", "false");
+  sidebarRailSyncStatusButtonEl?.setAttribute("aria-expanded", "false");
+}
+
+function toggleSyncPopup(anchor: HTMLElement) {
+  if (isSyncPopupOpen()) {
+    closeSyncPopup();
+  } else {
+    openSyncPopup(anchor);
+  }
+}
+
+/** Fills the popup's provider/last-synced lines from `get_sync_details` --
+ * fetched only when the popup actually opens (ticket 12 checklist item 3),
+ * not on every status change. */
+async function refreshSyncPopupDetails() {
+  if (!syncPopupProviderEl || !syncPopupLastSyncedEl) return;
+  try {
+    const details = await getSyncDetails();
+    if (details.provider) {
+      syncPopupProviderEl.textContent = details.provider;
+      syncPopupProviderEl.removeAttribute("hidden");
+    } else {
+      syncPopupProviderEl.setAttribute("hidden", "");
+    }
+    if (details.lastSyncedAt != null) {
+      const date = new Date(details.lastSyncedAt * 1000);
+      syncPopupLastSyncedEl.textContent = `Last synced: ${date.toLocaleString()}`;
+      syncPopupLastSyncedEl.removeAttribute("hidden");
+    } else {
+      syncPopupLastSyncedEl.setAttribute("hidden", "");
+    }
+  } catch {
+    syncPopupProviderEl.setAttribute("hidden", "");
+    syncPopupLastSyncedEl.setAttribute("hidden", "");
+  }
+}
+
+/** "Sync now" (ticket 12 checklist item 4): triggers an immediate attempt
+ * independent of the background timer. The resulting status change arrives
+ * via `sync-status-changed` like any other transition -- this doesn't wait
+ * for or reflect the outcome itself, just fires the attempt. */
+async function handleSyncNowClick() {
+  if (!syncPopupSyncNowButtonEl) return;
+  syncPopupSyncNowButtonEl.setAttribute("disabled", "");
+  try {
+    await triggerSyncNow();
+  } catch {
+    // No vault open -- nothing to sync; the button simply has no effect.
+  } finally {
+    syncPopupSyncNowButtonEl.removeAttribute("disabled");
+  }
+}
+
+/** The popup's "Sync settings…" link and the not-connected banner's
+ * "Connect…" button both close the popup and open Settings' "Sync" section
+ * -- reusing `openSyncManualForm`'s scroll-into-view, ticket 11's existing
+ * entry point, rather than duplicating it. */
+function openSyncSettingsFromPopup() {
+  closeSyncPopup();
+  openSyncManualForm("");
 }
 
 /** Holds the generated/imported key between "Generate"/"Import" and "Connect" -- mirrors `wizardSshKey`. */
@@ -2281,6 +2450,7 @@ async function finishCloneWizardIntoWorkspace() {
   showWorkspace();
   await loadPages();
   await loadTrash();
+  await refreshSyncStatus();
 }
 
 /** Set once `clone_and_open_vault` succeeds -- the vault path the finishing tail above opens the workspace onto. */
@@ -3139,6 +3309,37 @@ async function init() {
   sidebarRailSettingsButtonEl?.addEventListener("click", openSettingsModal);
   settingsChangeFolderButtonEl?.addEventListener("click", () => void handleChangeVaultFolderClick());
   settingsThemeRadios.forEach((radio) => radio.addEventListener("change", (e) => void handleThemeRadioChange(e)));
+  // Ticket 12: sidebar sync-status icon (footer + collapsed rail) and its
+  // click-to-open popup -- never auto-opened.
+  syncStatusButtonEl?.addEventListener("click", () => {
+    if (syncStatusButtonEl) toggleSyncPopup(syncStatusButtonEl);
+  });
+  sidebarRailSyncStatusButtonEl?.addEventListener("click", () => {
+    if (sidebarRailSyncStatusButtonEl) toggleSyncPopup(sidebarRailSyncStatusButtonEl);
+  });
+  document.addEventListener("click", (event) => {
+    if (!isSyncPopupOpen()) return;
+    const target = event.target as Node;
+    if (
+      syncPopupEl?.contains(target) ||
+      syncStatusButtonEl?.contains(target) ||
+      sidebarRailSyncStatusButtonEl?.contains(target)
+    ) {
+      return;
+    }
+    closeSyncPopup();
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && isSyncPopupOpen()) {
+      closeSyncPopup();
+    }
+  });
+  syncPopupSyncNowButtonEl?.addEventListener("click", () => void handleSyncNowClick());
+  syncPopupSettingsLinkEl?.addEventListener("click", openSyncSettingsFromPopup);
+  syncSectionConnectButtonEl?.addEventListener("click", openConnectWizard);
+  void onSyncStatusChanged(applySyncIndicator);
+  void refreshSyncStatus();
+
   connectWizardOpenButtonEl?.addEventListener("click", openConnectWizard);
   connectWizardCloseButtonEl?.addEventListener("click", closeConnectWizard);
   connectWizardBackButtonEl?.addEventListener("click", () => dispatchWizard({ type: "back" }));

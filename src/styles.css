@@ -989,3 +989,143 @@ body {
   --tag-chip-fg: #24c8db;
   --snippet-mark-bg: rgba(255, 213, 79, 0.35);
 }
+
+/* Ticket 12: sidebar footer sync-status icon + popup. Five calm, distinct
+   states via one glyph + a color modifier (`data-state`) -- "syncing" and
+   "retrying" share the same rotating-arrows glyph but are told apart by
+   color (blue vs. amber) and by only "syncing" actually rotating, since
+   "retrying" is deliberately not an alarming, attention-grabbing state. */
+.sidebar-footer {
+  padding-top: 0.5em;
+  border-top: 1px solid var(--sidebar-border);
+}
+
+.sync-status-button {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  width: 100%;
+  background: none;
+  border: none;
+  box-shadow: none;
+  padding: 0.3em 0.4em;
+  cursor: pointer;
+  border-radius: 6px;
+  color: inherit;
+  font-size: 0.9em;
+}
+
+.sync-status-button:hover {
+  background: var(--page-list-hover-bg);
+}
+
+.sync-status-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1em;
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+
+.sync-status-icon[data-state="synced"] {
+  color: #2e7d32;
+  opacity: 1;
+}
+
+.sync-status-icon[data-state="syncing"] {
+  color: #396cd8;
+  opacity: 1;
+  animation: sync-status-spin 1.2s linear infinite;
+}
+
+.sync-status-icon[data-state="retrying"] {
+  color: #b8860b;
+  opacity: 1;
+}
+
+.sync-status-icon[data-state="needsAttention"] {
+  color: #c0392b;
+  opacity: 1;
+}
+
+@keyframes sync-status-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sync-status-icon[data-state="syncing"] {
+    animation: none;
+  }
+}
+
+.sync-popup[hidden] {
+  display: none;
+}
+
+.sync-popup {
+  position: fixed;
+  z-index: 40;
+  width: min(280px, 90vw);
+  background: var(--modal-bg);
+  border: 1px solid var(--modal-border);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  padding: 0.85em 1em;
+  box-sizing: border-box;
+}
+
+.sync-popup-status-line {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin: 0 0 0.5em;
+  font-weight: 600;
+}
+
+.sync-popup-detail {
+  margin: 0 0 0.5em;
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+
+.sync-popup-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5em;
+  margin-top: 0.5em;
+}
+
+.sync-popup-settings-link {
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: var(--backlink-header-fg);
+  cursor: pointer;
+  padding: 0;
+  font-size: 0.85em;
+}
+
+.sync-section-not-connected {
+  margin: 0 0 1em;
+  padding: 0.6em 0.75em;
+  border-radius: 6px;
+  background: var(--page-list-hover-bg);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75em;
+  font-size: 0.9em;
+}

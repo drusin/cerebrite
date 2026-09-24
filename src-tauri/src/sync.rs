@@ -281,6 +281,18 @@ fn host_key_failure_cause(connection: &Connection) -> Option<SyncFailureCause> {
     }
 }
 
+/// Reads the currently configured `origin` remote's URL for `vault_path`, if
+/// any -- used by the frontend's sync-status popup (ticket 12) to show which
+/// provider a vault is connected to, without duplicating `run_sync`'s own
+/// remote-lookup logic on the `lib.rs` side. `None` whenever there's nothing
+/// meaningful to report: the repo can't be opened, or no `origin` remote is
+/// configured (mirrors `SyncStatus::NoRemote`).
+pub fn origin_remote_url(vault_path: &Path) -> Option<String> {
+    let repo = git2::Repository::open(vault_path).ok()?;
+    let remote = repo.find_remote("origin").ok()?;
+    remote.url().map(|s| s.to_string())
+}
+
 /// Sync status surfaced to the frontend (via `get_sync_status`, polled, and
 /// a best-effort `sync-status-changed` event -- see `lib.rs`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -807,6 +819,30 @@ mod tests {
             message.contains("detached HEAD"),
             "expected the error to mention detached HEAD, got: {message}"
         );
+    }
+
+    // -- ticket 12: `origin_remote_url`, used by the sidebar sync-status
+    // popup to name the connected provider. --
+
+    #[test]
+    fn origin_remote_url_returns_the_configured_remote() {
+        let dir = tempdir().unwrap();
+        vault::ensure_git_repo(dir.path()).unwrap();
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        repo.remote("origin", "https://example.com/user/repo.git").unwrap();
+
+        assert_eq!(
+            origin_remote_url(dir.path()),
+            Some("https://example.com/user/repo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn origin_remote_url_is_none_without_a_configured_remote() {
+        let dir = tempdir().unwrap();
+        vault::ensure_git_repo(dir.path()).unwrap();
+
+        assert_eq!(origin_remote_url(dir.path()), None);
     }
 
     #[test]

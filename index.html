@@ -169,6 +169,23 @@
           </div>
           <ul id="trash-list" class="page-list trash-list"></ul>
         </div>
+
+        <!-- Ticket 12: a persistent, quiet sync-status indicator -- never a
+             toast/banner (per issue 09's resolved decision). Reads
+             `get_sync_status` on load and stays live via `sync-status-changed`;
+             clicking opens `#sync-popup` (never auto-opens). -->
+        <div class="sidebar-footer">
+          <button
+            id="sync-status-button"
+            class="sync-status-button"
+            type="button"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+          >
+            <span id="sync-status-icon" class="sync-status-icon" data-state="notConnected" aria-hidden="true">○</span>
+            <span id="sync-status-label" class="sync-status-label">Not connected</span>
+          </button>
+        </div>
       </aside>
 
       <!-- Collapsed-state rail (desktop only): shown in place of the full
@@ -179,6 +196,37 @@
         <button id="sidebar-rail-search" class="sidebar-rail-button" type="button" aria-label="Search" title="Search">🔍</button>
         <button id="sidebar-rail-new-page" class="sidebar-rail-button" type="button" aria-label="New page" title="New page">+</button>
         <button id="sidebar-rail-settings" class="sidebar-rail-button" type="button" aria-label="Settings" title="Settings (Ctrl/Cmd+,)">⚙</button>
+        <!-- Ticket 12: same indicator as the expanded sidebar's footer, just
+             icon-only -- kept in sync by the same `applySyncIndicator` call. -->
+        <button
+          id="sidebar-rail-sync-status"
+          class="sidebar-rail-button sync-status-button"
+          type="button"
+          aria-haspopup="dialog"
+          aria-expanded="false"
+          aria-label="Sync status: not connected"
+          title="Sync status: not connected"
+        >
+          <span id="sync-status-icon-rail" class="sync-status-icon" data-state="notConnected" aria-hidden="true">○</span>
+        </button>
+      </div>
+
+      <!-- Ticket 12: the sync-status popup -- opened only by clicking the
+           footer/rail icon, never auto-opened. Shows provider, last-synced
+           time, status text, a link into Settings' Sync section, and a
+           "Sync now" action that's always available. Closed by Escape or
+           clicking outside it. -->
+      <div id="sync-popup" class="sync-popup" hidden role="dialog" aria-label="Sync status">
+        <p class="sync-popup-status-line">
+          <span id="sync-popup-icon" class="sync-status-icon" data-state="notConnected" aria-hidden="true">○</span>
+          <span id="sync-popup-status-text" class="sync-popup-status-text">Not connected</span>
+        </p>
+        <p id="sync-popup-provider" class="sync-popup-detail" hidden></p>
+        <p id="sync-popup-last-synced" class="sync-popup-detail" hidden></p>
+        <div class="sync-popup-actions">
+          <button id="sync-popup-sync-now-button" type="button">Sync now</button>
+          <button id="sync-popup-settings-link" type="button" class="sync-popup-settings-link">Sync settings…</button>
+        </div>
       </div>
 
       <main id="page-view" class="page-view">
@@ -323,6 +371,14 @@
                path over the guided wizard entirely. -->
           <div class="settings-section" id="sync-section">
             <h3>Sync</h3>
+            <!-- Ticket 12 checklist item 5: a vault with no remote at all is
+                 not an error, and this must not nag -- shown only while
+                 `get_sync_status` reports `NoRemote`, replaced by nothing
+                 (the raw fields below stay put either way) once connected. -->
+            <p id="sync-section-not-connected" class="sync-section-not-connected" hidden>
+              Not connected — connect a repository.
+              <button id="sync-section-connect-button" type="button">Connect…</button>
+            </p>
             <p class="settings-wizard-intro">
               Connect this vault to a remote repository directly, using raw git fields.
             </p>
