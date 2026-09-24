@@ -2,13 +2,10 @@ name: Build Android app (debug)
 
 # Ticket 15 (android-build-and-editor-parity): builds the REAL Cerebrite app
 # (this repo's own src-tauri/gen/android project, wired to the actual
-# Milkdown-editor frontend and Rust commands) for Android, as opposed to
-# android-smoke-apk.yml's throwaway ping-pong harness from ticket 06 (which
-# only proves the toolchain/cross-compilation story in isolation and builds
-# nothing from this repo).
+# Milkdown-editor frontend and Rust commands) for Android.
 #
 # Debug build only -- release signing is ticket 16's job. Manual trigger for
-# now (like android-smoke-apk.yml): a full Android SDK/NDK/Rust-target setup
+# now: a full Android SDK/NDK/Rust-target setup
 # plus a from-scratch cross-compile of git2/rusqlite is multiple minutes of
 # heavyweight setup that doesn't belong on every push/PR until it's proven
 # stable in CI a few times; wire it to `push`/`pull_request` once it has.

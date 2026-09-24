@@ -29,8 +29,8 @@ walkdir = "2"
 # `vendored-openssl` builds and statically links openssl-src instead of
 # relying on a system OpenSSL install: required for cross-compiling to
 # Android, where no OpenSSL dev headers/libs exist for the target triple.
-# Same fix already validated for git2 in the 06 smoke-test CI workflow
-# (.github/workflows/android-smoke-apk.yml) -- ticket 15 hit the identical
+# Same fix first validated for git2 in ticket 06's (since removed) Android
+# smoke-test CI workflow -- ticket 15 hit the identical
 # `openssl-sys` "Could not find directory of OpenSSL installation" failure
 # cross-compiling the real app to aarch64-linux-android without it.
 # `ssh_key_from_memory` (ticket 05): lets `Cred::ssh_key_from_memory` hand

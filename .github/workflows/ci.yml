@@ -5,10 +5,8 @@ name: CI
 # (ticket 16, packaging-and-install) bundles the actual sideload installers:
 # an unsigned NSIS `-setup.exe` on Windows and an AppImage on Linux. See
 # docs/install.md for end-user install instructions for both.
-# android-smoke-apk.yml separately proves Tauri's Android target builds at
-# all (via a throwaway scaffolded app, nothing committed) - it does not build
-# this app's own Android target. That's ticket 15 (android-build-and-editor-
-# parity), which also wires Android into this pipeline.
+# The app's Android target is built separately, on demand, by
+# android-build.yml.
 on:
   push:
     branches: [main]
