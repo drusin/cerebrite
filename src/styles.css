@@ -1147,3 +1147,24 @@ body {
   gap: 0.75em;
   font-size: 0.9em;
 }
+
+/* Ticket 14: the "Disconnect…" banner -- same treatment as the
+   not-connected banner above (they're never shown at the same time), just
+   left-aligned since it's a single button rather than text + button. */
+.sync-section-connected {
+  margin: 0 0 1em;
+}
+
+/* Ticket 14: the startup orphan-credential notice in Settings' "Credentials"
+   section -- same visual treatment as the not-connected banner. */
+.settings-orphan-notice {
+  margin: 0 0 1em;
+  padding: 0.6em 0.75em;
+  border-radius: 6px;
+  background: var(--page-list-hover-bg);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75em;
+  font-size: 0.9em;
+}

@@ -107,6 +107,11 @@ pub struct GitLabEndpoints {
     /// because ticket 07 had no per-repo REST calls of its own (unlike
     /// GitHub's installation check).
     pub api_base_url: String,
+    /// GitLab's OAuth token-revocation endpoint (RFC 7009) -- ticket 14's
+    /// Disconnect calls this for a GitLab OAuth sign-in connection's refresh
+    /// token. A public-client call: `client_id` + `token`, no secret, same
+    /// as the device-code/refresh exchanges above.
+    pub revoke_url: String,
 }
 
 impl GitLabEndpoints {
@@ -115,6 +120,7 @@ impl GitLabEndpoints {
             device_code_url: "https://gitlab.com/oauth/authorize_device".to_string(),
             token_url: "https://gitlab.com/oauth/token".to_string(),
             api_base_url: "https://gitlab.com/api/v4".to_string(),
+            revoke_url: "https://gitlab.com/oauth/revoke".to_string(),
         }
     }
 }
@@ -461,6 +467,27 @@ pub fn refresh_if_needed(
     (crate::connection::Connection::from_parts(record, new_secret.to_bytes()), save_failed)
 }
 
+/// Ticket 14 checklist item 2: revokes `refresh_token` at GitLab's
+/// `/oauth/revoke` (RFC 7009) -- a public-client call, `client_id` + `token`,
+/// no secret needed, verified against GitLab/Doorkeeper source per
+/// `.scratch/git-provider-integration/issues/07-credential-storage-decision.md`
+/// (GitLab's own docs don't spell this out). `Ok(())` only on a confirmed 2xx
+/// response -- callers (`provider_disconnect::disconnect_connection`) must
+/// never report a revocation to the user on anything else, including a
+/// network failure or a non-2xx status RFC 7009 itself allows a compliant
+/// server to return even for an already-invalid token.
+pub fn revoke_token(endpoints: &GitLabEndpoints, client_id: &str, token: &str) -> Result<(), DeviceFlowError> {
+    let form = [("client_id", client_id), ("token", token)];
+    let status = post_form_status(&endpoints.revoke_url, &form)?;
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(DeviceFlowError::Rejected(format!(
+            "GitLab's revoke endpoint returned status {status}"
+        )))
+    }
+}
+
 /// One repository as surfaced to the guided connect wizard (ticket 09) --
 /// identical shape to `github_oauth::RepoInfo` (kept duplicated rather than
 /// shared, same as the rest of this module, to keep the two provider
@@ -681,6 +708,20 @@ fn post_form(url: &str, form: &[(&str, &str)]) -> Result<String, DeviceFlowError
         .map_err(|e| DeviceFlowError::Network(e.to_string()))
 }
 
+/// Like `post_form`, but returns the HTTP status code instead of the body --
+/// `revoke_token` needs this because RFC 7009's revoke endpoint's success
+/// signal *is* the 2xx status, not anything in the (possibly empty) body.
+fn post_form_status(url: &str, form: &[(&str, &str)]) -> Result<u16, DeviceFlowError> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(url)
+        .header("Accept", "application/json")
+        .form(form)
+        .send()
+        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    Ok(response.status().as_u16())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,7 +894,8 @@ mod tests {
         GitLabEndpoints {
             device_code_url: base.clone(),
             token_url: base.clone(),
-            api_base_url: base,
+            api_base_url: base.clone(),
+            revoke_url: base,
         }
     }
 
@@ -1006,6 +1048,41 @@ mod tests {
         )]);
         let result = refresh_token_pair(&endpoints_for(port), "client", "glrt_stale");
         assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
+    }
+
+    // -- revoke_token (ticket 14) --
+
+    #[test]
+    fn revoke_token_succeeds_on_a_2xx_response() {
+        let port = mock_server::spawn(vec![(200, String::new())]);
+        let result = revoke_token(&endpoints_for(port), "client", "glrt_stale");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn revoke_token_succeeds_on_a_201_response_too() {
+        // RFC 7009 only requires 2xx, not specifically 200 -- guard against
+        // an accidental `== 200` check creeping in.
+        let port = mock_server::spawn(vec![(201, String::new())]);
+        let result = revoke_token(&endpoints_for(port), "client", "glrt_stale");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn revoke_token_fails_on_a_non_2xx_response() {
+        let port = mock_server::spawn(vec![(400, r#"{"error":"invalid_request"}"#.to_string())]);
+        let result = revoke_token(&endpoints_for(port), "client", "glrt_stale");
+        assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
+    }
+
+    #[test]
+    fn revoke_token_fails_when_the_endpoint_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let endpoints = endpoints_for(port);
+        let result = revoke_token(&endpoints, "client", "glrt_stale");
+        assert!(matches!(result, Err(DeviceFlowError::Network(_))));
     }
 
     // -- create_repository / list_repositories (ticket 09) --

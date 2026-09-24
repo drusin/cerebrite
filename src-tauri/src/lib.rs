@@ -9,6 +9,7 @@ mod heading_slug;
 mod index;
 mod links;
 mod markdown;
+mod provider_disconnect;
 mod redirects;
 mod search;
 mod settings;
@@ -719,6 +720,135 @@ fn reveal_conflict_backups(app: AppHandle, state: State<AppState>) -> Result<(),
     app.opener().reveal_item_in_dir(&backup_dir).map_err(|e| e.to_string())
 }
 
+/// Builds the keychain/plaintext store pair every ticket 14 command below
+/// needs, exactly the way `connect_access_token`/`connect_ssh_key`/etc.
+/// already do: prefer the platform keychain when it's actually reachable
+/// right now (not just "did `platform()` construct"), fall back to `None`
+/// otherwise so callers degrade to plaintext-only deletion attempts rather
+/// than erroring outright -- Disconnect must still remove a plaintext
+/// secret even when the keychain happens to be unreachable.
+fn credential_stores(app: &AppHandle) -> Result<(Option<credential::KeychainBackend>, credential::PlaintextStore), String> {
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let plaintext = credential::PlaintextStore::new(&config_dir);
+    let keychain = credential::KeychainBackend::platform().ok();
+    Ok((keychain, plaintext))
+}
+
+/// Ticket 14 checklist item 1/2/3/4/5/8: "Disconnect" in Settings' Sync
+/// section. Deletes the currently open vault's stored secret, its
+/// `.git/cerebrite/connection.json`, and (best effort) its `origin` remote
+/// via `provider_disconnect::disconnect_connection`, then clears the
+/// `settings.json` index entry. Returns `Ok(None)` if this vault had no
+/// connection configured at all (nothing to disconnect -- not an error, so
+/// the frontend can show "Nothing was connected" rather than an error
+/// dialog). See `provider_disconnect::DisconnectOutcome`'s doc comment for
+/// the exact GitLab-revocation honesty contract the frontend's dialog copy
+/// must respect.
+#[tauri::command]
+fn disconnect(app: AppHandle, state: State<AppState>) -> Result<Option<provider_disconnect::DisconnectOutcome>, String> {
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+    let (keychain, plaintext) = credential_stores(&app)?;
+    let gitlab_endpoints = gitlab_oauth::GitLabEndpoints::production();
+
+    let outcome = provider_disconnect::disconnect_connection(&repo_root, keychain.as_ref(), &plaintext, &gitlab_endpoints)
+        .map_err(|e| e.to_string())?;
+
+    if let Some(outcome) = &outcome {
+        let _ = settings::remove_connection(&app, &outcome.connection_id);
+    }
+
+    // Nudges the background loop to notice the connection is gone right
+    // away (checklist item 8) rather than waiting up to 60s for its next
+    // periodic tick -- same channel every other state-changing action pings.
+    notify_sync(&state);
+
+    Ok(outcome)
+}
+
+/// One orphaned entry in `settings.json`'s connections index (ticket 14
+/// checklist item 6) -- a stored credential whose repository no longer
+/// exists on disk, as surfaced to Settings' cleanup notice.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrphanedConnection {
+    connection_id: String,
+    repo_path: String,
+}
+
+/// Ticket 14 checklist item 6, the scan half: called at startup (and
+/// whenever Settings wants to refresh its notice) to find every stored
+/// credential whose repository has since been deleted or moved outside the
+/// app. Read-only -- pairs with `cleanup_orphaned_connections` below for the
+/// actual cleanup action.
+#[tauri::command]
+fn scan_orphaned_connections(app: AppHandle) -> Vec<OrphanedConnection> {
+    settings::load(&app)
+        .orphaned_connections()
+        .into_iter()
+        .map(|(connection_id, entry)| OrphanedConnection {
+            connection_id,
+            repo_path: entry.repo_path,
+        })
+        .collect()
+}
+
+/// Ticket 14 checklist item 6, the cleanup half: deletes the stored secret
+/// (`provider_disconnect::delete_orphaned_secret` -- there is no
+/// `connection.json` left to read for an orphan, its repository is gone) and
+/// index entry for every currently orphaned connection. Best-effort and
+/// unconditional per entry (a secret that was already gone is still cleared
+/// from the index); returns how many entries were cleaned up.
+#[tauri::command]
+fn cleanup_orphaned_connections(app: AppHandle) -> Result<usize, String> {
+    let orphans = settings::load(&app).orphaned_connections();
+    let (keychain, plaintext) = credential_stores(&app)?;
+
+    let count = orphans.len();
+    for (connection_id, entry) in orphans {
+        provider_disconnect::delete_orphaned_secret(keychain.as_ref(), &plaintext, &connection_id, entry.store);
+        let _ = settings::remove_connection(&app, &connection_id);
+    }
+    Ok(count)
+}
+
+/// Ticket 14 checklist item 7: "Remove all stored Cerebrite credentials" --
+/// iterates every connection `settings.json`'s index knows about (not just
+/// the currently open vault's) and disconnects each, reusing the exact same
+/// `disconnect_connection`/`delete_orphaned_secret` logic the single
+/// Disconnect action and orphan cleanup use. Best-effort: one connection
+/// failing to disconnect doesn't stop the rest from being attempted.
+/// Returns the connection ids that failed -- an empty vec means everything
+/// succeeded. The frontend is responsible for the confirmation step before
+/// calling this (`window.confirm`, per this codebase's ticket 09-13
+/// precedent).
+#[tauri::command]
+fn remove_all_stored_credentials(app: AppHandle) -> Result<Vec<String>, String> {
+    let settings = settings::load(&app);
+    let (keychain, plaintext) = credential_stores(&app)?;
+    let gitlab_endpoints = gitlab_oauth::GitLabEndpoints::production();
+
+    let mut failed = Vec::new();
+    for (connection_id, entry) in settings.connections.iter() {
+        let repo_path = Path::new(&entry.repo_path);
+        let succeeded = if repo_path.exists() {
+            provider_disconnect::disconnect_connection(repo_path, keychain.as_ref(), &plaintext, &gitlab_endpoints).is_ok()
+        } else {
+            provider_disconnect::delete_orphaned_secret(keychain.as_ref(), &plaintext, connection_id, entry.store);
+            true
+        };
+        if succeeded {
+            let _ = settings::remove_connection(&app, connection_id);
+        } else {
+            failed.push(connection_id.clone());
+        }
+    }
+    Ok(failed)
+}
+
 /// Ticket 08 checklist item 3/8: the "Commit as" prefill for the currently
 /// open vault -- repo-local `.git/config` -> global `~/.gitconfig` -> empty.
 /// Deliberately never includes the provider tier: this command has no
@@ -847,7 +977,7 @@ fn connect_access_token(
     // records which store this connection's secret ended up in, app-wide, so
     // a later cleanup/"remove all credentials" pass can find it without
     // walking every vault on disk.
-    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
 
     // The vault now has a working connection -- nudge the background sync
     // loop to try immediately rather than waiting for its next periodic
@@ -983,7 +1113,7 @@ fn connect_ssh_key(
     )
     .map_err(|e| e.to_string())?;
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::SshKey);
@@ -1153,7 +1283,7 @@ fn connect_github_oauth(
     )
     .map_err(|e| e.to_string())?;
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
@@ -1295,7 +1425,7 @@ fn connect_gitlab_oauth(
     )
     .map_err(|e| e.to_string())?;
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
@@ -1649,7 +1779,7 @@ fn clone_and_open_vault(
     *state.sync_tx.lock().unwrap() = Some(tx);
     spawn_sync_loop(app.clone(), vault_path.clone(), repo_root.clone(), rx);
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root).map_err(|e| e.to_string())?;
     notify_sync(&state);
 
     // Ticket 10 checklist: "Wizard ends on the 'Commit as' step, prefilled
@@ -2386,6 +2516,10 @@ pub fn run() {
             trigger_sync_now,
             unlock_keychain_and_retry_sync,
             reveal_conflict_backups,
+            disconnect,
+            scan_orphaned_connections,
+            cleanup_orphaned_connections,
+            remove_all_stored_credentials,
             commit_author_prefill,
             get_commit_author,
             confirm_commit_author,

@@ -14,6 +14,19 @@ use tauri::{AppHandle, Manager};
 
 use crate::connection_record::StoreKind;
 
+/// One entry in `Settings::connections` -- which credential store holds a
+/// connection's secret (ADR-0013), plus the repository path it belongs to.
+/// The repo path (added by ticket 14) is what lets a startup scan tell
+/// whether that repository still exists on disk without opening every vault
+/// to read its own `.git/cerebrite/connection.json` -- see
+/// `Settings::orphaned_connections`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionEntry {
+    pub store: StoreKind,
+    pub repo_path: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Theme {
@@ -38,7 +51,23 @@ pub struct Settings {
     /// outside the app) and so "Remove all stored Cerebrite credentials"
     /// knows what to remove without walking every vault on disk.
     #[serde(default)]
-    pub connections: BTreeMap<String, StoreKind>,
+    pub connections: BTreeMap<String, ConnectionEntry>,
+}
+
+impl Settings {
+    /// Ticket 14 checklist item 6: entries in `connections` whose repository
+    /// no longer exists on disk (deleted or moved outside the app) -- what a
+    /// startup scan surfaces for the "clean up orphaned credentials?"
+    /// notice. Pure and AppHandle-free on purpose, so it's directly
+    /// unit-testable; `scan_orphaned_connections` in `lib.rs` is the thin
+    /// Tauri-command wrapper that loads `Settings` first.
+    pub fn orphaned_connections(&self) -> Vec<(String, ConnectionEntry)> {
+        self.connections
+            .iter()
+            .filter(|(_, entry)| !Path::new(&entry.repo_path).exists())
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect()
+    }
 }
 
 fn settings_file_path(app: &AppHandle) -> Result<PathBuf> {
@@ -85,24 +114,66 @@ pub fn set_theme(app: &AppHandle, theme: Theme) -> Result<()> {
 }
 
 /// Records (or updates) which credential store a connection ID's secret is
-/// in. Called whenever a secret is first stored and whenever "Move to
-/// keychain" (ticket 02) succeeds.
-///
-/// No caller yet -- wiring a real connection into a vault starts at ticket
-/// 04 -- so `#[allow(dead_code)]` is deliberate here, not an oversight.
-#[allow(dead_code)]
-pub fn set_connection_store(app: &AppHandle, connection_id: &str, store: StoreKind) -> Result<()> {
+/// in, and which repository it belongs to (ticket 14's addition -- see
+/// `ConnectionEntry`'s doc comment). Called whenever a secret is first
+/// stored and whenever "Move to keychain" (ticket 02) succeeds.
+pub fn set_connection_store(app: &AppHandle, connection_id: &str, store: StoreKind, repo_root: &Path) -> Result<()> {
     let mut settings = load(app);
-    settings.connections.insert(connection_id.to_string(), store);
+    settings.connections.insert(
+        connection_id.to_string(),
+        ConnectionEntry {
+            store,
+            repo_path: repo_root.to_string_lossy().to_string(),
+        },
+    );
     save(app, &settings)
 }
 
 /// Removes a connection ID from the index -- called on Disconnect (ticket
-/// 14) and by "Remove all stored Cerebrite credentials" (ticket 02) once
+/// 14) and by "Remove all stored Cerebrite credentials" (ticket 14) once
 /// the underlying secret has actually been deleted.
-#[allow(dead_code)]
 pub fn remove_connection(app: &AppHandle, connection_id: &str) -> Result<()> {
     let mut settings = load(app);
     settings.connections.remove(connection_id);
     save(app, &settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn entry(repo_path: &str) -> ConnectionEntry {
+        ConnectionEntry {
+            store: StoreKind::Plaintext,
+            repo_path: repo_path.to_string(),
+        }
+    }
+
+    #[test]
+    fn orphaned_connections_finds_entries_whose_repo_path_is_gone() {
+        let mut settings = Settings::default();
+        settings.connections.insert("conn-gone".to_string(), entry("/does/not/exist/anywhere"));
+
+        let orphans = settings.orphaned_connections();
+
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].0, "conn-gone");
+    }
+
+    #[test]
+    fn orphaned_connections_excludes_entries_whose_repo_path_still_exists() {
+        let dir = tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings
+            .connections
+            .insert("conn-present".to_string(), entry(&dir.path().to_string_lossy()));
+
+        assert!(settings.orphaned_connections().is_empty());
+    }
+
+    #[test]
+    fn orphaned_connections_is_empty_when_there_are_no_connections() {
+        assert!(Settings::default().orphaned_connections().is_empty());
+    }
 }

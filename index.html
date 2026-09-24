@@ -388,6 +388,17 @@
               Not connected — connect a repository.
               <button id="sync-section-connect-button" type="button">Connect…</button>
             </p>
+            <!-- Ticket 14: shown only while this vault has a connection
+                 configured (the inverse of `sync-section-not-connected`
+                 above) -- deletes the stored secret, the connection record,
+                 and the origin remote; for a GitLab sign-in, also attempts
+                 to revoke the refresh token at GitLab itself. The result
+                 dialog's copy is built entirely in main.ts from the
+                 backend's `DisconnectOutcome`, never claiming a revocation
+                 that didn't actually happen. -->
+            <p id="sync-section-connected" class="sync-section-connected" hidden>
+              <button id="sync-section-disconnect-button" type="button">Disconnect…</button>
+            </p>
             <p class="settings-wizard-intro">
               Connect this vault to a remote repository directly, using raw git fields.
             </p>
@@ -505,6 +516,29 @@
               </div>
               <p id="settings-gitlab-status" class="settings-connect-status" hidden></p>
             </form>
+          </div>
+
+          <!-- Ticket 14: startup orphan-credential notice + "Remove all
+               stored Cerebrite credentials". The orphan notice is populated
+               by `scanOrphanedConnections` whenever Settings opens (a
+               startup dialog isn't required per the ticket -- this minimal
+               in-Settings banner is). -->
+          <div class="settings-section" id="credentials-section">
+            <h3>Credentials</h3>
+            <p id="settings-orphan-notice" class="settings-orphan-notice" hidden>
+              Cerebrite has stored credentials for a repository that no longer exists on this
+              device.
+              <button id="settings-orphan-cleanup-button" type="button">Clean up</button>
+            </p>
+            <p class="settings-wizard-intro">
+              Permanently deletes every credential Cerebrite has stored on this device, for every
+              vault it has ever connected -- not just this one. This does not revoke anything at
+              the provider.
+            </p>
+            <button id="settings-remove-all-credentials-button" type="button">
+              Remove all stored Cerebrite credentials…
+            </button>
+            <p id="settings-remove-all-credentials-status" class="settings-connect-status" hidden></p>
           </div>
         </div>
       </div>

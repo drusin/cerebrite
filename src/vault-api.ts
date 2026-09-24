@@ -617,3 +617,61 @@ export function revealConflictBackups(): Promise<void> {
 export function triggerSyncNow(): Promise<void> {
   return invoke("trigger_sync_now");
 }
+
+// --- Ticket 14: disconnect & credential revocation -------------------------
+
+/// Mirrors `connection_record::Provider`'s
+/// `#[serde(rename_all = "snake_case", tag = "kind", content = "host")]`
+/// shape exactly.
+export type Provider = { kind: "git_hub" } | { kind: "git_lab" } | { kind: "other"; host: string };
+
+/// Mirrors `provider_disconnect::DisconnectOutcome`'s
+/// `#[serde(rename_all = "camelCase")]` shape exactly. `gitlabRevoked` is the
+/// core trust-constraint field this ticket exists for -- see its Rust doc
+/// comment; the frontend's Disconnect dialog copy must never say "revoked"
+/// unless this is `true`.
+export interface DisconnectOutcome {
+  connectionId: string;
+  credentialKind: CredentialKind;
+  provider: Provider;
+  gitlabRevoked: boolean | null;
+}
+
+/// Ticket 14 checklist items 1/2/3/4/5/8: "Disconnect" in Settings' Sync
+/// section. Deletes the currently open vault's stored secret, its
+/// connection record, and (best effort) its `origin` remote; for a GitLab
+/// sign-in, also attempts to revoke the refresh token at GitLab itself.
+/// `null` means this vault had nothing connected to disconnect. Rejects if
+/// no vault is open.
+export function disconnectVault(): Promise<DisconnectOutcome | null> {
+  return invoke("disconnect");
+}
+
+/// One orphaned entry in `settings.json`'s connections index (ticket 14
+/// checklist item 6): a stored credential whose repository no longer exists
+/// on disk.
+export interface OrphanedConnection {
+  connectionId: string;
+  repoPath: string;
+}
+
+/// Scans for orphaned stored credentials -- called on startup (and whenever
+/// Settings wants to refresh its notice).
+export function scanOrphanedConnections(): Promise<OrphanedConnection[]> {
+  return invoke("scan_orphaned_connections");
+}
+
+/// Deletes every currently orphaned credential's secret and index entry.
+/// Returns how many were cleaned up.
+export function cleanupOrphanedConnections(): Promise<number> {
+  return invoke("cleanup_orphaned_connections");
+}
+
+/// Ticket 14 checklist item 7: "Remove all stored Cerebrite credentials" --
+/// disconnects every connection `settings.json`'s index knows about (not
+/// just the currently open vault's), best-effort. Returns the connection ids
+/// that failed to disconnect; an empty array means everything succeeded.
+/// The caller is responsible for the confirmation step before calling this.
+export function removeAllStoredCredentials(): Promise<string[]> {
+  return invoke("remove_all_stored_credentials");
+}

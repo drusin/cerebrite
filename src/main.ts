@@ -41,6 +41,12 @@ import {
   unlockKeychainAndRetrySync,
   revealConflictBackups,
   onSyncStatusChanged,
+  disconnectVault,
+  scanOrphanedConnections,
+  cleanupOrphanedConnections,
+  removeAllStoredCredentials,
+  type DisconnectOutcome,
+  type Provider,
   type CommitAuthor,
   type PageSummary,
   type PageResolution,
@@ -173,6 +179,18 @@ const syncPopupSyncNowButtonEl = document.querySelector<HTMLButtonElement>("#syn
 const syncPopupSettingsLinkEl = document.querySelector<HTMLButtonElement>("#sync-popup-settings-link");
 const syncSectionNotConnectedEl = document.querySelector<HTMLElement>("#sync-section-not-connected");
 const syncSectionConnectButtonEl = document.querySelector<HTMLButtonElement>("#sync-section-connect-button");
+// Ticket 14: "Disconnect…" (the inverse banner of the two above) plus the
+// standalone "Credentials" section's orphan notice and "Remove all" action.
+const syncSectionConnectedEl = document.querySelector<HTMLElement>("#sync-section-connected");
+const syncSectionDisconnectButtonEl = document.querySelector<HTMLButtonElement>("#sync-section-disconnect-button");
+const settingsOrphanNoticeEl = document.querySelector<HTMLElement>("#settings-orphan-notice");
+const settingsOrphanCleanupButtonEl = document.querySelector<HTMLButtonElement>("#settings-orphan-cleanup-button");
+const settingsRemoveAllCredentialsButtonEl = document.querySelector<HTMLButtonElement>(
+  "#settings-remove-all-credentials-button",
+);
+const settingsRemoveAllCredentialsStatusEl = document.querySelector<HTMLElement>(
+  "#settings-remove-all-credentials-status",
+);
 
 const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
@@ -1492,6 +1510,11 @@ function applySyncIndicator(status: SyncStatus) {
 function updateSyncSectionNotConnectedBanner() {
   if (!syncSectionNotConnectedEl) return;
   syncSectionNotConnectedEl.hidden = currentSyncStatus.state !== "noRemote";
+  // Ticket 14: the "Disconnect…" button's own banner is the exact inverse --
+  // shown whenever this vault has *some* connection configured, regardless
+  // of whether that connection is currently healthy (a needs-attention
+  // connection is still one Disconnect should be able to tear down).
+  if (syncSectionConnectedEl) syncSectionConnectedEl.hidden = currentSyncStatus.state === "noRemote";
 }
 
 /** Loads the current sync status once (on app start, and again once a vault
@@ -1827,6 +1850,160 @@ function openSettingsModal() {
   if (settingsVaultPathEl) settingsVaultPathEl.textContent = currentVaultPath ?? "";
   settingsModalOverlayEl.removeAttribute("hidden");
   void refreshCommitAuthorFields();
+  void refreshOrphanNotice();
+}
+
+// --- Ticket 14: disconnect & credential revocation --------------------------
+//
+// "Disconnect" deletes the three on-disk artifacts a connection leaves
+// behind (backend: `provider_disconnect::disconnect_connection`) and, for a
+// GitLab sign-in, attempts to revoke the refresh token at GitLab itself. The
+// dialog copy built here is the one place ticket 14's core trust constraint
+// actually has to be honored: never say "revoked" unless
+// `outcome.gitlabRevoked === true`, and for every other credential kind,
+// only ever "removed locally, revoke it yourself at: <link>".
+
+/** The host-specific "revoke it yourself" link for an access-token or SSH-key
+ * connection -- `null` for a host this app doesn't recognize (the dialog
+ * falls back to plain guidance text with no link, per the ticket). */
+function revocationLink(provider: Provider, kind: "token" | "sshKey"): string | null {
+  if (provider.kind === "git_hub") {
+    return kind === "token" ? "https://github.com/settings/tokens" : "https://github.com/settings/keys";
+  }
+  if (provider.kind === "git_lab") {
+    return kind === "token"
+      ? "https://gitlab.com/-/user_settings/personal_access_tokens"
+      : "https://gitlab.com/-/user_settings/ssh_keys";
+  }
+  return null;
+}
+
+/** GitHub's Authorized/Installed GitHub Apps management page -- where a user
+ * reviews or revokes Cerebrite's GitHub App installation, since revoking it
+ * directly needs a client secret Cerebrite deliberately doesn't hold (that's
+ * exactly why this app signs in via GitHub's device-flow-for-Apps instead of
+ * embedding one -- see `src-tauri/src/github_oauth.rs`'s module doc
+ * comment). */
+const GITHUB_INSTALLATIONS_URL = "https://github.com/settings/installations";
+
+/** GitLab's own "Authorized applications" settings page -- offered as the
+ * manual fallback whenever this app's own `/oauth/revoke` call couldn't be
+ * confirmed to have succeeded. */
+const GITLAB_AUTHORIZED_APPS_URL = "https://gitlab.com/-/profile/applications";
+
+/** Builds the Disconnect result message honestly, per credential kind --
+ * this is the one function in the whole feature this ticket's trust
+ * constraint lives or dies by. */
+function disconnectResultMessage(outcome: DisconnectOutcome): string {
+  if (outcome.credentialKind === "oauth_sign_in" && outcome.provider.kind === "git_lab") {
+    if (outcome.gitlabRevoked === true) {
+      return "Disconnected. Cerebrite revoked your GitLab sign-in token.";
+    }
+    return (
+      "Disconnected locally. Cerebrite could not confirm your GitLab sign-in token was " +
+      `revoked -- it may still be valid at GitLab. Revoke it yourself at: ${GITLAB_AUTHORIZED_APPS_URL}`
+    );
+  }
+  if (outcome.credentialKind === "oauth_sign_in" && outcome.provider.kind === "git_hub") {
+    return (
+      "Disconnected locally. GitHub App revocation needs a client secret Cerebrite doesn't " +
+      `hold. Review or revoke Cerebrite's access yourself at: ${GITHUB_INSTALLATIONS_URL}`
+    );
+  }
+  const linkKind = outcome.credentialKind === "ssh_key" ? "sshKey" : "token";
+  const link = revocationLink(outcome.provider, linkKind);
+  if (link) {
+    return `Removed locally -- revoke it yourself at: ${link}`;
+  }
+  const what = outcome.credentialKind === "ssh_key" ? "SSH key" : "access token";
+  return `Removed locally -- revoke this ${what} yourself at your git host's settings.`;
+}
+
+/** "Disconnect…" in Settings' Sync section (ticket 14 checklist item 1):
+ * confirms first (this codebase's `window.confirm` precedent, tickets
+ * 09-13), then deletes the stored secret, connection record, and origin
+ * remote, then shows the honest, per-kind result via `disconnectResultMessage`. */
+async function handleDisconnectClick() {
+  const confirmed = window.confirm(
+    "Disconnect this vault from its remote repository? Cerebrite deletes the stored " +
+      "credential and connection record from this device. This can't be undone from within " +
+      "Cerebrite.",
+  );
+  if (!confirmed) return;
+
+  try {
+    const outcome = await disconnectVault();
+    window.alert(outcome ? disconnectResultMessage(outcome) : "Nothing was connected.");
+  } catch (err) {
+    window.alert(`Couldn't disconnect: ${err}`);
+  } finally {
+    await refreshSyncStatus();
+    updateSyncSectionNotConnectedBanner();
+  }
+}
+
+/** Ticket 14 checklist item 6: refreshes Settings' orphaned-credential
+ * notice -- called whenever Settings opens (a startup dialog isn't required
+ * per the ticket; this minimal in-Settings banner is). Silently does
+ * nothing on failure (e.g. no app config dir resolvable) rather than
+ * blocking the rest of Settings from opening. */
+async function refreshOrphanNotice() {
+  if (!settingsOrphanNoticeEl) return;
+  try {
+    const orphans = await scanOrphanedConnections();
+    settingsOrphanNoticeEl.hidden = orphans.length === 0;
+  } catch {
+    settingsOrphanNoticeEl.hidden = true;
+  }
+}
+
+async function handleOrphanCleanupClick() {
+  settingsOrphanCleanupButtonEl?.setAttribute("disabled", "");
+  try {
+    await cleanupOrphanedConnections();
+  } catch (err) {
+    window.alert(`Couldn't clean up orphaned credentials: ${err}`);
+  } finally {
+    settingsOrphanCleanupButtonEl?.removeAttribute("disabled");
+    await refreshOrphanNotice();
+  }
+}
+
+/** Ticket 14 checklist item 7: "Remove all stored Cerebrite credentials" --
+ * confirms, then disconnects every connection `settings.json` knows about
+ * (not just this vault's), best-effort. Reports which ones (if any) failed
+ * rather than silently swallowing a partial failure. */
+async function handleRemoveAllCredentialsClick() {
+  const confirmed = window.confirm(
+    "Remove all stored Cerebrite credentials? This permanently deletes every credential " +
+      "Cerebrite has stored on this device, for every vault it has ever connected -- not just " +
+      "this one. This does not revoke anything at the provider, and can't be undone from " +
+      "within Cerebrite.",
+  );
+  if (!confirmed) return;
+
+  settingsRemoveAllCredentialsButtonEl?.setAttribute("disabled", "");
+  if (settingsRemoveAllCredentialsStatusEl) settingsRemoveAllCredentialsStatusEl.hidden = true;
+  try {
+    const failed = await removeAllStoredCredentials();
+    if (settingsRemoveAllCredentialsStatusEl) {
+      settingsRemoveAllCredentialsStatusEl.textContent =
+        failed.length === 0
+          ? "All stored credentials were removed."
+          : `Removed what it could -- ${failed.length} connection(s) could not be fully removed.`;
+      settingsRemoveAllCredentialsStatusEl.hidden = false;
+    }
+  } catch (err) {
+    if (settingsRemoveAllCredentialsStatusEl) {
+      settingsRemoveAllCredentialsStatusEl.textContent = String(err);
+      settingsRemoveAllCredentialsStatusEl.hidden = false;
+    }
+  } finally {
+    settingsRemoveAllCredentialsButtonEl?.removeAttribute("disabled");
+    await refreshOrphanNotice();
+    await refreshSyncStatus();
+    updateSyncSectionNotConnectedBanner();
+  }
 }
 
 /**
@@ -3499,6 +3676,9 @@ async function init() {
   syncPopupSyncNowButtonEl?.addEventListener("click", () => void handleSyncNowClick());
   syncPopupSettingsLinkEl?.addEventListener("click", openSyncSettingsFromPopup);
   syncSectionConnectButtonEl?.addEventListener("click", openConnectWizard);
+  syncSectionDisconnectButtonEl?.addEventListener("click", () => void handleDisconnectClick());
+  settingsOrphanCleanupButtonEl?.addEventListener("click", () => void handleOrphanCleanupClick());
+  settingsRemoveAllCredentialsButtonEl?.addEventListener("click", () => void handleRemoveAllCredentialsClick());
   void onSyncStatusChanged(applySyncIndicator);
   void refreshSyncStatus();
 
@@ -3593,6 +3773,13 @@ async function init() {
   const settings = await getSettings();
   applyTheme(settings.theme);
   setThemeRadioValue(settings.theme);
+
+  // Ticket 14 checklist item 6: startup orphan-credential scan -- app-wide
+  // (`settings.json`'s connections index isn't scoped to one vault), so
+  // this runs regardless of whether a vault is remembered/opens below. The
+  // notice itself only ever surfaces once Settings is opened (minimal UI,
+  // per the ticket) -- this just makes sure it's not stale the first time.
+  void refreshOrphanNotice();
 
   if (settings.vaultPath) {
     try {
