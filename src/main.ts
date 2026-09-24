@@ -21,6 +21,9 @@ import {
   pollGithubDeviceFlow,
   checkGithubInstallation,
   connectGithubOauth,
+  startGitlabDeviceFlow,
+  pollGitlabDeviceFlow,
+  connectGitlabOauth,
   type PageSummary,
   type PageResolution,
   type TrashedPageSummary,
@@ -119,6 +122,19 @@ const settingsGithubInstallContinueButtonEl = document.querySelector<HTMLButtonE
 /// until the install check clears and the real `connectGithubOauth` test
 /// fetch succeeds.
 let pendingGithubTokenPair: { accessToken: string; refreshToken: string; accessTokenExpiresAt: string } | null = null;
+
+// Ticket 07: minimal "Sign in with GitLab" device-flow UI elements -- same
+// shape as ticket 06's GitHub elements above, minus the install-CTA
+// elements (a GitLab OAuth application needs no per-repo install step).
+const settingsGitlabFormEl = document.querySelector<HTMLFormElement>("#settings-gitlab-form");
+const settingsGitlabUrlEl = document.querySelector<HTMLInputElement>("#settings-gitlab-url");
+const settingsGitlabButtonEl = document.querySelector<HTMLButtonElement>("#settings-gitlab-button");
+const settingsGitlabDeviceCodeEl = document.querySelector<HTMLElement>("#settings-gitlab-device-code");
+const settingsGitlabVerificationLinkEl = document.querySelector<HTMLAnchorElement>(
+  "#settings-gitlab-verification-link",
+);
+const settingsGitlabUserCodeEl = document.querySelector<HTMLElement>("#settings-gitlab-user-code");
+const settingsGitlabStatusEl = document.querySelector<HTMLElement>("#settings-gitlab-status");
 
 // The page currently loaded in the editor: either a persisted page (has an
 // id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
@@ -1166,6 +1182,84 @@ async function handleGithubInstallContinueClick() {
   }
 }
 
+/**
+ * Ticket 07's minimal "Sign in with GitLab" submit handler -- the same
+ * device-flow shape `handleGithubFormSubmit` uses, but there is no
+ * install-CTA detour: once a token pair is acquired, it goes straight to
+ * `connectGitlabOauth`'s real test-fetch-then-persist gate (a GitLab OAuth
+ * application reaches every repo the authorizing user can, unlike a GitHub
+ * App). `refreshToken` may come back `undefined` -- ticket 07's defensive
+ * dual path for GitLab's still-unverified device-grant response shape --
+ * and is passed through to `connectGitlabOauth` as-is rather than treated
+ * as an error.
+ */
+async function handleGitlabFormSubmit(event: SubmitEvent) {
+  event.preventDefault();
+  if (!settingsGitlabUrlEl) return;
+  const remoteUrl = settingsGitlabUrlEl.value.trim();
+  if (!remoteUrl) return;
+
+  settingsGitlabButtonEl?.setAttribute("disabled", "");
+  settingsGitlabDeviceCodeEl?.setAttribute("hidden", "");
+
+  const setStatus = (text: string) => {
+    if (!settingsGitlabStatusEl) return;
+    settingsGitlabStatusEl.textContent = text;
+    settingsGitlabStatusEl.removeAttribute("hidden");
+  };
+
+  try {
+    setStatus("Requesting a device code from GitLab…");
+    const device = await startGitlabDeviceFlow();
+
+    if (settingsGitlabVerificationLinkEl) {
+      settingsGitlabVerificationLinkEl.href = device.verificationUri;
+      settingsGitlabVerificationLinkEl.textContent = device.verificationUri;
+    }
+    if (settingsGitlabUserCodeEl) settingsGitlabUserCodeEl.textContent = device.userCode;
+    settingsGitlabDeviceCodeEl?.removeAttribute("hidden");
+    setStatus("Waiting for you to approve in the browser…");
+
+    const deadline = Date.now() + device.expiresInSecs * 1000;
+    let intervalMs = Math.max(device.intervalSecs, 1) * 1000;
+
+    let accessToken: string;
+    let refreshToken: string | undefined;
+    let accessTokenExpiresAt: string;
+
+    // Frontend-owned poll loop, identical shape to `handleGithubFormSubmit`'s.
+    for (;;) {
+      if (Date.now() >= deadline) throw new Error("The GitLab sign-in code expired before it was confirmed.");
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+
+      const result = await pollGitlabDeviceFlow(device.deviceCode);
+      if (result.outcome === "pending") continue;
+      if (result.outcome === "slowDown") {
+        intervalMs += 5000;
+        continue;
+      }
+      if (result.outcome === "denied") throw new Error("GitLab sign-in was denied.");
+      if (result.outcome === "expired") throw new Error("The GitLab sign-in code expired before it was confirmed.");
+      if (result.outcome === "error") throw new Error(result.message);
+
+      accessToken = result.accessToken;
+      refreshToken = result.refreshToken;
+      accessTokenExpiresAt = result.accessTokenExpiresAt;
+      break;
+    }
+
+    settingsGitlabDeviceCodeEl?.setAttribute("hidden", "");
+    setStatus("Connecting…");
+    await connectGitlabOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt);
+    setStatus("Connected.");
+  } catch (err) {
+    settingsGitlabDeviceCodeEl?.setAttribute("hidden", "");
+    setStatus(String(err));
+  } finally {
+    settingsGitlabButtonEl?.removeAttribute("disabled");
+  }
+}
+
 function openSettingsModal() {
   if (!settingsModalOverlayEl) return;
   if (settingsVaultPathEl) settingsVaultPathEl.textContent = currentVaultPath ?? "";
@@ -1243,6 +1337,7 @@ async function init() {
   settingsConnectFormEl?.addEventListener("submit", (e) => void handleConnectFormSubmit(e));
   settingsGithubFormEl?.addEventListener("submit", (e) => void handleGithubFormSubmit(e));
   settingsGithubInstallContinueButtonEl?.addEventListener("click", () => void handleGithubInstallContinueClick());
+  settingsGitlabFormEl?.addEventListener("submit", (e) => void handleGitlabFormSubmit(e));
   // Clicking the dimmed backdrop (not the modal card itself) closes it.
   settingsModalOverlayEl?.addEventListener("click", (event) => {
     if (event.target === settingsModalOverlayEl) closeSettingsModal();

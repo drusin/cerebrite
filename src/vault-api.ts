@@ -328,3 +328,51 @@ export function connectGithubOauth(
 ): Promise<void> {
   return invoke("connect_github_oauth", { remoteUrl, accessToken, refreshToken, accessTokenExpiresAt });
 }
+
+/// Ticket 07's GitLab Device Authorization Grant sign-in -- same shape as
+/// the GitHub functions above, minus an installation-check step (a GitLab
+/// OAuth application reaches every repo the authorizing user can; there is
+/// no separate per-repo "install" concept the way a GitHub App has one).
+/// Blocked on a real GitLab application registration *and* the still-
+/// pending live spike into whether `write_repository` scope is sufficient
+/// and whether GitLab's device grant returns a refresh token at all -- see
+/// `src-tauri/src/gitlab_oauth.rs`'s module doc comment. `startGitlabDeviceFlow`
+/// requests a fresh device/user code pair to show the user; the caller then
+/// polls `pollGitlabDeviceFlow` on a timer at `intervalSecs` until it stops
+/// returning `pending`/`slowDown`.
+export function startGitlabDeviceFlow(): Promise<DeviceCodeInfo> {
+  return invoke("start_gitlab_device_flow");
+}
+
+/// One poll of GitLab's token endpoint. Unlike GitHub's `DevicePollResult`,
+/// `refreshToken` on `success` may be `undefined` -- ticket 07's defensive
+/// dual path for GitLab's still-unverified device-grant response shape: if
+/// it's absent, the connection is stored without one and the background
+/// sync path reports the eventual 2-hour expiry as an explicit
+/// reconnect-needed failure instead of silently breaking.
+export type GitlabDevicePollResult =
+  | { outcome: "success"; accessToken: string; refreshToken?: string; accessTokenExpiresAt: string }
+  | { outcome: "pending" }
+  | { outcome: "slowDown" }
+  | { outcome: "denied" }
+  | { outcome: "expired" }
+  | { outcome: "error"; message: string };
+
+export function pollGitlabDeviceFlow(deviceCode: string): Promise<GitlabDevicePollResult> {
+  return invoke("poll_gitlab_device_flow", { deviceCode });
+}
+
+/// Finishes GitLab sign-in: runs a real test fetch with the access token
+/// (`oauth2` HTTPS Basic-auth convention -- GitLab's, distinct from
+/// GitHub's `x-access-token`) before persisting anything, same gate as
+/// `connectGithubOauth`/`connectAccessToken`/`connectSshKey`. Stores
+/// whatever refresh token (if any) came back so the background sync path
+/// can refresh unattended when one exists.
+export function connectGitlabOauth(
+  remoteUrl: string,
+  accessToken: string,
+  refreshToken: string | undefined,
+  accessTokenExpiresAt: string,
+): Promise<void> {
+  return invoke("connect_gitlab_oauth", { remoteUrl, accessToken, refreshToken, accessTokenExpiresAt });
+}

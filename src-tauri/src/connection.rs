@@ -147,10 +147,11 @@ impl Connection {
     pub fn make_callbacks(&self, known_hosts_path: Option<&Path>) -> git2::RemoteCallbacks<'_> {
         let mut callbacks = git2::RemoteCallbacks::new();
         let kind = self.record.credential_kind;
+        let provider = self.record.provider.clone();
         let username = self.record.https_username.clone();
         let secret = self.secret.clone();
         callbacks.credentials(move |url, username_from_url, _allowed_types| {
-            credential_for_kind(kind, &username, &secret, url, username_from_url)
+            credential_for_kind(kind, &provider, &username, &secret, url, username_from_url)
         });
 
         if kind == CredentialKind::SshKey {
@@ -275,6 +276,7 @@ fn resolve_secret(
 /// its own behalf (see `ssh_key.rs`'s module doc comment for why).
 fn credential_for_kind(
     kind: CredentialKind,
+    provider: &connection_record::Provider,
     https_username: &Option<String>,
     secret: &[u8],
     _url: &str,
@@ -289,24 +291,45 @@ fn credential_for_kind(
             let token = String::from_utf8_lossy(secret).into_owned();
             git2::Cred::userpass_plaintext(&user, &token)
         }
-        // Ticket 06: the stored secret is a `github_oauth::OauthSecret` JSON
-        // envelope (access token + refresh token), not a raw token -- unlike
-        // `AccessToken`, which stores the token verbatim. Only the access
-        // token half is a valid git credential; the refresh token never
-        // reaches libgit2, it's only used by this module's own background
-        // refresh path. Convention (ticket 01's research, confirmed for
-        // GitHub Apps' user-to-server tokens): username `x-access-token`,
-        // any real HTTPS username stored on the record still wins if present.
-        CredentialKind::OauthSignIn => {
-            let user = https_username
-                .clone()
-                .or_else(|| username_from_url.map(str::to_string))
-                .unwrap_or_else(|| "x-access-token".to_string());
-            let oauth = crate::github_oauth::OauthSecret::from_bytes(secret).map_err(|e| {
-                git2::Error::from_str(&format!("stored OAuth sign-in secret is corrupt: {e}"))
-            })?;
-            git2::Cred::userpass_plaintext(&user, &oauth.access_token)
-        }
+        // Tickets 06/07: the stored secret is a provider-specific
+        // `OauthSecret` JSON envelope (access token + refresh token), not a
+        // raw token -- unlike `AccessToken`, which stores the token
+        // verbatim. Only the access token half is a valid git credential;
+        // the refresh token never reaches libgit2, it's only used by each
+        // provider module's own background refresh path. The envelope shape
+        // *and* the HTTPS username convention differ per provider (GitHub's
+        // refresh token is mandatory, `x-access-token`; GitLab's is
+        // optional -- ticket 07's defensive dual path -- and `oauth2`), so
+        // this dispatches on `provider` rather than assuming one shape for
+        // every `OauthSignIn` connection.
+        CredentialKind::OauthSignIn => match provider {
+            connection_record::Provider::GitLab => {
+                let user = https_username
+                    .clone()
+                    .or_else(|| username_from_url.map(str::to_string))
+                    .unwrap_or_else(|| crate::gitlab_oauth::GITLAB_HTTPS_USERNAME.to_string());
+                let oauth = crate::gitlab_oauth::OauthSecret::from_bytes(secret).map_err(|e| {
+                    git2::Error::from_str(&format!("stored OAuth sign-in secret is corrupt: {e}"))
+                })?;
+                git2::Cred::userpass_plaintext(&user, &oauth.access_token)
+            }
+            // GitHub, and the fallback for any other provider -- ADR-0012
+            // only ever offers `OauthSignIn` for GitHub/GitLab, so there is
+            // no third shape to dispatch on in practice, but matching by
+            // exclusion here (rather than `Provider::GitHub` explicitly)
+            // means a corrupt/legacy record still gets a sensible attempt
+            // instead of a `match` that can't compile without a catch-all.
+            _ => {
+                let user = https_username
+                    .clone()
+                    .or_else(|| username_from_url.map(str::to_string))
+                    .unwrap_or_else(|| "x-access-token".to_string());
+                let oauth = crate::github_oauth::OauthSecret::from_bytes(secret).map_err(|e| {
+                    git2::Error::from_str(&format!("stored OAuth sign-in secret is corrupt: {e}"))
+                })?;
+                git2::Cred::userpass_plaintext(&user, &oauth.access_token)
+            }
+        },
         CredentialKind::SshKey => {
             let user = username_from_url.unwrap_or("git");
             let secret = crate::ssh_key::SshSecret::from_bytes(secret)
@@ -418,6 +441,7 @@ mod tests {
     fn access_token_kind_builds_userpass_credentials() {
         let result = credential_for_kind(
             CredentialKind::AccessToken,
+            &connection_record::Provider::Other("test-host".to_string()),
             &Some("dawid".to_string()),
             b"a-token",
             "https://example.test/repo.git",
@@ -427,17 +451,18 @@ mod tests {
     }
 
     #[test]
-    fn oauth_sign_in_kind_builds_userpass_credentials_from_the_access_token_half() {
-        // Ticket 06: the stored secret is the `OauthSecret` JSON envelope,
-        // not a raw token -- this proves `credential_for_kind` unwraps it
-        // and uses only the access token, defaulting to the `x-access-token`
-        // username convention when the record has none.
+    fn oauth_sign_in_kind_builds_userpass_credentials_from_the_access_token_half_for_github() {
+        // Ticket 06: the stored secret is the `github_oauth::OauthSecret`
+        // JSON envelope, not a raw token -- this proves `credential_for_kind`
+        // unwraps it and uses only the access token, defaulting to the
+        // `x-access-token` username convention when the record has none.
         let secret = crate::github_oauth::OauthSecret {
             access_token: "gho_abc".to_string(),
             refresh_token: "ghr_def".to_string(),
         };
         let result = credential_for_kind(
             CredentialKind::OauthSignIn,
+            &connection_record::Provider::GitHub,
             &None,
             &secret.to_bytes(),
             "https://github.com/dawid/notes.git",
@@ -447,12 +472,68 @@ mod tests {
     }
 
     #[test]
-    fn oauth_sign_in_kind_with_corrupt_stored_secret_bytes_fails_cleanly_not_a_panic() {
+    fn oauth_sign_in_kind_with_corrupt_stored_secret_bytes_fails_cleanly_not_a_panic_for_github() {
         let result = credential_for_kind(
             CredentialKind::OauthSignIn,
+            &connection_record::Provider::GitHub,
             &None,
             b"not valid json",
             "https://github.com/dawid/notes.git",
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn oauth_sign_in_kind_builds_userpass_credentials_from_the_access_token_half_for_gitlab() {
+        // Ticket 07: the stored secret is the `gitlab_oauth::OauthSecret`
+        // JSON envelope -- a different shape from GitHub's (`refresh_token`
+        // is `Option`, not mandatory) -- and the username convention is
+        // `oauth2`, not GitHub's `x-access-token`.
+        let secret = crate::gitlab_oauth::OauthSecret {
+            access_token: "glpat_abc".to_string(),
+            refresh_token: Some("glrt_def".to_string()),
+        };
+        let result = credential_for_kind(
+            CredentialKind::OauthSignIn,
+            &connection_record::Provider::GitLab,
+            &None,
+            &secret.to_bytes(),
+            "https://gitlab.com/dawid/notes.git",
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn oauth_sign_in_kind_for_gitlab_works_with_no_refresh_token_stored() {
+        // Ticket 07's defensive dual path: a GitLab connection whose device
+        // grant never returned a refresh token still has to authenticate
+        // with its access token -- `credential_for_kind` must not require
+        // the `Option` to be `Some`.
+        let secret = crate::gitlab_oauth::OauthSecret {
+            access_token: "glpat_abc".to_string(),
+            refresh_token: None,
+        };
+        let result = credential_for_kind(
+            CredentialKind::OauthSignIn,
+            &connection_record::Provider::GitLab,
+            &None,
+            &secret.to_bytes(),
+            "https://gitlab.com/dawid/notes.git",
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn oauth_sign_in_kind_with_corrupt_stored_secret_bytes_fails_cleanly_not_a_panic_for_gitlab() {
+        let result = credential_for_kind(
+            CredentialKind::OauthSignIn,
+            &connection_record::Provider::GitLab,
+            &None,
+            b"not valid json",
+            "https://gitlab.com/dawid/notes.git",
             None,
         );
         assert!(result.is_err());
@@ -471,6 +552,7 @@ mod tests {
         };
         let result = credential_for_kind(
             CredentialKind::SshKey,
+            &connection_record::Provider::Other("test-host".to_string()),
             &None,
             &secret.to_bytes(),
             "ssh://example.test/repo.git",
@@ -491,6 +573,7 @@ mod tests {
         };
         let result = credential_for_kind(
             CredentialKind::SshKey,
+            &connection_record::Provider::Other("test-host".to_string()),
             &None,
             &secret.to_bytes(),
             "ssh://example.test/repo.git",
@@ -503,6 +586,7 @@ mod tests {
     fn ssh_key_kind_with_corrupt_stored_secret_bytes_fails_cleanly_not_a_panic() {
         let result = credential_for_kind(
             CredentialKind::SshKey,
+            &connection_record::Provider::Other("test-host".to_string()),
             &None,
             b"not valid json",
             "ssh://example.test/repo.git",

@@ -223,6 +223,39 @@
               <button id="settings-github-install-continue-button" type="button">I've installed it, continue</button>
             </div>
           </div>
+
+          <!-- Ticket 07: minimal device-flow "Sign in with GitLab" UI --
+               same shape as the "Sign in with GitHub" section above, minus
+               an app-installation step (GitLab OAuth applications reach
+               every repo the authorizing user can, with no separate
+               per-repo "install" concept). Requires a real registered
+               GitLab application client id (currently a placeholder, see
+               src-tauri/src/gitlab_oauth.rs) to actually work, and the live
+               spike that ticket's still-pending (write_repository scope
+               sufficiency, refresh token presence, secretless refresh)
+               hasn't been run yet either. -->
+          <div class="settings-section">
+            <h3>Sign in with GitLab</h3>
+            <form id="settings-gitlab-form" class="settings-connect-form">
+              <label>
+                Repository URL
+                <input
+                  id="settings-gitlab-url"
+                  type="text"
+                  placeholder="https://gitlab.com/user/repo.git"
+                  required
+                />
+              </label>
+              <button id="settings-gitlab-button" type="submit">Sign in with GitLab</button>
+            </form>
+            <div id="settings-gitlab-device-code" class="settings-connect-status" hidden>
+              <p>
+                Go to <a id="settings-gitlab-verification-link" href="#" target="_blank" rel="noopener"></a> and
+                enter code: <strong id="settings-gitlab-user-code"></strong>
+              </p>
+            </div>
+            <p id="settings-gitlab-status" class="settings-connect-status" hidden></p>
+          </div>
         </div>
       </div>
     </div>

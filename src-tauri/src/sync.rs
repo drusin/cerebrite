@@ -83,6 +83,19 @@ pub enum SyncFailureCause {
     /// `HostKeyUnconfirmed`, re-trusting this host needs the same explicit
     /// confirmation as first contact, never an automatic retry.
     HostKeyMismatch { host: String, fingerprint: String },
+    /// An OAuth sign-in connection's access token was rejected *and* this
+    /// connection has no refresh token to renew it with (ticket 07: GitLab's
+    /// device grant may not hand one back at all -- one of the three facts
+    /// the still-pending live spike must confirm; see
+    /// `gitlab_oauth::refresh_if_needed`'s doc comment). Distinct from the
+    /// generic `CredentialRejected` so a future UI can point the user
+    /// straight at signing in again rather than implying the same
+    /// credential might work on retry -- the fix here is never "try again",
+    /// it's "reconnect".
+    OauthReconnectRequired {
+        detail: String,
+        credential_kind: CredentialKind,
+    },
 }
 
 impl std::fmt::Display for SyncFailureCause {
@@ -103,6 +116,11 @@ impl std::fmt::Display for SyncFailureCause {
             SyncFailureCause::HostKeyMismatch { host, fingerprint } => write!(
                 f,
                 "SSH host key for {host} no longer matches what was trusted (now {fingerprint}) -- refusing to connect until re-confirmed"
+            ),
+            SyncFailureCause::OauthReconnectRequired { detail, credential_kind } => write!(
+                f,
+                "{} expired and can't be refreshed automatically -- reconnect required: {detail}",
+                credential_kind_label(*credential_kind)
             ),
         }
     }
@@ -205,12 +223,39 @@ pub fn classify_git_error_for(err: &git2::Error, connection: Option<&Connection>
     }
     match (classify_git_error(err), connection) {
         (SyncFailureCause::CredentialRejected { detail, .. }, Some(connection)) => {
+            let kind = connection.credential_kind();
+            if kind == CredentialKind::OauthSignIn && !oauth_connection_is_refreshable(connection) {
+                return SyncFailureCause::OauthReconnectRequired { detail, credential_kind: kind };
+            }
             SyncFailureCause::CredentialRejected {
                 detail,
-                credential_kind: Some(connection.credential_kind()),
+                credential_kind: Some(kind),
             }
         }
         (cause, _) => cause,
+    }
+}
+
+/// Whether `connection` (an `OauthSignIn` connection) has a refresh token
+/// to renew itself with -- ticket 07's defensive dual path. GitHub
+/// connections (ticket 06) always carry a mandatory refresh token by
+/// construction, so this is only ever meaningfully `false` for a GitLab
+/// connection whose device grant never returned one. A corrupt/unparsable
+/// stored secret defaults to `true` (i.e. an ordinary `CredentialRejected`
+/// rather than `OauthReconnectRequired`) -- that failure mode is already
+/// reported elsewhere (`connection::credential_for_kind`'s own error), and
+/// this classifier shouldn't invent a second, different-shaped story for
+/// the same underlying problem.
+fn oauth_connection_is_refreshable(connection: &Connection) -> bool {
+    use crate::connection_record::Provider;
+    match &connection.record().provider {
+        Provider::GitLab => crate::gitlab_oauth::OauthSecret::from_bytes(connection.secret_bytes())
+            .map(|secret| secret.is_refreshable())
+            .unwrap_or(true),
+        // GitHub (ticket 06) and any other provider: always treated as
+        // refreshable (GitHub always issues a refresh token for its
+        // device-flow tokens).
+        _ => true,
     }
 }
 
@@ -958,6 +1003,92 @@ mod tests {
                     cause.to_string().starts_with("access token rejected:"),
                     "expected the message to name the credential kind, got: {cause}"
                 );
+            }
+            other => panic!("expected NeedsAttention, got {other:?}"),
+        }
+    }
+
+    // -- ticket 07: a GitLab OAuth sign-in connection with no refresh token
+    // surfaces a rejected credential as `OauthReconnectRequired`, not a
+    // generic `CredentialRejected` -- the defensive dual path for the
+    // still-unverified "does GitLab's device grant return a refresh token"
+    // fact. A GitLab connection that *does* have a refresh token is treated
+    // exactly like any other rejected credential (an ordinary
+    // `CredentialRejected`), since a stale/revoked refresh token is a
+    // different problem than "there was never anything to refresh with".
+
+    fn gitlab_oauth_connection(access_token: &str, refresh_token: Option<&str>) -> Connection {
+        let secret = crate::gitlab_oauth::OauthSecret {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.map(str::to_string),
+        };
+        Connection::from_parts(
+            ConnectionRecord {
+                connection_id: "test-conn".to_string(),
+                credential_kind: CredentialKind::OauthSignIn,
+                provider: Provider::GitLab,
+                https_username: Some(crate::gitlab_oauth::GITLAB_HTTPS_USERNAME.to_string()),
+                token_expiry: None,
+                credential_store: StoreKind::Plaintext,
+            },
+            secret.to_bytes(),
+        )
+    }
+
+    #[test]
+    fn a_rejected_gitlab_oauth_connection_with_no_refresh_token_surfaces_as_reconnect_required() {
+        let dir = tempdir().unwrap();
+        vault::ensure_git_repo(dir.path()).unwrap();
+        fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
+        vault::commit_all(dir.path(), "Create page").unwrap();
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let port = spawn_401_server();
+        repo.remote("origin", &format!("http://127.0.0.1:{port}/repo.git")).unwrap();
+
+        let connection = gitlab_oauth_connection("expired-token", None);
+        let outcome = run_sync(dir.path(), Some(&connection), None).unwrap();
+
+        match outcome.status {
+            SyncStatus::NeedsAttention { cause } => {
+                match &cause {
+                    SyncFailureCause::OauthReconnectRequired { credential_kind, .. } => {
+                        assert_eq!(*credential_kind, CredentialKind::OauthSignIn);
+                    }
+                    other => panic!("expected OauthReconnectRequired, got {other:?}"),
+                }
+                assert!(
+                    cause.to_string().contains("reconnect required"),
+                    "expected the message to call out reconnecting, got: {cause}"
+                );
+            }
+            other => panic!("expected NeedsAttention, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rejected_gitlab_oauth_connection_with_a_refresh_token_is_an_ordinary_credential_rejection() {
+        let dir = tempdir().unwrap();
+        vault::ensure_git_repo(dir.path()).unwrap();
+        fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
+        vault::commit_all(dir.path(), "Create page").unwrap();
+
+        let repo = git2::Repository::open(dir.path()).unwrap();
+        let port = spawn_401_server();
+        repo.remote("origin", &format!("http://127.0.0.1:{port}/repo.git")).unwrap();
+
+        // A refresh token is present, but stale/revoked (that's a separate
+        // problem from "there was never one to try") -- rejection here is
+        // an ordinary `CredentialRejected`, not `OauthReconnectRequired`.
+        let connection = gitlab_oauth_connection("expired-token", Some("glrt_stale"));
+        let outcome = run_sync(dir.path(), Some(&connection), None).unwrap();
+
+        match outcome.status {
+            SyncStatus::NeedsAttention { cause } => {
+                assert!(
+                    matches!(cause, SyncFailureCause::CredentialRejected { .. }),
+                    "expected CredentialRejected, got {cause:?}"
+                )
             }
             other => panic!("expected NeedsAttention, got {other:?}"),
         }

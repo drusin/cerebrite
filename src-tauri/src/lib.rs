@@ -3,6 +3,7 @@ mod connection_record;
 mod credential;
 mod frontmatter;
 mod github_oauth;
+mod gitlab_oauth;
 mod heading_slug;
 mod index;
 mod links;
@@ -433,9 +434,17 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
             // the fresh one rather than racing the old one's expiry mid-sync.
             // A no-op for every other credential kind, and for an OAuth
             // connection that isn't yet close to expiring.
+            // Ticket 07: GitLab's own OAuth sign-in connections need the
+            // same unattended pre-sync refresh -- both `refresh_if_needed`
+            // functions are no-ops for a connection they don't own (guarded
+            // by `record.provider`, not just `credential_kind`, since both
+            // share `CredentialKind::OauthSignIn`), so calling both in
+            // sequence is safe regardless of which provider this connection
+            // is actually signed in with.
             let connection = match (keychain.as_ref().ok(), plaintext.as_ref()) {
                 (keychain, Some(plaintext)) => {
-                    github_oauth::refresh_if_needed(repo_root, keychain, plaintext, connection)
+                    let connection = github_oauth::refresh_if_needed(repo_root, keychain, plaintext, connection);
+                    gitlab_oauth::refresh_if_needed(repo_root, keychain, plaintext, connection)
                 }
                 _ => connection,
             };
@@ -825,6 +834,134 @@ fn connect_github_oauth(
     };
 
     let secret = github_oauth::OauthSecret {
+        access_token,
+        refresh_token,
+    };
+
+    let connection = connection::try_connect(
+        &repo_root,
+        keychain.as_ref(),
+        &plaintext,
+        record.clone(),
+        secret.to_bytes(),
+        &remote_url,
+        None, // OAuth sign-in is HTTPS-only; SSH host-key checking doesn't apply
+        credential::CallUrgency::Interactive,
+    )
+    .map_err(|e| e.to_string())?;
+
+    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    notify_sync(&state);
+
+    debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
+    Ok(())
+}
+
+/// Ticket 07 step 1: requests a fresh device/user code pair from GitLab and
+/// hands it back for the frontend to display (the code, and the URL to
+/// visit). Uses the placeholder `gitlab_oauth::GITLAB_CLIENT_ID` until a
+/// real GitLab application is registered -- see `gitlab_oauth.rs`'s module
+/// doc comment for the full "blocked on manual follow-up" note, including
+/// the still-pending live spike ticket 07 was supposed to run first. A real
+/// (unregistered) client id makes GitLab reject this.
+#[tauri::command]
+fn start_gitlab_device_flow() -> Result<gitlab_oauth::DeviceCodeInfo, String> {
+    let endpoints = gitlab_oauth::GitLabEndpoints::production();
+    gitlab_oauth::request_device_code(&endpoints, gitlab_oauth::GITLAB_CLIENT_ID).map_err(|e| e.to_string())
+}
+
+/// Ticket 07 step 2: one poll of GitLab's token endpoint, called repeatedly
+/// by the frontend on a timer -- same "frontend owns the poll loop" pattern
+/// `poll_github_device_flow` uses. Unlike GitHub's `DevicePollResult`,
+/// `refreshToken` may be absent on success (ticket 07's defensive dual
+/// path: GitLab's device grant may not return one at all).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+enum GitlabDevicePollResult {
+    Success {
+        access_token: String,
+        refresh_token: Option<String>,
+        access_token_expires_at: String,
+    },
+    Pending,
+    SlowDown,
+    Denied,
+    Expired,
+    Error {
+        message: String,
+    },
+}
+
+#[tauri::command]
+fn poll_gitlab_device_flow(device_code: String) -> GitlabDevicePollResult {
+    let endpoints = gitlab_oauth::GitLabEndpoints::production();
+    match gitlab_oauth::poll_once(&endpoints, gitlab_oauth::GITLAB_CLIENT_ID, &device_code) {
+        gitlab_oauth::PollOutcome::Success(pair) => GitlabDevicePollResult::Success {
+            access_token: pair.access_token,
+            refresh_token: pair.refresh_token,
+            access_token_expires_at: pair.access_token_expires_at,
+        },
+        gitlab_oauth::PollOutcome::Pending => GitlabDevicePollResult::Pending,
+        gitlab_oauth::PollOutcome::SlowDown => GitlabDevicePollResult::SlowDown,
+        gitlab_oauth::PollOutcome::Denied => GitlabDevicePollResult::Denied,
+        gitlab_oauth::PollOutcome::Expired => GitlabDevicePollResult::Expired,
+        gitlab_oauth::PollOutcome::Error(e) => GitlabDevicePollResult::Error { message: e.to_string() },
+    }
+}
+
+/// Ticket 07 step 3-5: finishes GitLab sign-in the same way
+/// `connect_github_oauth` finishes a GitHub one -- reuses
+/// `connection::try_connect` as-is, so a real test fetch with
+/// `Cred::userpass_plaintext("oauth2", access_token)` (via
+/// `connection::credential_for_kind`'s `OauthSignIn`/`GitLab` arm) must
+/// succeed *before* anything is persisted. Unlike GitHub, there is no
+/// per-repo "app installation" step to check first -- a GitLab OAuth
+/// application reaches every repo the authorizing user can, so this goes
+/// straight from a token pair to the test-fetch-then-persist gate.
+/// `refresh_token` is `Option` (ticket 07's defensive dual path): when
+/// `None`, the stored `OauthSecret` simply has no refresh token to work
+/// with later, and `sync::classify_git_error_for` reports the eventual
+/// 2-hour expiry as `SyncFailureCause::OauthReconnectRequired` rather than
+/// a silent break.
+#[tauri::command]
+fn connect_gitlab_oauth(
+    app: AppHandle,
+    state: State<AppState>,
+    remote_url: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    access_token_expires_at: String,
+) -> Result<(), String> {
+    let remote_url = remote_url.trim().to_string();
+    if remote_url.is_empty() || access_token.is_empty() {
+        return Err("Repository URL and access token are both required".to_string());
+    }
+
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let plaintext = credential::PlaintextStore::new(&config_dir);
+
+    let keychain = credential::KeychainBackend::platform().ok();
+    let store_kind = match &keychain {
+        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
+        _ => connection_record::StoreKind::Plaintext,
+    };
+
+    let record = connection_record::ConnectionRecord {
+        connection_id: uuid::Uuid::new_v4().to_string(),
+        credential_kind: connection_record::CredentialKind::OauthSignIn,
+        provider: infer_provider(&remote_url),
+        https_username: Some(gitlab_oauth::GITLAB_HTTPS_USERNAME.to_string()),
+        token_expiry: Some(access_token_expires_at),
+        credential_store: store_kind,
+    };
+
+    let secret = gitlab_oauth::OauthSecret {
         access_token,
         refresh_token,
     };
@@ -1564,6 +1701,9 @@ pub fn run() {
             poll_github_device_flow,
             check_github_installation,
             connect_github_oauth,
+            start_gitlab_device_flow,
+            poll_gitlab_device_flow,
+            connect_gitlab_oauth,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
