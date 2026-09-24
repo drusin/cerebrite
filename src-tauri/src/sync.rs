@@ -71,6 +71,18 @@ pub enum SyncFailureCause {
     /// Any other git2/libgit2 failure, or a non-git problem (e.g. a
     /// detached HEAD) that isn't one of the above.
     Other { detail: String },
+    /// An SSH host presented a key that's never been trusted before (not
+    /// GitHub's/GitLab's pinned key either, ticket 05) -- not a broken
+    /// connection, but it always blocks until the user explicitly confirms
+    /// the fingerprint via `ssh_host_keys::KnownHosts::confirm`. Sync itself
+    /// never confirms one on its own.
+    HostKeyUnconfirmed { host: String, fingerprint: String },
+    /// An SSH host's key no longer matches what was pinned (GitHub/GitLab)
+    /// or previously confirmed (TOFU) for it -- ticket 05 checklist item 6,
+    /// the textbook host-key-changed/MITM signature. Unlike
+    /// `HostKeyUnconfirmed`, re-trusting this host needs the same explicit
+    /// confirmation as first contact, never an automatic retry.
+    HostKeyMismatch { host: String, fingerprint: String },
 }
 
 impl std::fmt::Display for SyncFailureCause {
@@ -84,6 +96,14 @@ impl std::fmt::Display for SyncFailureCause {
             SyncFailureCause::NonFastForwardPush { detail } => write!(f, "push rejected: {detail}"),
             SyncFailureCause::Conflict { detail } => write!(f, "conflict: {detail}"),
             SyncFailureCause::Other { detail } => write!(f, "{detail}"),
+            SyncFailureCause::HostKeyUnconfirmed { host, fingerprint } => write!(
+                f,
+                "unknown SSH host key for {host} ({fingerprint}) -- confirm this fingerprint before connecting"
+            ),
+            SyncFailureCause::HostKeyMismatch { host, fingerprint } => write!(
+                f,
+                "SSH host key for {host} no longer matches what was trusted (now {fingerprint}) -- refusing to connect until re-confirmed"
+            ),
         }
     }
 }
@@ -167,7 +187,22 @@ pub fn classify_git_error(err: &git2::Error) -> SyncFailureCause {
 /// name it ("access token rejected: ...") instead of a generic message
 /// (ticket 04 checklist: "surfaces ... as a needs-attention failure naming
 /// this credential kind").
+///
+/// Ticket 05: also checks `connection`'s `last_host_key_check` *first* --
+/// when an SSH connection's `certificate_check` rejected the host key
+/// (unconfirmed or mismatched), the resulting `git2::Error`'s own message is
+/// useless for telling those two cases apart (libgit2 overwrites it with a
+/// fixed "invalid or unknown remote ssh hostkey" string regardless of what
+/// the callback set -- see `connection.rs`'s `check_ssh_host_key` doc
+/// comment), so the structured cause has to come from that side channel
+/// instead of `err` at all. Falls through to the ordinary classification
+/// below whenever host-key checking wasn't what failed (a non-SSH
+/// connection, or an SSH one where the host key itself checked out fine and
+/// something else -- credentials, network -- failed afterward).
 pub fn classify_git_error_for(err: &git2::Error, connection: Option<&Connection>) -> SyncFailureCause {
+    if let Some(cause) = connection.and_then(host_key_failure_cause) {
+        return cause;
+    }
     match (classify_git_error(err), connection) {
         (SyncFailureCause::CredentialRejected { detail, .. }, Some(connection)) => {
             SyncFailureCause::CredentialRejected {
@@ -176,6 +211,28 @@ pub fn classify_git_error_for(err: &git2::Error, connection: Option<&Connection>
             }
         }
         (cause, _) => cause,
+    }
+}
+
+/// Recovers a `SyncFailureCause` from `connection`'s
+/// `last_host_key_check` (ticket 05), if the most recent
+/// `certificate_check` invocation rejected the host key. `None` when there
+/// was no SSH host-key check at all, or it passed (pinned/previously
+/// confirmed) and whatever actually failed happened afterward -- that case
+/// falls through to ordinary `git2::Error` classification instead.
+fn host_key_failure_cause(connection: &Connection) -> Option<SyncFailureCause> {
+    let outcome = connection.last_host_key_check()?;
+    use crate::ssh_host_keys::HostKeyCheck;
+    match outcome.check {
+        HostKeyCheck::PinnedMismatch | HostKeyCheck::KnownMismatch { .. } => Some(SyncFailureCause::HostKeyMismatch {
+            host: outcome.host,
+            fingerprint: outcome.fingerprint,
+        }),
+        HostKeyCheck::Unknown => Some(SyncFailureCause::HostKeyUnconfirmed {
+            host: outcome.host,
+            fingerprint: outcome.fingerprint,
+        }),
+        HostKeyCheck::PinnedMatch | HostKeyCheck::KnownMatch => None,
     }
 }
 
@@ -230,9 +287,14 @@ fn callbacks_without_connection<'a>() -> git2::RemoteCallbacks<'a> {
     git2::RemoteCallbacks::new()
 }
 
-fn push_current_branch(remote: &mut git2::Remote, branch: &str, connection: Option<&Connection>) -> Result<(), git2::Error> {
+fn push_current_branch(
+    remote: &mut git2::Remote,
+    branch: &str,
+    connection: Option<&Connection>,
+    known_hosts_path: Option<&Path>,
+) -> Result<(), git2::Error> {
     let callbacks = connection
-        .map(Connection::make_callbacks)
+        .map(|c| c.make_callbacks(known_hosts_path))
         .unwrap_or_else(callbacks_without_connection);
     let mut push_opts = git2::PushOptions::new();
     push_opts.remote_callbacks(callbacks);
@@ -245,10 +307,14 @@ fn push_current_branch(remote: &mut git2::Remote, branch: &str, connection: Opti
 /// `connection::try_connect` to prove a credential works before anything is
 /// persisted -- ticket 03 checklist: "No connection is persisted until a
 /// test fetch using its credential succeeds."
-pub fn test_fetch(remote_url: &str, connection: &Connection) -> Result<(), SyncFailureCause> {
+pub fn test_fetch(
+    remote_url: &str,
+    connection: &Connection,
+    known_hosts_path: Option<&Path>,
+) -> Result<(), SyncFailureCause> {
     let mut remote =
         git2::Remote::create_detached(remote_url).map_err(|e| classify_git_error(&e))?;
-    let callbacks = connection.make_callbacks();
+    let callbacks = connection.make_callbacks(known_hosts_path);
     remote
         .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
         .map_err(|e| classify_git_error_for(&e, Some(connection)))?;
@@ -299,7 +365,11 @@ fn backup_conflicted_files(vault_path: &Path, merged_index: &git2::Index) -> Res
 /// and fails cleanly for one that does. A no-op (`SyncStatus::NoRemote`)
 /// when no `origin` remote is configured, or when the vault has no commits
 /// yet.
-pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<SyncOutcome> {
+pub fn run_sync(
+    vault_path: &Path,
+    connection: Option<&Connection>,
+    known_hosts_path: Option<&Path>,
+) -> Result<SyncOutcome> {
     let repo = git2::Repository::open(vault_path).context("opening vault git repo")?;
 
     let mut remote = match repo.find_remote("origin") {
@@ -342,7 +412,7 @@ pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<Sy
     let local_commit = repo.find_commit(local_oid).context("looking up local HEAD commit")?;
 
     let fetch_callbacks = connection
-        .map(Connection::make_callbacks)
+        .map(|c| c.make_callbacks(known_hosts_path))
         .unwrap_or_else(callbacks_without_connection);
     let mut fetch_opts = git2::FetchOptions::new();
     fetch_opts.remote_callbacks(fetch_callbacks);
@@ -363,7 +433,7 @@ pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<Sy
         Err(_) => {
             // The remote has no such branch yet -- nothing to merge, just
             // push to create it.
-            if let Err(e) = push_current_branch(&mut remote, &branch, connection) {
+            if let Err(e) = push_current_branch(&mut remote, &branch, connection, known_hosts_path) {
                 return Ok(SyncOutcome {
                     status: classify_git_error_for(&e, connection).into_status(),
                     index_rebuild_needed: false,
@@ -416,7 +486,7 @@ pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<Sy
 
     if analysis.is_up_to_date() {
         // Remote has nothing new to merge in; local may still be ahead.
-        if let Err(e) = push_current_branch(&mut remote, &branch, connection) {
+        if let Err(e) = push_current_branch(&mut remote, &branch, connection, known_hosts_path) {
             return Ok(SyncOutcome {
                 status: classify_git_error_for(&e, connection).into_status(),
                 index_rebuild_needed: false,
@@ -486,7 +556,7 @@ pub fn run_sync(vault_path: &Path, connection: Option<&Connection>) -> Result<Sy
     repo.checkout_head(Some(&mut checkout))
         .context("checking out merge result")?;
 
-    if let Err(e) = push_current_branch(&mut remote, &branch, connection) {
+    if let Err(e) = push_current_branch(&mut remote, &branch, connection, known_hosts_path) {
         // The merge already landed locally (HEAD and the working tree were
         // updated above) -- only the push failed, so this still needs an
         // index rebuild even though the push itself didn't succeed.
@@ -606,7 +676,7 @@ mod tests {
         git2::Repository::init_bare(bare_dir.path()).unwrap();
         repo.remote("origin", bare_dir.path().to_str().unwrap()).unwrap();
 
-        let result = run_sync(dir.path(), None);
+        let result = run_sync(dir.path(), None, None);
 
         let err = match result {
             Ok(_) => panic!("expected a clean error, not a successful sync"),
@@ -626,7 +696,7 @@ mod tests {
         fs::write(dir.path().join("page.md"), "---\nid: p1\n---\nHello.\n").unwrap();
         vault::commit_all(dir.path(), "Create page").unwrap();
 
-        let outcome = run_sync(dir.path(), None).unwrap();
+        let outcome = run_sync(dir.path(), None, None).unwrap();
         assert_eq!(outcome.status, SyncStatus::NoRemote);
         assert!(!outcome.index_rebuild_needed);
     }
@@ -636,7 +706,7 @@ mod tests {
         let dir = tempdir().unwrap();
         vault::ensure_git_repo(dir.path()).unwrap();
 
-        let outcome = run_sync(dir.path(), None).unwrap();
+        let outcome = run_sync(dir.path(), None, None).unwrap();
         assert_eq!(outcome.status, SyncStatus::NoRemote);
     }
 
@@ -655,7 +725,7 @@ mod tests {
             .push(&[format!("refs/heads/{branch}:refs/heads/{branch}").as_str()], None)
             .unwrap();
 
-        let outcome = run_sync(device_b_dir.path(), None).unwrap();
+        let outcome = run_sync(device_b_dir.path(), None, None).unwrap();
 
         assert_eq!(outcome.status, SyncStatus::Synced);
         assert!(outcome.index_rebuild_needed);
@@ -675,7 +745,7 @@ mod tests {
         .unwrap();
         vault::commit_all(device_b_dir.path(), "Update page").unwrap();
 
-        let outcome = run_sync(device_b_dir.path(), None).unwrap();
+        let outcome = run_sync(device_b_dir.path(), None, None).unwrap();
         assert_eq!(outcome.status, SyncStatus::Synced);
         assert!(!outcome.index_rebuild_needed);
 
@@ -720,7 +790,7 @@ mod tests {
             .target()
             .unwrap();
 
-        let outcome = run_sync(device_b_dir.path(), None).unwrap();
+        let outcome = run_sync(device_b_dir.path(), None, None).unwrap();
 
         match &outcome.status {
             SyncStatus::NeedsAttention {
@@ -822,7 +892,7 @@ mod tests {
         let port = unreachable_port();
         repo.remote("origin", &format!("http://127.0.0.1:{port}/repo.git")).unwrap();
 
-        let outcome = run_sync(dir.path(), None).unwrap();
+        let outcome = run_sync(dir.path(), None, None).unwrap();
 
         match outcome.status {
             SyncStatus::Transient { cause } => {
@@ -844,7 +914,7 @@ mod tests {
         repo.remote("origin", &format!("http://127.0.0.1:{port}/repo.git")).unwrap();
 
         let connection = access_token_connection("invalid-token");
-        let outcome = run_sync(dir.path(), Some(&connection)).unwrap();
+        let outcome = run_sync(dir.path(), Some(&connection), None).unwrap();
 
         match outcome.status {
             SyncStatus::NeedsAttention { cause } => {
@@ -874,7 +944,7 @@ mod tests {
         repo.remote("origin", &format!("http://127.0.0.1:{port}/repo.git")).unwrap();
 
         let connection = access_token_connection("invalid-token");
-        let outcome = run_sync(dir.path(), Some(&connection)).unwrap();
+        let outcome = run_sync(dir.path(), Some(&connection), None).unwrap();
 
         match outcome.status {
             SyncStatus::NeedsAttention { cause } => {

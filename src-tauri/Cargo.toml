@@ -33,7 +33,15 @@ walkdir = "2"
 # (.github/workflows/android-smoke-apk.yml) -- ticket 15 hit the identical
 # `openssl-sys` "Could not find directory of OpenSSL installation" failure
 # cross-compiling the real app to aarch64-linux-android without it.
-git2 = { version = "0.19", features = ["vendored-openssl"] }
+# `ssh_key_from_memory` (ticket 05): lets `Cred::ssh_key_from_memory` hand
+# libssh2 key material directly rather than a file path -- needed since
+# Cerebrite generates/imports SSH keys itself rather than relying on files
+# on disk. Confirmed to compile against libssh2-sys's vendored-OpenSSL
+# backend (the precondition `ssh_key_from_memory` needs) and smoke-tested
+# with an ed25519 key specifically -- see `connection.rs`'s
+# `ssh_key_from_memory_smoke_test` and ticket 05's research doc
+# (.scratch/git-provider-integration/issues/03-ssh-key-management-research.md).
+git2 = { version = "0.19", features = ["vendored-openssl", "ssh_key_from_memory"] }
 pulldown-cmark = "0.12"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
@@ -50,6 +58,14 @@ tokio = { version = "1", features = ["sync"] }
 # in-process `sample` mock store (test-only) used to exercise the credential
 # module without a real OS keychain in CI/sandboxes.
 keyring-core = "1"
+# In-app ed25519 SSH key generation and OpenSSH-format (de)serialization
+# (ticket 05) -- no dependency on a system `ssh-keygen` binary. Chosen over
+# `ed25519-dalek` (archived/moved upstream, see ticket 05's research doc)
+# and `russh-keys` (pulls in a full SSH client stack Cerebrite doesn't need,
+# since git2/libssh2 already is one). `encryption` is needed to parse an
+# imported key that may be passphrase-protected (Cerebrite never decrypts
+# it itself -- see `ssh_key.rs` -- but must still validate it parses).
+ssh-key = { version = "0.6", features = ["ed25519", "getrandom", "encryption"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust (zbus) Secret Service store -- avoids a libdbus-sys build

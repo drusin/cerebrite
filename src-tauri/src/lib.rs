@@ -9,6 +9,8 @@ mod markdown;
 mod redirects;
 mod search;
 mod settings;
+mod ssh_host_keys;
+mod ssh_key;
 mod sync;
 mod trash;
 mod vault;
@@ -398,9 +400,18 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
     // keychain) is reported the same way a fetch/push failure would be,
     // rather than silently falling back to no credentials.
     let keychain = credential::KeychainBackend::platform();
+    let config_dir = app.path().app_config_dir().ok();
+    // Ticket 05: resolved once per sync attempt so SSH connections can
+    // check presented host keys against it -- `None` only when the app
+    // config dir itself couldn't be resolved, in which case `make_callbacks`
+    // still lets pinned hosts (GitHub/GitLab) through and treats every other
+    // SSH host as unconfirmed rather than silently trusting it.
+    let known_hosts_path = config_dir
+        .as_ref()
+        .and_then(|dir| credential::known_hosts_path(dir).ok());
     let connection_load = keychain.as_ref().ok().and_then(|keychain| {
-        app.path().app_config_dir().ok().and_then(|config_dir| {
-            let plaintext = credential::PlaintextStore::new(&config_dir);
+        config_dir.as_ref().and_then(|config_dir| {
+            let plaintext = credential::PlaintextStore::new(config_dir);
             connection::Connection::load(repo_root, keychain, &plaintext, credential::CallUrgency::Background).transpose()
         })
     });
@@ -410,14 +421,14 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
             status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
             index_rebuild_needed: false,
         },
-        Some(Ok(connection)) => match sync::run_sync(repo_root, Some(&connection)) {
+        Some(Ok(connection)) => match sync::run_sync(repo_root, Some(&connection), known_hosts_path.as_deref()) {
             Ok(outcome) => outcome,
             Err(e) => sync::SyncOutcome {
                 status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
                 index_rebuild_needed: false,
             },
         },
-        None => match sync::run_sync(repo_root, None) {
+        None => match sync::run_sync(repo_root, None, known_hosts_path.as_deref()) {
             Ok(outcome) => outcome,
             Err(e) => sync::SyncOutcome {
                 status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
@@ -511,6 +522,7 @@ fn connect_access_token(
         record.clone(),
         token.into_bytes(),
         &remote_url,
+        None, // access tokens are HTTPS-only; SSH host-key checking doesn't apply
         credential::CallUrgency::Interactive,
     )
     .map_err(|e| e.to_string())?;
@@ -529,6 +541,153 @@ fn connect_access_token(
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::AccessToken);
     Ok(())
+}
+
+/// What `generate_ssh_key`/`import_ssh_key` hand back to the frontend: the
+/// public half to show (with a copy button, per the ticket) plus everything
+/// `connect_ssh_key` needs to actually connect. The private key material
+/// necessarily passes through the frontend here -- same trust boundary
+/// ticket 04's access-token form already crosses (the user types/pastes a
+/// secret into a form field that round-trips through Tauri's IPC) -- held
+/// only in memory until the user confirms Connect.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshKeyInfo {
+    private_key_openssh: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passphrase: Option<String>,
+    public_key_openssh: String,
+    fingerprint_sha256: String,
+    had_passphrase: bool,
+}
+
+/// Ticket 05: generates a fresh ed25519 key in-app (the default: no
+/// passphrase, ready for unattended sync immediately). Generation alone
+/// persists nothing -- exactly like `connect_access_token`'s token isn't
+/// stored until a test fetch succeeds, the key returned here only becomes a
+/// real Connection once the caller sends it to `connect_ssh_key` and that
+/// succeeds.
+#[tauri::command]
+fn generate_ssh_key() -> Result<SshKeyInfo, String> {
+    let generated = ssh_key::generate_ed25519_key().map_err(|e| e.to_string())?;
+    Ok(SshKeyInfo {
+        private_key_openssh: generated.secret.private_key_openssh,
+        passphrase: generated.secret.passphrase,
+        public_key_openssh: generated.public_key_openssh,
+        fingerprint_sha256: generated.fingerprint_sha256,
+        had_passphrase: false,
+    })
+}
+
+/// Ticket 05's import path: validates `private_key_openssh` (and, if it's
+/// passphrase-protected, that `passphrase` actually unlocks it) without
+/// persisting anything yet -- same "validate, don't yet store" shape as
+/// `generate_ssh_key`. See `ssh_key.rs`'s module doc comment for why an
+/// imported passphrase is kept (not stripped or silently dropped) and
+/// stored alongside the key once `connect_ssh_key` does persist it.
+#[tauri::command]
+fn import_ssh_key(private_key_openssh: String, passphrase: Option<String>) -> Result<SshKeyInfo, String> {
+    let imported =
+        ssh_key::import_ssh_key(&private_key_openssh, passphrase.as_deref()).map_err(|e| e.to_string())?;
+    Ok(SshKeyInfo {
+        private_key_openssh: imported.secret.private_key_openssh,
+        passphrase: imported.secret.passphrase,
+        public_key_openssh: imported.public_key_openssh,
+        fingerprint_sha256: imported.fingerprint_sha256,
+        had_passphrase: imported.had_passphrase,
+    })
+}
+
+/// Ticket 05's "connect with an SSH key" entry point, mirroring
+/// `connect_access_token`'s shape exactly: reuses `connection::try_connect`
+/// as-is, so a real test fetch (including this connection's host-key check,
+/// via `known_hosts_path`) must succeed *before* anything is persisted.
+///
+/// A failure here can be an ordinary rejected-credential/unreachable-remote
+/// error (same as ticket 04), or -- ticket 05's own case -- an unconfirmed
+/// or mismatched SSH host key (`SyncFailureCause::HostKeyUnconfirmed`/
+/// `HostKeyMismatch`, surfaced through this error's message). This minimal
+/// command-level flow doesn't parse that out into a separate confirm-dialog
+/// affordance (no wizard UI exists yet to show one in -- tickets 09-11); the
+/// caller sees a message naming the host and fingerprint, confirms it via
+/// `confirm_ssh_host_key`, and calls `connect_ssh_key` again, which then
+/// finds the host already trusted.
+#[tauri::command]
+fn connect_ssh_key(
+    app: AppHandle,
+    state: State<AppState>,
+    remote_url: String,
+    private_key_openssh: String,
+    passphrase: Option<String>,
+) -> Result<(), String> {
+    let remote_url = remote_url.trim().to_string();
+    if remote_url.is_empty() || private_key_openssh.trim().is_empty() {
+        return Err("Repository URL and an SSH private key are both required".to_string());
+    }
+
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let plaintext = credential::PlaintextStore::new(&config_dir);
+    let known_hosts_path = credential::known_hosts_path(&config_dir).map_err(|e| e.to_string())?;
+
+    let keychain = credential::KeychainBackend::platform().ok();
+    let store_kind = match &keychain {
+        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
+        _ => connection_record::StoreKind::Plaintext,
+    };
+
+    let secret = ssh_key::SshSecret {
+        private_key_openssh,
+        passphrase,
+    };
+
+    let record = connection_record::ConnectionRecord {
+        connection_id: uuid::Uuid::new_v4().to_string(),
+        credential_kind: connection_record::CredentialKind::SshKey,
+        provider: infer_provider(&remote_url),
+        https_username: None,
+        token_expiry: None,
+        credential_store: store_kind,
+    };
+
+    let connection = connection::try_connect(
+        &repo_root,
+        keychain.as_ref(),
+        &plaintext,
+        record.clone(),
+        secret.to_bytes(),
+        &remote_url,
+        Some(&known_hosts_path),
+        credential::CallUrgency::Interactive,
+    )
+    .map_err(|e| e.to_string())?;
+
+    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    notify_sync(&state);
+
+    debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::SshKey);
+    Ok(())
+}
+
+/// Ticket 05's TOFU confirmation -- the "simple confirm dialog/command" the
+/// ticket allows for this ticket's minimal UI. Persists `fingerprint` for
+/// `host` to Cerebrite's own known_hosts-equivalent file
+/// (`credential::known_hosts_path`) *only* when called -- nothing upstream
+/// of this command ever calls it automatically; the certificate_check
+/// callback in `connection.rs` always rejects an unconfirmed or mismatched
+/// host key rather than accepting it silently. The caller is responsible
+/// for having actually shown `fingerprint` to the user and gotten explicit
+/// confirmation first -- this command trusts that it did.
+#[tauri::command]
+fn confirm_ssh_host_key(app: AppHandle, host: String, fingerprint: String) -> Result<(), String> {
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let path = credential::known_hosts_path(&config_dir).map_err(|e| e.to_string())?;
+    ssh_host_keys::KnownHosts::confirm(&path, &host, &fingerprint).map_err(|e| e.to_string())
 }
 
 /// Provider hosts recognized as `Provider::GitHub`/`Provider::GitLab`;
@@ -1239,6 +1398,10 @@ pub fn run() {
             search_pages,
             get_sync_status,
             connect_access_token,
+            generate_ssh_key,
+            import_ssh_key,
+            connect_ssh_key,
+            confirm_ssh_host_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

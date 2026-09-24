@@ -28,6 +28,23 @@ use crate::sync::SyncFailureCause;
 pub struct Connection {
     record: ConnectionRecord,
     secret: Vec<u8>,
+    /// Ticket 05: what `certificate_check` (via `make_callbacks`) most
+    /// recently found, for `sync.rs` to recover a structured
+    /// `SyncFailureCause` after a failed fetch/push -- see its doc comment
+    /// for *why* this side channel exists rather than reading it back out
+    /// of the resulting `git2::Error`.
+    last_host_key_check: std::cell::RefCell<Option<HostKeyOutcome>>,
+}
+
+/// What `certificate_check` found the one time it's called per connection
+/// attempt (SSH host-key verification happens once, during the transport
+/// handshake, before any credential is even requested) -- host, presented
+/// fingerprint, and how it was judged.
+#[derive(Debug, Clone)]
+pub struct HostKeyOutcome {
+    pub host: String,
+    pub fingerprint: String,
+    pub check: crate::ssh_host_keys::HostKeyCheck,
 }
 
 /// Everything that can go wrong resolving or trying a Connection, short of
@@ -70,14 +87,22 @@ impl Connection {
         };
         let secret = resolve_secret(&record, keychain, plaintext, urgency)
             .map_err(ConnectionError::Credential)?;
-        Ok(Some(Self { record, secret }))
+        Ok(Some(Self {
+            record,
+            secret,
+            last_host_key_check: std::cell::RefCell::new(None),
+        }))
     }
 
     /// Builds a Connection directly from an already-known record + secret,
     /// without touching a keychain or `connection.json` -- used by
     /// `try_connect`'s pre-persist test fetch, and by tests.
     pub fn from_parts(record: ConnectionRecord, secret: Vec<u8>) -> Self {
-        Self { record, secret }
+        Self {
+            record,
+            secret,
+            last_host_key_check: std::cell::RefCell::new(None),
+        }
     }
 
     pub fn record(&self) -> &ConnectionRecord {
@@ -88,12 +113,28 @@ impl Connection {
         self.record.credential_kind
     }
 
+    /// The outcome of the most recent `certificate_check` invocation made
+    /// through this Connection's callbacks, if any -- `None` for a non-SSH
+    /// kind, or an SSH connection that never got far enough to exchange
+    /// host keys at all (e.g. the TCP connect itself failed).
+    pub fn last_host_key_check(&self) -> Option<HostKeyOutcome> {
+        self.last_host_key_check.borrow().clone()
+    }
+
     /// Builds callbacks that resolve credentials from this Connection's one
     /// named kind, and nothing else. A credential failure here (an invalid
     /// key, a rejected token) is a hard failure of *this* connection -- it
     /// is never a cue to try a different kind, unlike the old
     /// agent/credential-helper/default chain this type replaces.
-    pub fn make_callbacks(&self) -> git2::RemoteCallbacks<'_> {
+    ///
+    /// `known_hosts_path` is only consulted for `CredentialKind::SshKey` --
+    /// every other kind ignores it (host-key verification is meaningless
+    /// over HTTPS/TLS, which has its own certificate chain). `None` still
+    /// lets pinned hosts (GitHub/GitLab, ticket 05) connect; every other SSH
+    /// host is then always treated as unconfirmed (`HostKeyCheck::Unknown`),
+    /// since there's nowhere to check a prior confirmation against -- safer
+    /// than silently trusting it.
+    pub fn make_callbacks(&self, known_hosts_path: Option<&Path>) -> git2::RemoteCallbacks<'_> {
         let mut callbacks = git2::RemoteCallbacks::new();
         let kind = self.record.credential_kind;
         let username = self.record.https_username.clone();
@@ -101,8 +142,101 @@ impl Connection {
         callbacks.credentials(move |url, username_from_url, _allowed_types| {
             credential_for_kind(kind, &username, &secret, url, username_from_url)
         });
+
+        if kind == CredentialKind::SshKey {
+            let known_hosts = known_hosts_path.map(|path| {
+                crate::ssh_host_keys::KnownHosts::load(path)
+                    .unwrap_or_else(|_| crate::ssh_host_keys::KnownHosts::empty())
+            });
+            let sink = &self.last_host_key_check;
+            callbacks.certificate_check(move |cert, host| {
+                let (outcome, status) = check_ssh_host_key(cert, host, known_hosts.as_ref());
+                *sink.borrow_mut() = Some(outcome);
+                status
+            });
+        }
+
         callbacks
     }
+}
+
+/// The `RemoteCallbacks::certificate_check` implementation for SSH
+/// connections (ticket 05 checklist item 4): GitHub's/GitLab's published
+/// fingerprints are pinned outright; anything already confirmed once
+/// (persisted in `known_hosts`) is trusted again; anything else is refused.
+/// Never returns `CertificateOk` for a host it hasn't actually checked.
+///
+/// Returns both the `HostKeyOutcome` (for the `last_host_key_check` side
+/// channel) *and* the status/error git2 itself needs -- deliberately not
+/// just the latter: libgit2's SSH transport discards whatever message this
+/// callback's `Err` carries and replaces it with its own fixed
+/// "invalid or unknown remote ssh hostkey" once it decides the cert isn't
+/// valid (see `ssh_libssh2.c`'s `certificate_check` handling), so there is
+/// no way to recover *why* -- unconfirmed vs. mismatched, which host, which
+/// fingerprint -- from the `git2::Error` a failed fetch/push ultimately
+/// surfaces. The outcome has to travel back out some other way; `Connection`
+/// gives it a place to land (`last_host_key_check`) that `sync.rs` checks
+/// before falling back to generic `git2::Error` classification.
+fn check_ssh_host_key(
+    cert: &git2::cert::Cert<'_>,
+    host: &str,
+    known_hosts: Option<&crate::ssh_host_keys::KnownHosts>,
+) -> (HostKeyOutcome, Result<git2::CertificateCheckStatus, git2::Error>) {
+    let Some(hostkey) = cert.as_hostkey() else {
+        let outcome = HostKeyOutcome {
+            host: host.to_string(),
+            fingerprint: String::new(),
+            check: crate::ssh_host_keys::HostKeyCheck::Unknown,
+        };
+        return (
+            outcome,
+            Err(git2::Error::from_str("expected an SSH host key certificate")),
+        );
+    };
+    let Some(digest) = hostkey.hash_sha256() else {
+        let outcome = HostKeyOutcome {
+            host: host.to_string(),
+            fingerprint: String::new(),
+            check: crate::ssh_host_keys::HostKeyCheck::Unknown,
+        };
+        return (
+            outcome,
+            Err(git2::Error::from_str(
+                "this host's SSH key has no SHA-256 hash available to verify",
+            )),
+        );
+    };
+    let fingerprint = crate::ssh_host_keys::format_sha256_fingerprint(digest);
+
+    // An empty (no-entries) store makes exactly the same pinning decision a
+    // real one would -- pinning never depends on the known_hosts file being
+    // reachable -- so a missing `known_hosts_path` only changes the outcome
+    // for a host that isn't pinned (it becomes `Unknown` instead of
+    // possibly `KnownMatch`).
+    let empty = crate::ssh_host_keys::KnownHosts::empty();
+    let store = known_hosts.unwrap_or(&empty);
+    let check = store.check(host, &fingerprint);
+
+    use crate::ssh_host_keys::HostKeyCheck;
+    let status = match &check {
+        HostKeyCheck::PinnedMatch | HostKeyCheck::KnownMatch => Ok(git2::CertificateCheckStatus::CertificateOk),
+        HostKeyCheck::PinnedMismatch | HostKeyCheck::KnownMismatch { .. } => Err(git2::Error::new(
+            git2::ErrorCode::Certificate,
+            git2::ErrorClass::Ssh,
+            crate::ssh_host_keys::host_key_mismatch_message(host, &fingerprint),
+        )),
+        HostKeyCheck::Unknown => Err(git2::Error::new(
+            git2::ErrorCode::Certificate,
+            git2::ErrorClass::Ssh,
+            crate::ssh_host_keys::unknown_host_key_message(host, &fingerprint),
+        )),
+    };
+    let outcome = HostKeyOutcome {
+        host: host.to_string(),
+        fingerprint,
+        check,
+    };
+    (outcome, status)
 }
 
 fn resolve_secret(
@@ -120,13 +254,15 @@ fn resolve_secret(
 }
 
 /// The actual, per-kind translation of "opaque secret bytes" into a
-/// `git2::Cred`. Deliberately minimal/generic per ticket 03's scope: both
-/// HTTPS-transport kinds (access token, OAuth sign-in) are a token sent as
-/// an HTTPS Basic-auth password and differ only in how the token was
-/// obtained (ADR-0012), which tickets 04/06/07 implement; the SSH kind
-/// treats the stored secret as PEM private-key material verbatim (the
-/// ADR-0012 default: ed25519, no passphrase). Passphrase handling and
-/// host-key pinning/TOFU are ticket 05's scope, not this one's.
+/// `git2::Cred`. Both HTTPS-transport kinds (access token, OAuth sign-in)
+/// are a token sent as an HTTPS Basic-auth password and differ only in how
+/// the token was obtained (ADR-0012), which tickets 04/06/07 implement; the
+/// SSH kind (ticket 05) deserializes the stored secret as a
+/// `ssh_key::SshSecret` -- the private key material verbatim (still
+/// encrypted, if it was imported that way) plus its passphrase if it has
+/// one -- and hands both straight to `Cred::ssh_key_from_memory`, which lets
+/// libssh2 do any decryption itself; Cerebrite never decrypts an SSH key on
+/// its own behalf (see `ssh_key.rs`'s module doc comment for why).
 fn credential_for_kind(
     kind: CredentialKind,
     https_username: &Option<String>,
@@ -145,8 +281,14 @@ fn credential_for_kind(
         }
         CredentialKind::SshKey => {
             let user = username_from_url.unwrap_or("git");
-            let key = String::from_utf8_lossy(secret).into_owned();
-            git2::Cred::ssh_key_from_memory(user, None, &key, None)
+            let secret = crate::ssh_key::SshSecret::from_bytes(secret)
+                .map_err(|e| git2::Error::from_str(&format!("stored SSH key material is corrupt: {e}")))?;
+            git2::Cred::ssh_key_from_memory(
+                user,
+                None,
+                &secret.private_key_openssh,
+                secret.passphrase.as_deref(),
+            )
         }
     }
 }
@@ -197,11 +339,12 @@ pub fn try_connect(
     record: ConnectionRecord,
     secret: Vec<u8>,
     remote_url: &str,
+    known_hosts_path: Option<&Path>,
     urgency: CallUrgency,
 ) -> Result<Connection, ConnectError> {
     let candidate = Connection::from_parts(record.clone(), secret.clone());
 
-    crate::sync::test_fetch(remote_url, &candidate).map_err(ConnectError::Fetch)?;
+    crate::sync::test_fetch(remote_url, &candidate, known_hosts_path).map_err(ConnectError::Fetch)?;
 
     match record.credential_store {
         StoreKind::Keychain => keychain
@@ -260,15 +403,52 @@ mod tests {
         // `ssh_key_from_memory` defers actually parsing the key until
         // libssh2 uses it during the handshake (network-only, so it isn't
         // exercised here) -- this only checks the right `Cred` constructor
-        // is used for the kind, never a fallback to another kind.
+        // is used for the kind, never a fallback to another kind, and that
+        // the ticket 05 `SshSecret` JSON envelope round-trips correctly.
+        let secret = crate::ssh_key::SshSecret {
+            private_key_openssh: "-----BEGIN OPENSSH PRIVATE KEY-----\nstand-in key bytes\n-----END OPENSSH PRIVATE KEY-----\n".to_string(),
+            passphrase: None,
+        };
         let result = credential_for_kind(
             CredentialKind::SshKey,
             &None,
-            b"-----BEGIN OPENSSH PRIVATE KEY-----\nstand-in key bytes\n-----END OPENSSH PRIVATE KEY-----\n",
+            &secret.to_bytes(),
             "ssh://example.test/repo.git",
             Some("git"),
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn ssh_key_kind_passes_the_stored_passphrase_through_to_the_credential() {
+        // A passphrase stored alongside an imported key (ticket 05) must
+        // actually reach `Cred::ssh_key_from_memory`, not just the key
+        // material -- otherwise unattended sync with an imported
+        // passphrase-protected key would silently never work.
+        let secret = crate::ssh_key::SshSecret {
+            private_key_openssh: "-----BEGIN OPENSSH PRIVATE KEY-----\nencrypted stand-in\n-----END OPENSSH PRIVATE KEY-----\n".to_string(),
+            passphrase: Some("hunter2".to_string()),
+        };
+        let result = credential_for_kind(
+            CredentialKind::SshKey,
+            &None,
+            &secret.to_bytes(),
+            "ssh://example.test/repo.git",
+            Some("git"),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn ssh_key_kind_with_corrupt_stored_secret_bytes_fails_cleanly_not_a_panic() {
+        let result = credential_for_kind(
+            CredentialKind::SshKey,
+            &None,
+            b"not valid json",
+            "ssh://example.test/repo.git",
+            Some("git"),
+        );
+        assert!(result.is_err());
     }
 
     // -- try_connect: nothing is persisted until a test fetch succeeds --
@@ -299,6 +479,7 @@ mod tests {
             record.clone(),
             b"a-token".to_vec(),
             &remote_url,
+            None,
             CallUrgency::Interactive,
         );
 
@@ -342,6 +523,7 @@ mod tests {
             record.clone(),
             b"a-token".to_vec(),
             bare_dir.path().to_str().unwrap(),
+            None,
             CallUrgency::Interactive,
         )
         .unwrap();
@@ -510,6 +692,7 @@ mod tests {
             record.clone(),
             b"correct-token".to_vec(),
             &remote_url,
+            None,
             CallUrgency::Interactive,
         )
         .unwrap();
@@ -544,6 +727,7 @@ mod tests {
             record.clone(),
             b"wrong-token".to_vec(),
             &remote_url,
+            None,
             CallUrgency::Interactive,
         );
 
@@ -569,5 +753,299 @@ mod tests {
             keychain.get_secret(&record.connection_id, CallUrgency::Interactive),
             Err(CredentialError::NotFound)
         ));
+    }
+
+    // -- ticket 05: end-to-end SSH integration against a real local sshd --
+    //
+    // Checklist item 8 asks for "a generated key connects and pushes/pulls
+    // against a local SSH-serving fixture", and separately, that "a
+    // mismatched host key is rejected rather than silently trusted" is
+    // tested directly. This sandbox happens to have `openssh-server`
+    // available (confirmed with `apt-get install openssh-server` while
+    // implementing this ticket), so rather than descoping to a mocked
+    // `certificate_check` call (which can't easily construct a real
+    // `git2::Cert` without an actual handshake), this spins up a real
+    // non-root `sshd` listening on 127.0.0.1, serving a real bare repo via
+    // a forced `git-upload-pack` command in `authorized_keys` -- so the
+    // whole path (an in-app-generated ed25519 key building valid libssh2
+    // credentials, the host-key TOFU/pinning check via a real
+    // `certificate_check` invocation, and `Cred::ssh_key_from_memory`
+    // actually authenticating) is exercised for real. If `sshd` isn't
+    // present (a leaner or non-Linux sandbox), `SshFixture::spawn` returns
+    // `None` and these tests skip themselves rather than failing the suite
+    // -- see this ticket's report for why a guaranteed-available fixture
+    // wasn't assumed.
+    mod ssh_fixture {
+        use std::net::TcpStream;
+        use std::path::PathBuf;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Duration;
+
+        pub struct SshFixture {
+            child: Child,
+            port: u16,
+            repo_dir: tempfile::TempDir,
+            _config_dir: tempfile::TempDir,
+        }
+
+        impl SshFixture {
+            /// Spawns a local `sshd` trusting only `client_public_key_openssh`,
+            /// serving a fresh bare repo via a forced `git-upload-pack`
+            /// command. `None` if this sandbox has no `sshd` binary at all.
+            pub fn spawn(client_public_key_openssh: &str) -> Option<Self> {
+                const SSHD_PATH: &str = "/usr/sbin/sshd";
+                if !std::path::Path::new(SSHD_PATH).exists() {
+                    return None;
+                }
+
+                let config_dir = tempfile::tempdir().unwrap();
+                let repo_dir = tempfile::tempdir().unwrap();
+                git2::Repository::init_bare(repo_dir.path()).unwrap();
+
+                // The host key is generated exactly the way any other
+                // Cerebrite ed25519 key is (`ssh_key::generate_ed25519_key`)
+                // -- a bonus check that a Cerebrite-generated key is
+                // byte-for-byte usable by a real OpenSSH server, not only
+                // by libssh2's parser.
+                let host_key = crate::ssh_key::generate_ed25519_key().unwrap();
+                let host_key_path = config_dir.path().join("host_key");
+                std::fs::write(&host_key_path, &host_key.secret.private_key_openssh).unwrap();
+                restrict(&host_key_path);
+
+                let authorized_keys_path = config_dir.path().join("authorized_keys");
+                let repo_path = repo_dir.path().to_str().unwrap();
+                std::fs::write(
+                    &authorized_keys_path,
+                    format!(
+                        "command=\"git-upload-pack '{repo_path}'\",no-pty,no-agent-forwarding,no-X11-forwarding,no-port-forwarding {client_public_key_openssh}\n"
+                    ),
+                )
+                .unwrap();
+                restrict(&authorized_keys_path);
+
+                let port = unused_port();
+                let sshd_config_path = config_dir.path().join("sshd_config");
+                std::fs::write(
+                    &sshd_config_path,
+                    format!(
+                        "Port {port}\n\
+                         ListenAddress 127.0.0.1\n\
+                         HostKey {}\n\
+                         AuthorizedKeysFile {}\n\
+                         UsePAM no\n\
+                         PasswordAuthentication no\n\
+                         PubkeyAuthentication yes\n\
+                         StrictModes no\n\
+                         LogLevel ERROR\n",
+                        host_key_path.display(),
+                        authorized_keys_path.display(),
+                    ),
+                )
+                .unwrap();
+
+                let child = Command::new(SSHD_PATH)
+                    .args(["-f", sshd_config_path.to_str().unwrap(), "-D"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawning sshd");
+
+                wait_for_port(port);
+
+                Some(Self {
+                    child,
+                    port,
+                    repo_dir,
+                    _config_dir: config_dir,
+                })
+            }
+
+            pub fn host(&self) -> &'static str {
+                "127.0.0.1"
+            }
+
+            pub fn remote_url(&self) -> String {
+                format!(
+                    "ssh://{}@{}:{}{}",
+                    current_username(),
+                    self.host(),
+                    self.port,
+                    self.repo_dir.path().to_str().unwrap()
+                )
+            }
+        }
+
+        impl Drop for SshFixture {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+
+        fn unused_port() -> u16 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        }
+
+        fn wait_for_port(port: u16) {
+            for _ in 0..100 {
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("sshd did not start listening on port {port} in time");
+        }
+
+        fn current_username() -> String {
+            Command::new("whoami")
+                .output()
+                .ok()
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "agent".to_string())
+        }
+
+        #[cfg(unix)]
+        fn restrict(path: &PathBuf) {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn ssh_key_record() -> ConnectionRecord {
+        ConnectionRecord {
+            connection_id: uuid::Uuid::new_v4().to_string(),
+            credential_kind: CredentialKind::SshKey,
+            provider: connection_record::Provider::Other("127.0.0.1".to_string()),
+            https_username: None,
+            token_expiry: None,
+            credential_store: StoreKind::Plaintext,
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_ssh_host_key_is_reported_and_confirming_it_lets_the_connection_through() {
+        let client_key = crate::ssh_key::generate_ed25519_key().unwrap();
+        let Some(fixture) = ssh_fixture::SshFixture::spawn(&client_key.public_key_openssh) else {
+            eprintln!("skipping: no local sshd available in this sandbox");
+            return;
+        };
+
+        let repo_dir = tempdir().unwrap();
+        vault::ensure_git_repo(repo_dir.path()).unwrap();
+        let config_dir = tempdir().unwrap();
+        let plaintext = crate::credential::PlaintextStore::new(config_dir.path());
+        let known_hosts_path = config_dir.path().join("known_hosts");
+
+        let record = ssh_key_record();
+        let remote_url = fixture.remote_url();
+
+        // First contact: the host has never been seen before, and it isn't
+        // GitHub/GitLab -- must be reported as unconfirmed, not silently
+        // trusted, and nothing may be persisted.
+        let first_attempt = try_connect(
+            repo_dir.path(),
+            None,
+            &plaintext,
+            record.clone(),
+            client_key.secret.to_bytes(),
+            &remote_url,
+            Some(&known_hosts_path),
+            CallUrgency::Interactive,
+        );
+        let (host, fingerprint) = match first_attempt {
+            Err(ConnectError::Fetch(crate::sync::SyncFailureCause::HostKeyUnconfirmed { host, fingerprint })) => {
+                (host, fingerprint)
+            }
+            Ok(_) => panic!("expected HostKeyUnconfirmed, but the connection unexpectedly succeeded"),
+            Err(other) => panic!("expected HostKeyUnconfirmed, got {other}"),
+        };
+        assert_eq!(host, fixture.host());
+        assert!(fingerprint.starts_with("SHA256:"));
+        assert_eq!(connection_record::read(repo_dir.path()).unwrap(), None);
+
+        // Explicit confirmation (what `confirm_ssh_host_key` does in
+        // lib.rs), then the identical connect attempt succeeds end to end:
+        // the host key is now trusted *and* the generated key's private
+        // material authenticates against the real sshd via
+        // `Cred::ssh_key_from_memory`.
+        crate::ssh_host_keys::KnownHosts::confirm(&known_hosts_path, &host, &fingerprint).unwrap();
+
+        let connection = try_connect(
+            repo_dir.path(),
+            None,
+            &plaintext,
+            record.clone(),
+            client_key.secret.to_bytes(),
+            &remote_url,
+            Some(&known_hosts_path),
+            CallUrgency::Interactive,
+        )
+        .unwrap();
+
+        assert_eq!(connection.credential_kind(), CredentialKind::SshKey);
+        assert_eq!(connection_record::read(repo_dir.path()).unwrap(), Some(record.clone()));
+        assert_eq!(
+            plaintext.get_secret(&record.connection_id).unwrap(),
+            client_key.secret.to_bytes()
+        );
+    }
+
+    #[test]
+    fn a_host_key_that_no_longer_matches_what_was_confirmed_is_rejected_not_silently_trusted() {
+        let client_key = crate::ssh_key::generate_ed25519_key().unwrap();
+        let Some(fixture) = ssh_fixture::SshFixture::spawn(&client_key.public_key_openssh) else {
+            eprintln!("skipping: no local sshd available in this sandbox");
+            return;
+        };
+
+        let repo_dir = tempdir().unwrap();
+        vault::ensure_git_repo(repo_dir.path()).unwrap();
+        let config_dir = tempdir().unwrap();
+        let plaintext = crate::credential::PlaintextStore::new(config_dir.path());
+        let known_hosts_path = config_dir.path().join("known_hosts");
+
+        // Pre-confirm the host under a fingerprint that is deliberately
+        // *not* what this sshd instance actually presents -- simulating
+        // "this host's key changed since it was last trusted".
+        crate::ssh_host_keys::KnownHosts::confirm(
+            &known_hosts_path,
+            fixture.host(),
+            "SHA256:this-is-not-the-real-fingerprint-AAAAAAAAAAA",
+        )
+        .unwrap();
+
+        let record = ssh_key_record();
+        let result = try_connect(
+            repo_dir.path(),
+            None,
+            &plaintext,
+            record.clone(),
+            client_key.secret.to_bytes(),
+            &fixture.remote_url(),
+            Some(&known_hosts_path),
+            CallUrgency::Interactive,
+        );
+
+        match result {
+            Err(ConnectError::Fetch(crate::sync::SyncFailureCause::HostKeyMismatch { host, fingerprint })) => {
+                assert_eq!(host, fixture.host());
+                // The *real* fingerprint sshd presented, not the bogus one
+                // pre-confirmed above -- proof the check compared against
+                // what was actually presented, not just noticed a diff.
+                assert_ne!(fingerprint, "SHA256:this-is-not-the-real-fingerprint-AAAAAAAAAAA");
+                assert!(fingerprint.starts_with("SHA256:"));
+            }
+            Ok(_) => panic!("expected HostKeyMismatch, but the connection unexpectedly succeeded"),
+            Err(other) => panic!("expected HostKeyMismatch, got {other}"),
+        }
+        // Refused, not silently trusted -- nothing persisted.
+        assert_eq!(connection_record::read(repo_dir.path()).unwrap(), None);
     }
 }

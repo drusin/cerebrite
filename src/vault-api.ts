@@ -225,3 +225,45 @@ export function searchPages(query: string, includeTrash: boolean): Promise<Searc
 export function connectAccessToken(remoteUrl: string, username: string, token: string): Promise<void> {
   return invoke("connect_access_token", { remoteUrl, username, token });
 }
+
+/// Ticket 05's SSH key connection path. `SshKeyInfo` is what
+/// `generateSshKey`/`importSshKey` hand back: the public half to show (copy
+/// button + link to the provider's "add SSH key" page, per the ticket) plus
+/// everything `connectSshKey` needs. Nothing is persisted by generating or
+/// importing alone -- only `connectSshKey` succeeding (a real test fetch,
+/// same gate as `connectAccessToken`) stores anything.
+export interface SshKeyInfo {
+  privateKeyOpenssh: string;
+  passphrase?: string;
+  publicKeyOpenssh: string;
+  fingerprintSha256: string;
+  hadPassphrase: boolean;
+}
+
+/// Generates a fresh in-app ed25519 key (no passphrase, the default).
+export function generateSshKey(): Promise<SshKeyInfo> {
+  return invoke("generate_ssh_key");
+}
+
+/// Validates an imported private key -- and, if it's passphrase-protected,
+/// that `passphrase` actually unlocks it -- without persisting anything yet.
+export function importSshKey(privateKeyOpenssh: string, passphrase?: string): Promise<SshKeyInfo> {
+  return invoke("import_ssh_key", { privateKeyOpenssh, passphrase });
+}
+
+/// Connects with an SSH key (generated or imported): runs a real test fetch
+/// -- including this ticket's host-key check -- before persisting anything.
+/// A rejected/unconfirmed/mismatched host key surfaces as a rejected
+/// promise naming the host and fingerprint; confirm it via
+/// `confirmSshHostKey` (only after showing it to the user and getting
+/// explicit confirmation) and call this again.
+export function connectSshKey(remoteUrl: string, privateKeyOpenssh: string, passphrase?: string): Promise<void> {
+  return invoke("connect_ssh_key", { remoteUrl, privateKeyOpenssh, passphrase });
+}
+
+/// Persists explicit TOFU confirmation of `fingerprint` for `host` to
+/// Cerebrite's own known_hosts-equivalent file. Never call this without
+/// having actually shown the fingerprint to the user first.
+export function confirmSshHostKey(host: string, fingerprint: string): Promise<void> {
+  return invoke("confirm_ssh_host_key", { host, fingerprint });
+}
