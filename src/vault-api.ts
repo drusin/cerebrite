@@ -267,3 +267,64 @@ export function connectSshKey(remoteUrl: string, privateKeyOpenssh: string, pass
 export function confirmSshHostKey(host: string, fingerprint: string): Promise<void> {
   return invoke("confirm_ssh_host_key", { host, fingerprint });
 }
+
+/// Ticket 06's GitHub Device Authorization Grant sign-in. `startGithubDeviceFlow`
+/// requests a fresh device/user code pair to show the user (the code and the
+/// URL to visit); the caller then polls `pollGithubDeviceFlow` on a timer at
+/// `intervalSecs` until it stops returning `pending`/`slowDown`. Blocked on a
+/// real GitHub App registration -- see `src-tauri/src/github_oauth.rs`'s
+/// module doc comment -- so this will reject with GitHub's
+/// `incorrect_client_credentials` until the placeholder client id is
+/// replaced.
+export interface DeviceCodeInfo {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  expiresInSecs: number;
+  intervalSecs: number;
+}
+
+export function startGithubDeviceFlow(): Promise<DeviceCodeInfo> {
+  return invoke("start_github_device_flow");
+}
+
+/// One poll of GitHub's token endpoint (RFC 8628 section 3.5's outcomes).
+/// `success` carries the token pair the caller must then pass to
+/// `checkGithubInstallation`/`connectGithubOauth`; every other outcome means
+/// "keep polling" (`pending`/`slowDown`) or "stop, this attempt is over"
+/// (`denied`/`expired`/`error`).
+export type DevicePollResult =
+  | { outcome: "success"; accessToken: string; refreshToken: string; accessTokenExpiresAt: string }
+  | { outcome: "pending" }
+  | { outcome: "slowDown" }
+  | { outcome: "denied" }
+  | { outcome: "expired" }
+  | { outcome: "error"; message: string };
+
+export function pollGithubDeviceFlow(deviceCode: string): Promise<DevicePollResult> {
+  return invoke("poll_github_device_flow", { deviceCode });
+}
+
+/// Checks whether the GitHub App is installed on `remoteUrl`'s repository.
+/// `notInstalled`'s `installUrl` is where to send the user before retrying
+/// `connectGithubOauth` -- a token for an uninstalled app fails the
+/// backend's test fetch anyway, but this gives a clear next step instead of
+/// an opaque auth failure.
+export type InstallationStatus = { status: "installed" } | { status: "notInstalled"; installUrl: string };
+
+export function checkGithubInstallation(remoteUrl: string, accessToken: string): Promise<InstallationStatus> {
+  return invoke("check_github_installation", { remoteUrl, accessToken });
+}
+
+/// Finishes GitHub sign-in: runs a real test fetch with the access token
+/// (`x-access-token` HTTPS Basic-auth convention) before persisting
+/// anything, same gate as `connectAccessToken`/`connectSshKey`. Stores the
+/// full token pair so the background sync path can refresh it unattended.
+export function connectGithubOauth(
+  remoteUrl: string,
+  accessToken: string,
+  refreshToken: string,
+  accessTokenExpiresAt: string,
+): Promise<void> {
+  return invoke("connect_github_oauth", { remoteUrl, accessToken, refreshToken, accessTokenExpiresAt });
+}

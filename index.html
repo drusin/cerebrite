@@ -183,6 +183,46 @@
               <p id="settings-connect-status" class="settings-connect-status" hidden></p>
             </form>
           </div>
+
+          <!-- Ticket 06: minimal device-flow "Sign in with GitHub" UI --
+               shows the device code + verification URL GitHub's device
+               flow hands back, then (once a token is acquired) either the
+               app-installation CTA or a plain "Connected" status. No
+               wizard polish (that's tickets 09/10) -- this just gets the
+               mechanism working end-to-end, same scope as ticket 04's raw
+               access-token form above. Requires a real registered GitHub
+               App client id (currently a placeholder, see
+               src-tauri/src/github_oauth.rs) to actually work. -->
+          <div class="settings-section">
+            <h3>Sign in with GitHub</h3>
+            <form id="settings-github-form" class="settings-connect-form">
+              <label>
+                Repository URL
+                <input
+                  id="settings-github-url"
+                  type="text"
+                  placeholder="https://github.com/user/repo.git"
+                  required
+                />
+              </label>
+              <button id="settings-github-button" type="submit">Sign in with GitHub</button>
+            </form>
+            <div id="settings-github-device-code" class="settings-connect-status" hidden>
+              <p>
+                Go to <a id="settings-github-verification-link" href="#" target="_blank" rel="noopener"></a> and
+                enter code: <strong id="settings-github-user-code"></strong>
+              </p>
+            </div>
+            <p id="settings-github-status" class="settings-connect-status" hidden></p>
+            <div id="settings-github-install" class="settings-connect-status" hidden>
+              <p>
+                GitHub is signed in, but Cerebrite isn't installed on this repository yet.
+                <a id="settings-github-install-link" href="#" target="_blank" rel="noopener">Install the app</a>,
+                then continue.
+              </p>
+              <button id="settings-github-install-continue-button" type="button">I've installed it, continue</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>

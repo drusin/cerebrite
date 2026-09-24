@@ -17,6 +17,10 @@ import {
   listTrashedPages,
   searchPages,
   connectAccessToken,
+  startGithubDeviceFlow,
+  pollGithubDeviceFlow,
+  checkGithubInstallation,
+  connectGithubOauth,
   type PageSummary,
   type PageResolution,
   type TrashedPageSummary,
@@ -92,6 +96,29 @@ const settingsConnectUsernameEl = document.querySelector<HTMLInputElement>("#set
 const settingsConnectTokenEl = document.querySelector<HTMLInputElement>("#settings-connect-token");
 const settingsConnectButtonEl = document.querySelector<HTMLButtonElement>("#settings-connect-button");
 const settingsConnectStatusEl = document.querySelector<HTMLElement>("#settings-connect-status");
+
+// Ticket 06: minimal "Sign in with GitHub" device-flow UI elements.
+const settingsGithubFormEl = document.querySelector<HTMLFormElement>("#settings-github-form");
+const settingsGithubUrlEl = document.querySelector<HTMLInputElement>("#settings-github-url");
+const settingsGithubButtonEl = document.querySelector<HTMLButtonElement>("#settings-github-button");
+const settingsGithubDeviceCodeEl = document.querySelector<HTMLElement>("#settings-github-device-code");
+const settingsGithubVerificationLinkEl = document.querySelector<HTMLAnchorElement>(
+  "#settings-github-verification-link",
+);
+const settingsGithubUserCodeEl = document.querySelector<HTMLElement>("#settings-github-user-code");
+const settingsGithubStatusEl = document.querySelector<HTMLElement>("#settings-github-status");
+const settingsGithubInstallEl = document.querySelector<HTMLElement>("#settings-github-install");
+const settingsGithubInstallLinkEl = document.querySelector<HTMLAnchorElement>("#settings-github-install-link");
+const settingsGithubInstallContinueButtonEl = document.querySelector<HTMLButtonElement>(
+  "#settings-github-install-continue-button",
+);
+
+/// Holds the acquired token pair between "device flow finished" and "the
+/// user confirmed the app install" -- `connectGithubOauth` needs it, but
+/// it can't be persisted (and shouldn't be, per ADR-0012's persist-gate)
+/// until the install check clears and the real `connectGithubOauth` test
+/// fetch succeeds.
+let pendingGithubTokenPair: { accessToken: string; refreshToken: string; accessTokenExpiresAt: string } | null = null;
 
 // The page currently loaded in the editor: either a persisted page (has an
 // id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
@@ -1016,6 +1043,129 @@ async function handleConnectFormSubmit(event: SubmitEvent) {
   }
 }
 
+/**
+ * Ticket 06's minimal "Sign in with GitHub" submit handler: requests a
+ * device code, shows it to the user, then polls on GitHub's own reported
+ * interval until it succeeds, is denied, or expires. On success, checks
+ * whether the app is installed on the given repo before finishing the
+ * connect -- if not, shows the install CTA and waits for the user to click
+ * "I've installed it, continue" (`handleGithubInstallContinueClick`) rather
+ * than looping the check itself.
+ */
+async function handleGithubFormSubmit(event: SubmitEvent) {
+  event.preventDefault();
+  if (!settingsGithubUrlEl) return;
+  const remoteUrl = settingsGithubUrlEl.value.trim();
+  if (!remoteUrl) return;
+
+  settingsGithubButtonEl?.setAttribute("disabled", "");
+  settingsGithubInstallEl?.setAttribute("hidden", "");
+  settingsGithubDeviceCodeEl?.setAttribute("hidden", "");
+  pendingGithubTokenPair = null;
+
+  const setStatus = (text: string) => {
+    if (!settingsGithubStatusEl) return;
+    settingsGithubStatusEl.textContent = text;
+    settingsGithubStatusEl.removeAttribute("hidden");
+  };
+
+  try {
+    setStatus("Requesting a device code from GitHub…");
+    const device = await startGithubDeviceFlow();
+
+    if (settingsGithubVerificationLinkEl) {
+      settingsGithubVerificationLinkEl.href = device.verificationUri;
+      settingsGithubVerificationLinkEl.textContent = device.verificationUri;
+    }
+    if (settingsGithubUserCodeEl) settingsGithubUserCodeEl.textContent = device.userCode;
+    settingsGithubDeviceCodeEl?.removeAttribute("hidden");
+    setStatus("Waiting for you to approve in the browser…");
+
+    const deadline = Date.now() + device.expiresInSecs * 1000;
+    let intervalMs = Math.max(device.intervalSecs, 1) * 1000;
+
+    // Frontend-owned poll loop (same "poll on a timer" shape as sync
+    // status): each iteration waits `intervalMs`, then polls once, and
+    // reacts to GitHub's device-flow outcome -- see `DevicePollResult`.
+    for (;;) {
+      if (Date.now() >= deadline) throw new Error("The GitHub sign-in code expired before it was confirmed.");
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+
+      const result = await pollGithubDeviceFlow(device.deviceCode);
+      if (result.outcome === "pending") continue;
+      if (result.outcome === "slowDown") {
+        intervalMs += 5000;
+        continue;
+      }
+      if (result.outcome === "denied") throw new Error("GitHub sign-in was denied.");
+      if (result.outcome === "expired") throw new Error("The GitHub sign-in code expired before it was confirmed.");
+      if (result.outcome === "error") throw new Error(result.message);
+
+      pendingGithubTokenPair = {
+        accessToken: result.accessToken,
+        refreshToken: result.refreshToken,
+        accessTokenExpiresAt: result.accessTokenExpiresAt,
+      };
+      break;
+    }
+
+    settingsGithubDeviceCodeEl?.setAttribute("hidden", "");
+    await finishGithubConnect(remoteUrl);
+  } catch (err) {
+    settingsGithubDeviceCodeEl?.setAttribute("hidden", "");
+    setStatus(String(err));
+  } finally {
+    settingsGithubButtonEl?.removeAttribute("disabled");
+  }
+}
+
+/**
+ * Shared tail of the GitHub sign-in flow, called once a token pair is in
+ * hand (`pendingGithubTokenPair`): checks the app's installation on
+ * `remoteUrl`'s repo and either shows the install CTA or finishes
+ * `connectGithubOauth`'s real test-fetch-then-persist gate. Also the retry
+ * path `handleGithubInstallContinueClick` calls after the user says
+ * they've installed the app.
+ */
+async function finishGithubConnect(remoteUrl: string) {
+  if (!pendingGithubTokenPair || !settingsGithubStatusEl) return;
+  const { accessToken, refreshToken, accessTokenExpiresAt } = pendingGithubTokenPair;
+
+  settingsGithubStatusEl.textContent = "Checking whether Cerebrite is installed on this repository…";
+  settingsGithubStatusEl.removeAttribute("hidden");
+
+  const installation = await checkGithubInstallation(remoteUrl, accessToken);
+  if (installation.status === "notInstalled") {
+    if (settingsGithubInstallLinkEl) settingsGithubInstallLinkEl.href = installation.installUrl;
+    settingsGithubInstallEl?.removeAttribute("hidden");
+    settingsGithubStatusEl.textContent = "";
+    settingsGithubStatusEl.setAttribute("hidden", "");
+    return;
+  }
+
+  settingsGithubInstallEl?.setAttribute("hidden", "");
+  settingsGithubStatusEl.textContent = "Connecting…";
+  await connectGithubOauth(remoteUrl, accessToken, refreshToken, accessTokenExpiresAt);
+  settingsGithubStatusEl.textContent = "Connected.";
+  pendingGithubTokenPair = null;
+}
+
+async function handleGithubInstallContinueClick() {
+  if (!settingsGithubUrlEl) return;
+  const remoteUrl = settingsGithubUrlEl.value.trim();
+  settingsGithubInstallContinueButtonEl?.setAttribute("disabled", "");
+  try {
+    await finishGithubConnect(remoteUrl);
+  } catch (err) {
+    if (settingsGithubStatusEl) {
+      settingsGithubStatusEl.textContent = String(err);
+      settingsGithubStatusEl.removeAttribute("hidden");
+    }
+  } finally {
+    settingsGithubInstallContinueButtonEl?.removeAttribute("disabled");
+  }
+}
+
 function openSettingsModal() {
   if (!settingsModalOverlayEl) return;
   if (settingsVaultPathEl) settingsVaultPathEl.textContent = currentVaultPath ?? "";
@@ -1091,6 +1241,8 @@ async function init() {
   settingsChangeFolderButtonEl?.addEventListener("click", () => void handleChangeVaultFolderClick());
   settingsThemeRadios.forEach((radio) => radio.addEventListener("change", (e) => void handleThemeRadioChange(e)));
   settingsConnectFormEl?.addEventListener("submit", (e) => void handleConnectFormSubmit(e));
+  settingsGithubFormEl?.addEventListener("submit", (e) => void handleGithubFormSubmit(e));
+  settingsGithubInstallContinueButtonEl?.addEventListener("click", () => void handleGithubInstallContinueClick());
   // Clicking the dimmed backdrop (not the modal card itself) closes it.
   settingsModalOverlayEl?.addEventListener("click", (event) => {
     if (event.target === settingsModalOverlayEl) closeSettingsModal();

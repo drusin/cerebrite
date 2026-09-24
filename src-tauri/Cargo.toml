@@ -66,6 +66,16 @@ keyring-core = "1"
 # imported key that may be passphrase-protected (Cerebrite never decrypts
 # it itself -- see `ssh_key.rs` -- but must still validate it parses).
 ssh-key = { version = "0.6", features = ["ed25519", "getrandom", "encryption"] }
+# GitHub OAuth device-flow HTTP calls (ticket 06): already present in
+# Cargo.lock as a transitive dependency (pulled in indirectly at this same
+# version), so promoting it to a direct dependency here adds no new crate to
+# the build, just a direct `[dependencies]` entry for it -- deliberately not
+# a second HTTP client. `blocking` avoids requiring the rest of the app to
+# become async just for this module's handful of request/response calls.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "form", "rustls"] }
+# RFC 3339 timestamp formatting/parsing for OAuth token expiry (ticket 06) --
+# also already present transitively at this version.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust (zbus) Secret Service store -- avoids a libdbus-sys build

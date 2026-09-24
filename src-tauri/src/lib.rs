@@ -2,6 +2,7 @@ mod connection;
 mod connection_record;
 mod credential;
 mod frontmatter;
+mod github_oauth;
 mod heading_slug;
 mod index;
 mod links;
@@ -409,11 +410,14 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
     let known_hosts_path = config_dir
         .as_ref()
         .and_then(|dir| credential::known_hosts_path(dir).ok());
+    let plaintext = config_dir.as_ref().map(|dir| credential::PlaintextStore::new(dir));
     let connection_load = keychain.as_ref().ok().and_then(|keychain| {
-        config_dir.as_ref().and_then(|config_dir| {
-            let plaintext = credential::PlaintextStore::new(config_dir);
-            connection::Connection::load(repo_root, keychain, &plaintext, credential::CallUrgency::Background).transpose()
-        })
+        plaintext
+            .as_ref()
+            .and_then(|plaintext| {
+                connection::Connection::load(repo_root, keychain, plaintext, credential::CallUrgency::Background)
+                    .transpose()
+            })
     });
 
     let outcome = match connection_load {
@@ -421,13 +425,28 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
             status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
             index_rebuild_needed: false,
         },
-        Some(Ok(connection)) => match sync::run_sync(repo_root, Some(&connection), known_hosts_path.as_deref()) {
-            Ok(outcome) => outcome,
-            Err(e) => sync::SyncOutcome {
-                status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
-                index_rebuild_needed: false,
-            },
-        },
+        Some(Ok(connection)) => {
+            // Ticket 06: an OAuth sign-in connection's access token is
+            // short-lived (8 hours) and must be refreshed unattended in this
+            // background path -- refresh happens here, *before* the sync
+            // attempt, so a connection whose token was about to expire uses
+            // the fresh one rather than racing the old one's expiry mid-sync.
+            // A no-op for every other credential kind, and for an OAuth
+            // connection that isn't yet close to expiring.
+            let connection = match (keychain.as_ref().ok(), plaintext.as_ref()) {
+                (keychain, Some(plaintext)) => {
+                    github_oauth::refresh_if_needed(repo_root, keychain, plaintext, connection)
+                }
+                _ => connection,
+            };
+            match sync::run_sync(repo_root, Some(&connection), known_hosts_path.as_deref()) {
+                Ok(outcome) => outcome,
+                Err(e) => sync::SyncOutcome {
+                    status: sync::SyncFailureCause::Other { detail: e.to_string() }.into_status(),
+                    index_rebuild_needed: false,
+                },
+            }
+        }
         None => match sync::run_sync(repo_root, None, known_hosts_path.as_deref()) {
             Ok(outcome) => outcome,
             Err(e) => sync::SyncOutcome {
@@ -688,6 +707,145 @@ fn confirm_ssh_host_key(app: AppHandle, host: String, fingerprint: String) -> Re
     let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     let path = credential::known_hosts_path(&config_dir).map_err(|e| e.to_string())?;
     ssh_host_keys::KnownHosts::confirm(&path, &host, &fingerprint).map_err(|e| e.to_string())
+}
+
+/// Ticket 06 step 1: requests a fresh device/user code pair from GitHub and
+/// hands it back for the frontend to display (the code, and the URL to
+/// visit). Uses the placeholder `github_oauth::GITHUB_CLIENT_ID` until a
+/// real GitHub App is registered -- see `github_oauth.rs`'s module doc
+/// comment for the full "blocked on manual follow-up" note. A real
+/// (unregistered) client id makes GitHub reject this with
+/// `incorrect_client_credentials`, surfaced here as an ordinary `Err`.
+#[tauri::command]
+fn start_github_device_flow() -> Result<github_oauth::DeviceCodeInfo, String> {
+    let endpoints = github_oauth::GitHubEndpoints::production();
+    github_oauth::request_device_code(&endpoints, github_oauth::GITHUB_CLIENT_ID).map_err(|e| e.to_string())
+}
+
+/// Ticket 06 step 2: one poll of GitHub's token endpoint, called repeatedly
+/// by the frontend on a timer (the same "frontend owns the poll loop"
+/// pattern `get_sync_status` already uses) at the interval
+/// `start_github_device_flow`'s response named -- rather than one long
+/// blocking command, so the frontend can show live progress and let the
+/// user cancel.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+enum DevicePollResult {
+    Success {
+        access_token: String,
+        refresh_token: String,
+        access_token_expires_at: String,
+    },
+    Pending,
+    SlowDown,
+    Denied,
+    Expired,
+    Error {
+        message: String,
+    },
+}
+
+#[tauri::command]
+fn poll_github_device_flow(device_code: String) -> DevicePollResult {
+    let endpoints = github_oauth::GitHubEndpoints::production();
+    match github_oauth::poll_once(&endpoints, github_oauth::GITHUB_CLIENT_ID, &device_code) {
+        github_oauth::PollOutcome::Success(pair) => DevicePollResult::Success {
+            access_token: pair.access_token,
+            refresh_token: pair.refresh_token,
+            access_token_expires_at: pair.access_token_expires_at,
+        },
+        github_oauth::PollOutcome::Pending => DevicePollResult::Pending,
+        github_oauth::PollOutcome::SlowDown => DevicePollResult::SlowDown,
+        github_oauth::PollOutcome::Denied => DevicePollResult::Denied,
+        github_oauth::PollOutcome::Expired => DevicePollResult::Expired,
+        github_oauth::PollOutcome::Error(e) => DevicePollResult::Error { message: e.to_string() },
+    }
+}
+
+/// Ticket 06 step 3: once a token is in hand, checks whether the GitHub App
+/// is installed on `remote_url`'s repository -- if not, the frontend walks
+/// the user to `InstallationStatus::NotInstalled`'s `install_url` before
+/// calling `connect_github_oauth` (a token for an app that isn't installed
+/// on the repo would fail the test fetch anyway, but this gives the user a
+/// clear next step instead of an opaque auth failure).
+#[tauri::command]
+fn check_github_installation(remote_url: String, access_token: String) -> Result<github_oauth::InstallationStatus, String> {
+    let (owner, repo) =
+        github_oauth::owner_repo_from_remote_url(&remote_url).ok_or_else(|| "not a GitHub repository URL".to_string())?;
+    let endpoints = github_oauth::GitHubEndpoints::production();
+    github_oauth::check_installation(&endpoints, &access_token, &owner, &repo).map_err(|e| e.to_string())
+}
+
+/// Ticket 06 step 4-6: finishes GitHub sign-in the same way
+/// `connect_access_token` finishes an access-token connection -- reuses
+/// `connection::try_connect` as-is, so a real test fetch with
+/// `Cred::userpass_plaintext("x-access-token", access_token)` (via
+/// `connection::credential_for_kind`'s `OauthSignIn` arm) must succeed
+/// *before* anything is persisted. The full `OauthSecret` envelope (access
+/// token + refresh token) is what actually gets stored -- see
+/// `github_oauth::OauthSecret`'s doc comment -- so the background refresh
+/// path (`github_oauth::refresh_if_needed`, wired into `perform_sync`) has
+/// the refresh token to work with later.
+#[tauri::command]
+fn connect_github_oauth(
+    app: AppHandle,
+    state: State<AppState>,
+    remote_url: String,
+    access_token: String,
+    refresh_token: String,
+    access_token_expires_at: String,
+) -> Result<(), String> {
+    let remote_url = remote_url.trim().to_string();
+    if remote_url.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
+        return Err("Repository URL, access token, and refresh token are all required".to_string());
+    }
+
+    let vault_path = {
+        let guard = state.vault_path.lock().unwrap();
+        guard.as_ref().ok_or("No vault is open")?.clone()
+    };
+    let repo_root = repo_root_of(&vault_path)?;
+
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let plaintext = credential::PlaintextStore::new(&config_dir);
+
+    let keychain = credential::KeychainBackend::platform().ok();
+    let store_kind = match &keychain {
+        Some(kc) if kc.probe(credential::CallUrgency::Interactive).is_ok() => connection_record::StoreKind::Keychain,
+        _ => connection_record::StoreKind::Plaintext,
+    };
+
+    let record = connection_record::ConnectionRecord {
+        connection_id: uuid::Uuid::new_v4().to_string(),
+        credential_kind: connection_record::CredentialKind::OauthSignIn,
+        provider: infer_provider(&remote_url),
+        https_username: Some("x-access-token".to_string()),
+        token_expiry: Some(access_token_expires_at),
+        credential_store: store_kind,
+    };
+
+    let secret = github_oauth::OauthSecret {
+        access_token,
+        refresh_token,
+    };
+
+    let connection = connection::try_connect(
+        &repo_root,
+        keychain.as_ref(),
+        &plaintext,
+        record.clone(),
+        secret.to_bytes(),
+        &remote_url,
+        None, // OAuth sign-in is HTTPS-only; SSH host-key checking doesn't apply
+        credential::CallUrgency::Interactive,
+    )
+    .map_err(|e| e.to_string())?;
+
+    settings::set_connection_store(&app, &record.connection_id, store_kind).map_err(|e| e.to_string())?;
+    notify_sync(&state);
+
+    debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
+    Ok(())
 }
 
 /// Provider hosts recognized as `Provider::GitHub`/`Provider::GitLab`;
@@ -1402,6 +1560,10 @@ pub fn run() {
             import_ssh_key,
             connect_ssh_key,
             confirm_ssh_host_key,
+            start_github_device_flow,
+            poll_github_device_flow,
+            check_github_installation,
+            connect_github_oauth,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
