@@ -2,7 +2,6 @@ import {
   getSettings,
   setTheme,
   pickVaultFolder,
-  openVault,
   listPages,
   getPage,
   savePage,
@@ -54,10 +53,20 @@ import {
 } from "./vault-api";
 import { mountIsland } from "./mount-island";
 import { refreshSyncStatus, syncStatus } from "./state/sync";
-import { openSettings, openSearchModal, closeModal, type OpenSettingsOptions } from "./state/ui";
+import {
+  openSettings,
+  openSearchModal,
+  closeModal,
+  vaultView,
+  setVaultView,
+  type OpenSettingsOptions,
+} from "./state/ui";
+import { vaultPath, openVault, applyVaultOpened } from "./state/vault";
+import { friendlyVaultOpenError } from "./vault-open-error";
 import SyncIndicatorContainer from "./surfaces/sync-indicator/SyncIndicatorContainer.vue";
 import SyncPopupContainer from "./surfaces/sync-indicator/SyncPopupContainer.vue";
 import SearchModalContainer from "./surfaces/search/SearchModalContainer.vue";
+import VaultPickerContainer from "./surfaces/vault-picker/VaultPickerContainer.vue";
 import { watch } from "vue";
 import {
   reduceWizard,
@@ -92,23 +101,21 @@ import { humanizeHeadingSlug } from "./heading-slug";
 // action -- see issue 03's save-trigger note.
 const AUTOSAVE_DEBOUNCE_MS = 1500;
 
-const vaultPickerEl = document.querySelector<HTMLElement>("#vault-picker");
-const vaultPickerErrorEl = document.querySelector<HTMLElement>("#vault-picker-error");
-const selectVaultButtonEl = document.querySelector<HTMLButtonElement>("#select-vault-button");
-
-// Ticket 10: the guided clone wizard's full-screen DOM handles -- entry
-// point lives on the first-run folder-picker screen above.
-const cloneWizardOpenButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-open-button");
+// Ticket 10: the guided clone wizard's full-screen DOM handles. Its entry
+// point is now the `surfaces/vault-picker/` Vue island's "I already have a
+// repository…" button, which calls `openCloneWizard` (below) via a
+// temporary callback root prop (`openCloneWizardInVanilla`).
 const cloneWizardOverlayEl = document.querySelector<HTMLElement>("#clone-wizard-overlay");
 const cloneWizardBodyEl = document.querySelector<HTMLElement>("#clone-wizard-body");
 const cloneWizardCloseButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-close-button");
 const cloneWizardBackButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-back-button");
 const cloneWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#clone-wizard-manual-button");
 
-// Ticket 11: the standalone "git clone" manual form's DOM handles --
-// reachable from the first-run screen (`cloneManualOpenButtonEl`) and from
-// the guided clone wizard's own "Switch to manual setup" link.
-const cloneManualOpenButtonEl = document.querySelector<HTMLButtonElement>("#clone-manual-open-button");
+// Ticket 11: the standalone "git clone" manual form's DOM handles. Its
+// first-run entry point is now the vault picker Vue island's "Or clone with
+// raw git fields…" button, which calls `openCloneManualDialog` (below) via
+// a temporary callback root prop (`openCloneManualInVanilla`) -- the guided
+// clone wizard's own "Switch to manual setup" link still opens it directly.
 const cloneManualOverlayEl = document.querySelector<HTMLElement>("#clone-manual-overlay");
 const cloneManualCloseButtonEl = document.querySelector<HTMLButtonElement>("#clone-manual-close-button");
 const cloneManualUrlEl = document.querySelector<HTMLInputElement>("#clone-manual-url");
@@ -217,8 +224,47 @@ if (searchModalRootEl) {
   });
 }
 
+// Ticket 04: the vault picker is now the `surfaces/vault-picker/` Vue
+// island, mounted at `#vault-picker-root`. Its three temporary callback
+// root props relies on the same `function`-hoisting as the search modal's
+// above. `#workspace`'s own visibility now follows `state/ui.ts`'s
+// `vaultView` (replacing `showVaultPicker`/`showWorkspace`'s toggling of
+// it) -- the picker's own visibility is the island's own `v-if` on that
+// same state.
+const vaultPickerRootEl = document.querySelector<HTMLElement>("#vault-picker-root");
+if (vaultPickerRootEl) {
+  mountIsland(vaultPickerRootEl, VaultPickerContainer, {
+    openCloneWizardInVanilla: openCloneWizard,
+    openCloneManualInVanilla: () => openCloneManualDialog(),
+    loadPagesAndTrashInVanilla: async () => {
+      await loadPages();
+      await loadTrash();
+    },
+  });
+}
+watch(
+  vaultView,
+  (view) => {
+    if (view === "workspace") workspaceEl?.removeAttribute("hidden");
+    else workspaceEl?.setAttribute("hidden", "");
+  },
+  { immediate: true },
+);
+
 const settingsModalOverlayEl = document.querySelector<HTMLElement>("#settings-modal-overlay");
 const settingsVaultPathEl = document.querySelector<HTMLElement>("#settings-vault-path");
+// Ticket 04: replaces every call site's own `settingsVaultPathEl.textContent
+// = path` write (`openVaultAndLoad`, `finishCloneWizardIntoWorkspace`,
+// `handleCloneManualSubmitClick`, `handleChangeVaultFolderClick`) with one
+// spot that follows `state/vault.ts`'s `vaultPath` -- still-vanilla
+// Settings' one remaining read of the vault path.
+watch(
+  vaultPath,
+  (path) => {
+    if (settingsVaultPathEl) settingsVaultPathEl.textContent = path ?? "";
+  },
+  { immediate: true },
+);
 const settingsChangeFolderButtonEl = document.querySelector<HTMLButtonElement>("#settings-change-folder-button");
 const settingsThemeRadios = document.querySelectorAll<HTMLInputElement>('input[name="settings-theme"]');
 const settingsConnectFormEl = document.querySelector<HTMLFormElement>("#settings-connect-form");
@@ -307,8 +353,6 @@ type OpenPage =
 let currentPage: OpenPage | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pageEditor: PageEditor | null = null;
-/** The currently open vault's folder path, shown in the Settings modal. */
-let currentVaultPath: string | null = null;
 
 // --- Recent (issue 12) ---------------------------------------------------
 //
@@ -446,48 +490,13 @@ function highlightActivePage() {
   });
 }
 
-/**
- * Ticket 09 checklist item 8: translates ticket 01's `ensure_git_repo`
- * refusal message (`vault.rs`: "'<picked>' is inside an existing git
- * repository rooted at '<root>'. Pick that folder instead of a folder
- * nested inside it.") into copy a non-technical user can act on, rather
- * than showing the raw Rust error string verbatim. This is the only
- * "adoption"/"refusal" case `ensure_git_repo` actually surfaces as an
- * `Err` -- adopting an existing content-bearing repo (README, source
- * files) is a silent success, not an error, so there is nothing to
- * translate for that case. Applied everywhere a vault-open error reaches
- * the user (initial picker, "Change folder…" in Settings, and the
- * remembered-vault auto-open at launch) since that's the only place this
- * particular error can occur -- not inside the connect wizard itself, which
- * only ever operates on an already-open vault.
- */
-function friendlyVaultOpenError(raw: string): string {
-  const match = raw.match(/is inside an existing git repository rooted at '([^']+)'/);
-  if (!match) return raw;
-  const root = match[1];
-  return (
-    `That folder is inside an existing repository. Pick the repository's own top-level folder instead: ` +
-    `"${root}".`
-  );
-}
-
-function showVaultPicker(errorMessage?: string) {
-  vaultPickerEl?.removeAttribute("hidden");
-  workspaceEl?.setAttribute("hidden", "");
-  if (vaultPickerErrorEl) {
-    if (errorMessage) {
-      vaultPickerErrorEl.textContent = errorMessage;
-      vaultPickerErrorEl.removeAttribute("hidden");
-    } else {
-      vaultPickerErrorEl.setAttribute("hidden", "");
-    }
-  }
-}
-
-function showWorkspace() {
-  vaultPickerEl?.setAttribute("hidden", "");
-  workspaceEl?.removeAttribute("hidden");
-}
+// Ticket 04: `friendlyVaultOpenError` moved to `./vault-open-error` (shared
+// by the vault picker Vue island and "Change folder…" below).
+//
+// `showVaultPicker`/`showWorkspace` are gone -- `#workspace`'s visibility
+// now follows `state/ui.ts`'s `vaultView` (see the `watch(vaultView, ...)`
+// near the other module-scope island setup, above), and `#vault-picker`'s
+// own visibility is the Vue island's own `v-if` on that same state.
 
 function renderPageList(pages: PageSummary[]) {
   if (!pageListEl) return;
@@ -895,30 +904,10 @@ async function handleNewPageClick() {
   }
 }
 
-async function openVaultAndLoad(path: string) {
-  await openVault(path);
-  currentVaultPath = path;
-  if (settingsVaultPathEl) settingsVaultPathEl.textContent = path;
-  showWorkspace();
-  await loadPages();
-  await loadTrash();
-  await refreshSyncStatus();
-}
-
-async function handleSelectVaultClick() {
-  // `pickVaultFolder` itself can reject -- not just `openVaultAndLoad` below
-  // -- on platforms with no folder-picker at all (Android currently has
-  // none; see `pick_vault_folder`'s `#[cfg(mobile)]` arm in lib.rs), so both
-  // calls need to land on the same error path rather than leaving that
-  // rejection unhandled.
-  try {
-    const path = await pickVaultFolder();
-    if (!path) return; // user cancelled
-    await openVaultAndLoad(path);
-  } catch (err) {
-    showVaultPicker(friendlyVaultOpenError(String(err)));
-  }
-}
+// Ticket 04: `openVaultAndLoad`/`handleSelectVaultClick` moved into
+// `surfaces/vault-picker/VaultPickerContainer.vue` (its "Select vault
+// folder…" handler and its `onMounted` remembered-vault auto-open), which
+// call `state/vault.ts`'s `openVault` action instead.
 
 // --- Search modal's temporary callbacks (ticket 03) ------------------------
 //
@@ -1004,7 +993,7 @@ async function handleChangeVaultFolderClick() {
 
   try {
     closeSettingsModal();
-    await openVaultAndLoad(path);
+    await openVault(path);
   } catch (err) {
     await messageDialog(friendlyVaultOpenError(String(err)));
   }
@@ -1427,7 +1416,6 @@ function openSettingsInVanilla(options: OpenSettingsOptions): void {
 
 function openSettingsModal() {
   if (!settingsModalOverlayEl) return;
-  if (settingsVaultPathEl) settingsVaultPathEl.textContent = currentVaultPath ?? "";
   settingsModalOverlayEl.removeAttribute("hidden");
   void refreshCommitAuthorFields();
   void refreshOrphanNotice();
@@ -2348,8 +2336,9 @@ function dispatchCloneWizard(action: CloneWizardAction) {
   renderCloneWizardStep();
   if (isCloneWizardDone(cloneWizardState)) {
     // The clone already opened the vault (server side) -- swap the
-    // full-screen wizard for the ordinary workspace, same tail
-    // `openVaultAndLoad` runs after a plain first-run pick.
+    // full-screen wizard for the ordinary workspace, same shared post-open
+    // tail (`state/vault.ts`'s `applyVaultOpened`) a plain first-run pick
+    // runs.
     closeCloneWizard();
     void finishCloneWizardIntoWorkspace();
   }
@@ -2373,12 +2362,11 @@ function handleCloneWizardManualSetupClick() {
 async function finishCloneWizardIntoWorkspace() {
   const path = cloneWizardClonedPath;
   if (!path) return;
-  currentVaultPath = path;
-  if (settingsVaultPathEl) settingsVaultPathEl.textContent = path;
-  showWorkspace();
-  await loadPages();
-  await loadTrash();
-  await refreshSyncStatus();
+  // Ticket 04: `clone_and_open_vault` already opened the vault server side,
+  // so this runs the shared post-open tail directly (view switch + sync
+  // refresh + page/trash load) rather than `state/vault.ts`'s `openVault`,
+  // which would re-invoke the backend `open_vault` command needlessly.
+  await applyVaultOpened(path);
 }
 
 /** Set once `clone_and_open_vault` succeeds -- the vault path the finishing tail above opens the workspace onto. */
@@ -2396,7 +2384,7 @@ function openCloneWizard() {
   cloneWizardPendingAccessTokenConnect = null;
   cloneWizardAuthorPrefill = null;
   cloneWizardClonedPath = null;
-  vaultPickerEl?.setAttribute("hidden", "");
+  setVaultView("cloneWizard");
   cloneWizardOverlayEl.removeAttribute("hidden");
   renderCloneWizardStep();
 }
@@ -2406,7 +2394,7 @@ function closeCloneWizard() {
   cloneWizardGeneration += 1; // invalidates any in-flight poll loop/clone
   cloneWizardOverlayEl?.setAttribute("hidden", "");
   if (!isCloneWizardDone(cloneWizardState)) {
-    vaultPickerEl?.removeAttribute("hidden");
+    setVaultView("picker");
   }
 }
 
@@ -3155,11 +3143,12 @@ async function handleCloneManualSubmitClick() {
     const result = await cloneAndOpenVault(remoteUrl, destination, credential);
     if (generation !== cloneManualGeneration) return;
     closeCloneManualDialog();
-    currentVaultPath = result.vault.path;
-    if (settingsVaultPathEl) settingsVaultPathEl.textContent = result.vault.path;
-    showWorkspace();
-    await loadPages();
-    await loadTrash();
+    // Ticket 04: routes through the shared post-open tail (view switch +
+    // sync refresh + page/trash load) instead of duplicating it inline --
+    // this also fixes this call site's previously-missing
+    // `refreshSyncStatus` (spec.md#step-9-clone-wizard--clone-manual-form's
+    // "incidental fix").
+    await applyVaultOpened(result.vault.path);
     openSettingsModal();
   } catch (err) {
     if (generation !== cloneManualGeneration) return;
@@ -3205,7 +3194,6 @@ function applyLayoutMode() {
 }
 
 async function init() {
-  selectVaultButtonEl?.addEventListener("click", handleSelectVaultClick);
   newPageButtonEl?.addEventListener("click", () => void handleNewPageClick());
   todayButtonEl?.addEventListener("click", () => void handleTodayClick());
   emptyTrashButtonEl?.addEventListener("click", () => void handleEmptyTrashClick());
@@ -3254,7 +3242,6 @@ async function init() {
   connectWizardOverlayEl?.addEventListener("click", (event) => {
     if (event.target === connectWizardOverlayEl) closeConnectWizard();
   });
-  cloneWizardOpenButtonEl?.addEventListener("click", openCloneWizard);
   cloneWizardCloseButtonEl?.addEventListener("click", closeCloneWizard);
   cloneWizardBackButtonEl?.addEventListener("click", () => dispatchCloneWizard({ type: "back" }));
   cloneWizardManualButtonEl?.addEventListener("click", () => dispatchCloneWizard({ type: "switchToManual" }));
@@ -3273,7 +3260,6 @@ async function init() {
   });
 
   // Ticket 11: the standalone "git clone" manual dialog's wiring.
-  cloneManualOpenButtonEl?.addEventListener("click", () => openCloneManualDialog());
   cloneManualCloseButtonEl?.addEventListener("click", closeCloneManualDialog);
   cloneManualOverlayEl?.addEventListener("click", (event) => {
     if (event.target === cloneManualOverlayEl) closeCloneManualDialog();
@@ -3343,17 +3329,9 @@ async function init() {
   // per the ticket) -- this just makes sure it's not stale the first time.
   void refreshOrphanNotice();
 
-  if (settings.vaultPath) {
-    try {
-      await openVaultAndLoad(settings.vaultPath);
-      return;
-    } catch (err) {
-      showVaultPicker(friendlyVaultOpenError(String(err)));
-      return;
-    }
-  }
-
-  showVaultPicker();
+  // Ticket 04: the remembered-vault auto-open this used to do here (via
+  // `openVaultAndLoad`) moved into `VaultPickerContainer`'s own `onMounted`
+  // -- it owns every vault-open backend call now, including this one.
 }
 
 window.addEventListener("DOMContentLoaded", () => {

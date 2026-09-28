@@ -9,25 +9,10 @@
   </head>
 
   <body>
-    <section id="vault-picker" class="vault-picker" hidden>
-      <h1>Cerebrite</h1>
-      <p>Select a folder to use as your vault. It doesn't need to be a git repo yet.</p>
-      <button id="select-vault-button" type="button">Select vault folder…</button>
-      <!-- Ticket 10: the guided *clone* wizard's entry point -- device #2,
-           no local vault exists yet. A full-screen takeover (below), not a
-           modal: unlike ticket 09's connect wizard, there is no
-           window/vault yet to anchor a modal on top of. -->
-      <p class="vault-picker-alt">
-        Setting up a new device? <button id="clone-wizard-open-button" class="link-button" type="button">I already have a repository…</button>
-      </p>
-      <!-- Ticket 11: clone's manual/raw escape hatch, reachable even here --
-           there is no vault/Settings surface yet to anchor it to, so it gets
-           its own first-run entry point next to the guided wizard's. -->
-      <p class="vault-picker-alt">
-        <button id="clone-manual-open-button" class="link-button" type="button">Or clone with raw git fields…</button>
-      </p>
-      <p id="vault-picker-error" class="error" hidden></p>
-    </section>
+    <!-- Ticket 04: the vault picker is now the `surfaces/vault-picker/`
+         Vue island -- it shows/hides itself from `state/ui.ts`'s
+         `vaultView` instead of a DOM `hidden` attribute. -->
+    <div id="vault-picker-root"></div>
 
     <!-- Ticket 11: the standalone "git clone" manual form -- variant B's
          transparent, full-git-vocabulary door into the same

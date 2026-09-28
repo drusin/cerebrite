@@ -110,3 +110,25 @@ export function openSearchModal(): void {
 export function closeModal(): void {
   modalState.value = null;
 }
+
+// --- Vault view state ----------------------------------------------------
+//
+// Replaces main.ts's own `showVaultPicker()`/`showWorkspace()` -- which
+// toggled `#vault-picker`'s and `#workspace`'s `hidden` attributes directly
+// -- with one piece of state every vault-related surface can read.
+// `"cloneWizard"`/`"cloneManual"` are introduced now (per spec.md#step-3-
+// vault-picker) but aren't fully wired up yet: the guided clone wizard (a
+// full-screen takeover that replaces the picker) does call `setVaultView`
+// so the Vue picker hides itself while it's open, but the standalone manual
+// form (a modal overlay *on top of* the picker, same as before) doesn't --
+// both stay driven by their own still-vanilla overlay show/hide otherwise,
+// until they migrate onto this state in step 9.
+export type VaultView = "picker" | "cloneWizard" | "cloneManual" | "workspace";
+
+const vaultViewState: Ref<VaultView> = ref("picker");
+
+export const vaultView = readonly(vaultViewState);
+
+export function setVaultView(view: VaultView): void {
+  vaultViewState.value = view;
+}
