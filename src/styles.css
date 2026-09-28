@@ -465,7 +465,7 @@ body {
   gap: 0.4em;
 }
 
-#rename-page-button {
+.rename-page-button {
   padding: 0.3em 0.6em;
   font-size: 0.8em;
   box-shadow: none;
@@ -476,7 +476,7 @@ body {
    trash-bin glyph plus its danger color are the label. Same padding/font-size
    box as the button used to have when it read "Delete page", just filled
    with an icon instead of text. */
-#delete-page-button {
+.delete-page-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -489,12 +489,12 @@ body {
   color: #c0392b;
 }
 
-#delete-page-button:hover {
+.delete-page-button:hover {
   border-color: #c0392b;
   background: rgba(192, 57, 43, 0.1);
 }
 
-#delete-page-button:active {
+.delete-page-button:active {
   border-color: #c0392b;
   background: rgba(192, 57, 43, 0.18);
 }

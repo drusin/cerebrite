@@ -182,38 +182,12 @@
            island itself now, not by `init`'s document listeners). -->
       <div id="sync-popup-root"></div>
 
-      <main id="page-view" class="page-view">
-        <p id="page-view-empty" class="page-view-empty">Select a page from the list.</p>
-        <article id="page-article" hidden>
-          <div class="page-title-row">
-            <h1 id="page-title"></h1>
-            <div class="page-title-actions">
-              <button id="rename-page-button" type="button" hidden>Rename page</button>
-              <button id="delete-page-button" type="button" hidden aria-label="Delete page" title="Delete page">
-                <svg viewBox="0 0 24 24" width="1em" height="1em" aria-hidden="true" focusable="false">
-                  <path
-                    d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-3 6h12l-1 12a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 9Zm3 2v8h1v-8H9Zm3 0v8h1v-8h-1Zm3 0v8h1v-8h-1Z"
-                    fill="currentColor"
-                  />
-                </svg>
-              </button>
-            </div>
-          </div>
-          <p id="page-trash-banner" class="page-trash-banner" hidden>
-            This page is in trash.
-            <button id="restore-page-button" type="button">Restore</button>
-          </p>
-          <!-- Ticket 06: the editor is now the `surfaces/page-editor/` Vue
-               island (mounted in main.ts). It renders its own
-               `.milkdown-root` div; this is just the mount point. -->
-          <div id="page-editor-root"></div>
-          <section id="backlinks-section" class="backlinks-section">
-            <h2>Backlinks</h2>
-            <p id="backlinks-empty" class="backlinks-empty" hidden>No backlinks yet.</p>
-            <ul id="backlinks-list" class="backlinks-list"></ul>
-          </section>
-        </article>
-      </main>
+      <!-- Ticket 07: the whole article view -- title row (rename/delete),
+           trash banner (Restore), the editor, and backlinks -- is now the
+           `surfaces/article/` Vue island (mounted in main.ts). It renders
+           its own `.page-view`/`.page-article`/etc. markup; this is just
+           the mount point. -->
+      <div id="article-root"></div>
 
       <!-- Ticket 03: the search modal -- a Vue island
            (`surfaces/search/SearchModalContainer.vue`) mounted here.

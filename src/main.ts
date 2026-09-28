@@ -4,7 +4,6 @@ import {
   pickVaultFolder,
   getPage,
   resolvePage,
-  getBacklinks,
   connectAccessToken,
   generateSshKey,
   importSshKey,
@@ -59,7 +58,7 @@ import SyncIndicatorContainer from "./surfaces/sync-indicator/SyncIndicatorConta
 import SyncPopupContainer from "./surfaces/sync-indicator/SyncPopupContainer.vue";
 import SearchModalContainer from "./surfaces/search/SearchModalContainer.vue";
 import VaultPickerContainer from "./surfaces/vault-picker/VaultPickerContainer.vue";
-import PageEditorContainer from "./surfaces/page-editor/PageEditorContainer.vue";
+import ArticleContainer from "./surfaces/article/ArticleContainer.vue";
 import { createApp, watch } from "vue";
 import {
   reduceWizard,
@@ -86,7 +85,6 @@ import {
 // `window.alert`, and why a few pre-existing call sites still use those
 // broken globals unchanged.
 import { confirmDialog, messageDialog, promptDialog, confirmBrowser, alertBrowser } from "./dialogs";
-import { humanizeHeadingSlug } from "./heading-slug";
 
 // Ticket 10: the guided clone wizard's full-screen DOM handles. Its entry
 // point is now the `surfaces/vault-picker/` Vue island's "I already have a
@@ -184,15 +182,6 @@ const settingsRemoveAllCredentialsStatusEl = document.querySelector<HTMLElement>
   "#settings-remove-all-credentials-status",
 );
 
-const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
-const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
-const pageTitleEl = document.querySelector<HTMLElement>("#page-title");
-const backlinksListEl = document.querySelector<HTMLUListElement>("#backlinks-list");
-const backlinksEmptyEl = document.querySelector<HTMLElement>("#backlinks-empty");
-const renamePageButtonEl = document.querySelector<HTMLButtonElement>("#rename-page-button");
-const deletePageButtonEl = document.querySelector<HTMLButtonElement>("#delete-page-button");
-const pageTrashBannerEl = document.querySelector<HTMLElement>("#page-trash-banner");
-const restorePageButtonEl = document.querySelector<HTMLButtonElement>("#restore-page-button");
 const trashListEl = document.querySelector<HTMLUListElement>("#trash-list");
 const emptyTrashButtonEl = document.querySelector<HTMLButtonElement>("#empty-trash-button");
 
@@ -231,30 +220,36 @@ if (vaultPickerRootEl) {
   });
 }
 
-// Ticket 06: the editor is now the `surfaces/page-editor/` Vue island,
-// mounted at `#page-editor-root` (replacing `#page-body`). Its one
-// temporary callback root prop, `openPageByTitleInVanilla`, is the same
-// link-click navigation the search modal already uses above.
+// Ticket 07: the whole article view -- title row (rename/delete), trash
+// banner (Restore), the editor (embedded via a slot; see
+// `surfaces/article/ArticleContainer.vue`'s template), and backlinks -- is
+// now the `surfaces/article/` Vue island, mounted at `#article-root`
+// (replacing `#page-view`). It needs no root props at all: unlike ticket
+// 06's editor island, it reads `state/pages.ts` and calls `vault-api`/
+// `dialogs.ts` directly for everything it owns (rename/delete/restore,
+// backlinks, and opening a `[[Link]]` chip's target), so there's no more
+// vanilla logic for a callback to reach back into.
 //
-// Mounted directly (not via `mountIsland`) so `pageEditorHandle` below can
+// Mounted directly (not via `mountIsland`) so `articleHandle` below can
 // keep a typed reference to the container's own `defineExpose` --
 // `mountIsland` intentionally returns only the `App` (see its own doc
 // comment), which doesn't expose that. This is the one place `main.ts`
 // still needs an imperative handle into an island, for `scrollToHeading`
-// (spec.md#imperative-escape-hatches) -- the rest of the click-through-to-
-// heading wiring (like the rest of the article view) stays here until
-// ticket 07 gives it a proper home.
-const pageEditorRootEl = document.querySelector<HTMLElement>("#page-editor-root");
-let pageEditorHandle: { scrollToHeading(slug: string): boolean } | null = null;
-if (pageEditorRootEl) {
-  const pageEditorApp = createApp(PageEditorContainer, { openPageByTitleInVanilla });
-  pageEditorHandle = pageEditorApp.mount(pageEditorRootEl) as unknown as { scrollToHeading(slug: string): boolean };
+// (spec.md#imperative-escape-hatches), used by navigations that originate
+// outside the article surface itself (the sidebar's page/Recent/Trash
+// lists, search, "Today") -- a `[[Link]]` click inside the editor scrolls
+// on its own, entirely within the container.
+const articleRootEl = document.querySelector<HTMLElement>("#article-root");
+let articleHandle: { scrollToHeading(slug: string): boolean } | null = null;
+if (articleRootEl) {
+  const articleApp = createApp(ArticleContainer);
+  articleHandle = articleApp.mount(articleRootEl) as unknown as { scrollToHeading(slug: string): boolean };
 }
 
 /**
- * Calls the mounted editor's exposed `scrollToHeading`, retrying briefly:
- * a fresh navigation reloads the editor's content asynchronously (the
- * wrapper's own `pageKey` watcher awaits `PageEditor.load()`), so the
+ * Calls the mounted article island's exposed `scrollToHeading`, retrying
+ * briefly: a fresh navigation reloads the editor's content asynchronously
+ * (the wrapper's own `pageKey` watcher awaits `PageEditor.load()`), so the
  * heading's DOM node may not exist yet the instant this is called. Bounded
  * and self-cancelling -- once `scrollToHeading` returns `true`, or the
  * budget runs out, it stops. A no-op if nothing is mounted yet.
@@ -264,7 +259,7 @@ function scrollToHeadingWhenReady(slug: string) {
   const intervalMs = 25;
   let tries = 0;
   const tick = () => {
-    if (pageEditorHandle?.scrollToHeading(slug)) return;
+    if (articleHandle?.scrollToHeading(slug)) return;
     tries += 1;
     if (tries < attempts) setTimeout(tick, intervalMs);
   };
@@ -382,9 +377,10 @@ const connectWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#
 // Ticket 06: the editor and its autosave (`saveTimer`/`pageEditor`/
 // `scheduleAutosave`/`flushSave`/`flushPendingSaveForCurrentPage`, all
 // removed from this file) are now `surfaces/page-editor/`'s Vue island,
-// mounted below at `#page-editor-root`. Its container owns the debounce and
-// the immediate save-on-`commit` that fixes the lost-edit bug -- see its
-// own doc comments.
+// embedded inside the ticket 07 article island below (mounted at
+// `#article-root`). Its container owns the debounce and the immediate
+// save-on-`commit` that fixes the lost-edit bug -- see its own doc
+// comments.
 
 watch(pagesState.pages, (list) => renderPageList(list), { immediate: true });
 watch(pagesState.trash, (list) => renderTrashList(list), { immediate: true });
@@ -462,174 +458,27 @@ function renderPageList(pages: readonly PageSummary[]) {
 }
 
 /**
- * Renders the "Backlinks" section always appended at the bottom of a page's
- * rendered content (issue 06): every other page's `[[Link]]` occurrences
- * whose normalized target matches `title`, grouped by source page
- * (most-recently-modified source first, per `get_backlinks`'s ordering),
- * with a plain-text snippet per entry. Renders identically for persisted and
- * dynamic pages -- always present, "No backlinks yet" rather than hidden
- * when empty.
- */
-async function renderBacklinks(title: string) {
-  if (!backlinksListEl) return;
-
-  const entries = await getBacklinks(title);
-  backlinksListEl.innerHTML = "";
-
-  if (entries.length === 0) {
-    backlinksEmptyEl?.removeAttribute("hidden");
-    return;
-  }
-  backlinksEmptyEl?.setAttribute("hidden", "");
-
-  let lastSourceId: string | null = null;
-  for (const entry of entries) {
-    if (entry.sourceId !== lastSourceId) {
-      const header = document.createElement("li");
-      header.className = "backlink-group-header";
-      const headerButton = document.createElement("button");
-      headerButton.type = "button";
-      headerButton.textContent = entry.sourceTitle;
-      headerButton.addEventListener("click", () => void selectPage(entry.sourceId));
-      header.appendChild(headerButton);
-      backlinksListEl.appendChild(header);
-      lastSourceId = entry.sourceId;
-    }
-
-    const item = document.createElement("li");
-    item.className = "backlink-snippet";
-    const snippetButton = document.createElement("button");
-    snippetButton.type = "button";
-    snippetButton.textContent = entry.snippet;
-    snippetButton.addEventListener("click", () => void selectPage(entry.sourceId));
-    item.appendChild(snippetButton);
-
-    // Per-entry target-heading label (ticket 07): shown only when the link
-    // that produced this entry targeted a heading rather than the page
-    // itself. The label is a best-effort reversal of the stored slug (see
-    // heading-slug.ts's `humanizeHeadingSlug`) since only the slug, not the
-    // original heading text, is persisted.
-    if (entry.targetHeadingSlug) {
-      const headingLabel = document.createElement("span");
-      headingLabel.className = "backlink-heading-label";
-      headingLabel.textContent = `→ ${humanizeHeadingSlug(entry.targetHeadingSlug)}`;
-      item.appendChild(headingLabel);
-    }
-
-    backlinksListEl.appendChild(item);
-  }
-}
-
-/**
- * Renders the title into the article view. The body itself is no longer
- * this function's job as of ticket 06 -- `openResolution` below already
- * called `pagesState.open(resolution)`, which updates `openPageMarkdown`/
- * `openPageKey`, and the `surfaces/page-editor/` island reacts to that on
- * its own. `headingSlug` (ticket 07), if given, is the target heading of
- * the `[[Page#Heading]]` link that navigated here -- once the (async)
- * reload lands, the matching heading (if any) is scrolled into view.
- */
-async function renderPageArticle(
-  title: string,
-  headingSlug?: string | null,
-  options?: {
-    /** Whether the "Delete page" button should be offered at all -- only a persisted, non-trashed page is deletable. */
-    deletable?: boolean;
-    pageId?: string;
-    /** In trash (issue 10 / ADR-0010): renders a banner + inline "Restore" action instead of the "Delete page" button. */
-    inTrash?: boolean;
-    trashedFilename?: string | null;
-  }
-) {
-  if (pageTitleEl) pageTitleEl.textContent = title;
-  pageViewEmptyEl?.setAttribute("hidden", "");
-  pageArticleEl?.removeAttribute("hidden");
-
-  const inTrash = options?.inTrash ?? false;
-  const trashedFilename = options?.trashedFilename ?? null;
-  const deletable = (options?.deletable ?? false) && !inTrash;
-  const pageId = options?.pageId ?? null;
-
-  if (renamePageButtonEl) {
-    renamePageButtonEl.hidden = !deletable;
-    renamePageButtonEl.onclick = deletable && pageId ? () => void handleRenamePageClick(pageId, title) : null;
-  }
-  if (deletePageButtonEl) {
-    deletePageButtonEl.hidden = !deletable;
-    deletePageButtonEl.onclick = deletable && pageId ? () => void handleDeletePageClick(pageId) : null;
-  }
-  if (pageTrashBannerEl) {
-    pageTrashBannerEl.hidden = !inTrash;
-  }
-  if (restorePageButtonEl) {
-    restorePageButtonEl.onclick =
-      inTrash && trashedFilename ? () => void handleRestoreClick(trashedFilename) : null;
-  }
-
-  // Click-through-to-heading (ticket 07): a link to a heading that doesn't
-  // (yet) exist on the target page is simply a no-op scroll -- the page
-  // itself still opens normally, per the ticket's "behaves like a
-  // dynamic-page link at the page level" acceptance criterion.
-  // `scrollToHeadingWhenReady` retries briefly since the editor island
-  // reloads asynchronously (see its own doc comment above).
-  if (headingSlug) {
-    scrollToHeadingWhenReady(headingSlug);
-  }
-
-  // Always appended at the bottom of the page's rendered content (issue 06),
-  // for both persisted and dynamic pages, since both render identically
-  // (ADR-0009).
-  await renderBacklinks(title);
-}
-
-/**
  * Opens whatever `resolution` points to: an existing persisted page, or a
  * dynamic (unmaterialized) one. The Recent-recording and open-page state
- * update themselves live in `state/pages.ts`'s `open` action (ticket 05) --
- * this function decides whether a (re)render is even needed (the "already
- * open" skip, which reads the state module's `openPage`) and does the
- * rendering the action itself has no DOM to do.
+ * update themselves live in `state/pages.ts`'s `open` action (ticket 05).
+ *
+ * Ticket 07: the article view (title, rename/delete, the trash banner,
+ * backlinks) is now the `surfaces/article/` island, and it reads
+ * `state/pages.ts` reactively -- so this function no longer renders
+ * anything itself, and no longer needs the "already open" skip it used to
+ * (a `pagesState.open()` call whose resolution doesn't actually change
+ * `openPage`'s value is a no-op for anyone `watch`ing it, article island
+ * included). It still owns what's not the article island's job: the
+ * sidebar's active-item highlight, and the heading-targeted scroll for a
+ * navigation that originates outside the article surface itself (a
+ * `[[Link]]` clicked *inside* the editor scrolls entirely within the
+ * island instead; see `surfaces/article/ArticleContainer.vue`'s
+ * `handleLinkClick`).
  */
 async function openResolution(resolution: PageResolution) {
-  const current = pagesState.openPage.value;
-  const alreadyOpen =
-    (resolution.kind === "persisted" && current?.kind === "persisted" && current.id === resolution.id) ||
-    (resolution.kind === "dynamic" && current?.kind === "dynamic" && current.title === resolution.normalizedTitle);
-  // Even when the page is already open, a heading-targeted link still needs
-  // to scroll -- only skip the (re)load, not the scroll. Recording it in
-  // Recent still happens either way (a different heading target on the same
-  // page still counts as an open), so `pagesState.open` runs unconditionally
-  // below regardless of this early return.
-  if (alreadyOpen) {
-    pagesState.open(resolution);
-    if (resolution.headingSlug) scrollToHeadingWhenReady(resolution.headingSlug);
-    return;
-  }
-
-  // Ticket 06: no more explicit pre-switch flush here -- `pagesState.open`
-  // below updates `openPageKey`, which the editor island's wrapper watches;
-  // its own `commit` flush (the lost-edit fix) fires from that, not from a
-  // synchronous call this function has to remember to make first.
   pagesState.open(resolution);
   highlightActivePage();
-
-  if (resolution.kind === "persisted") {
-    const inTrash = resolution.inTrash ?? false;
-    const trashedFilename = resolution.trashedFilename ?? null;
-    await renderPageArticle(resolution.title, resolution.headingSlug, {
-      deletable: true,
-      pageId: resolution.id,
-      inTrash,
-      trashedFilename,
-    });
-  } else {
-    // Dynamic page (ADR-0009): UI-identical to a persisted page, but merely
-    // viewing it must not create a file -- no id, no file, just its
-    // normalized title, until the first write materializes it. Per the
-    // ticket, a heading-specific dynamic target isn't a thing, so
-    // `resolution.headingSlug` is intentionally not passed through here.
-    await renderPageArticle(resolution.normalizedTitle);
-  }
+  if (resolution.headingSlug) scrollToHeadingWhenReady(resolution.headingSlug);
 }
 
 async function selectPage(id: string) {
@@ -687,103 +536,22 @@ function renderTrashList(pages: readonly TrashedPageSummary[]) {
   }
 }
 
-/**
- * Explicit "delete page" action (issue 10 / ADR-0010): moves the page's file
- * into `.cerebrite/trash/` (git-tracked move, auto-committed) and closes the
- * page view, since the page is no longer an ordinary persisted page.
- */
-async function handleDeletePageClick(id: string) {
-  if (!(await confirmDialog("Move this page to trash?"))) return;
-
-  try {
-    await pagesState.deletePage(id);
-    pageArticleEl?.setAttribute("hidden", "");
-    pageViewEmptyEl?.removeAttribute("hidden");
-  } catch (err) {
-    await messageDialog(String(err));
-  }
-}
-
-/**
- * Explicit "rename page" action (the checklist item ticket 04 left undone,
- * see `docs/known-gaps.md`): prompts for a new title pre-filled with the
- * current one, warns first if other pages have inbound links that will be
- * rewritten (a rename's blast radius isn't limited to this one file, unlike
- * every other mutation in this app), then renames.
- *
- * If the currently-open page's content was touched by the rewrite (either
- * because it's the page being renamed, or because it was one of the
- * `affectedPageIds`), its title/body are reloaded from the backend and
- * pushed back into the editor -- otherwise a pending autosave on that page
- * would overwrite the just-rewritten file with its stale in-memory content.
- */
-async function handleRenamePageClick(id: string, currentTitle: string) {
-  const newTitle = promptDialog("New title for this page:", currentTitle);
-  if (newTitle === null) return; // user cancelled
-
-  const trimmed = newTitle.trim();
-  if (!trimmed) {
-    await messageDialog("Title cannot be empty.");
-    return;
-  }
-  if (trimmed === currentTitle) return;
-
-  let affectedCount = 0;
-  try {
-    affectedCount = (await getBacklinks(currentTitle)).length;
-  } catch (err) {
-    console.error("Failed to look up backlinks before renaming", err);
-  }
-  if (affectedCount > 0) {
-    const linkWord = affectedCount === 1 ? "link" : "links";
-    if (!(await confirmDialog(`This will also update ${affectedCount} ${linkWord} in other pages. Continue?`))) {
-      return;
-    }
-  }
-
-  try {
-    const result = await pagesState.rename(id, trimmed);
-
-    const current = pagesState.openPage.value;
-    const currentPageNeedsReload =
-      current?.kind === "persisted" && (current.id === id || result.affectedPageIds.includes(current.id));
-    if (currentPageNeedsReload && current?.kind === "persisted") {
-      const page = await getPage(current.id);
-      if (pageTitleEl) pageTitleEl.textContent = page.title;
-      // The renamed page's own id (and so `openPageKey`) doesn't change --
-      // the editor island's wrapper only reloads on a `pageKey` change, so
-      // a same-id content refresh needs this forced-reload action instead
-      // (ticket 06; see its own doc comment in state/pages.ts).
-      pagesState.reloadOpenPage(page.body);
-      await renderBacklinks(page.title);
-    }
-  } catch (err) {
-    await messageDialog(String(err));
-  }
-}
-
-/** Explicit "restore" action (issue 10): moves a trashed page's file back to its original path and reopens it as an ordinary persisted page. */
-async function handleRestoreClick(trashedFilename: string) {
-  try {
-    const summary = await pagesState.restore(trashedFilename);
-    await selectPage(summary.id);
-  } catch (err) {
-    await messageDialog(String(err));
-  }
-}
+// Ticket 07: "delete page"/"rename page"/"restore" (issue 10 / ADR-0010,
+// and the rename action the ticket 04 checklist left undone) are now
+// `surfaces/article/ArticleContainer.vue`'s job -- it confirms through
+// `dialogs.ts` and calls `state/pages.ts`'s actions itself, and its own
+// reactive read of `openPage`/`pages`/`trash` (for the article's title)
+// means it doesn't need this file to push a re-render at it afterwards.
 
 /** Explicit "empty trash" action (issue 10): permanently deletes every trashed page. There is no other purge path. */
 async function handleEmptyTrashClick() {
   if (!(await confirmDialog("Permanently delete all trashed pages? This cannot be undone."))) return;
 
-  const current = pagesState.openPage.value;
-  const wasViewingTrashedPage = current?.kind === "persisted" && current.inTrash;
   try {
+    // `pagesState.emptyTrash()` itself clears the open page when it was a
+    // trashed one -- the article island reacts to that on its own (ticket
+    // 07), so there's no DOM to clear here anymore.
     await pagesState.emptyTrash();
-    if (wasViewingTrashedPage) {
-      pageArticleEl?.setAttribute("hidden", "");
-      pageViewEmptyEl?.removeAttribute("hidden");
-    }
   } catch (err) {
     await messageDialog(String(err));
   }
@@ -912,9 +680,9 @@ async function handleChangeVaultFolderClick() {
   }
   if (!path) return; // user cancelled
 
+  // `pagesState.reset()` clears `openPage` -- the article island (ticket 07)
+  // reacts to that on its own, so there's no DOM to clear here anymore.
   pagesState.reset();
-  pageArticleEl?.setAttribute("hidden", "");
-  pageViewEmptyEl?.removeAttribute("hidden");
 
   try {
     closeSettingsModal();

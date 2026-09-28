@@ -9,13 +9,15 @@ import { ref } from "vue";
 import { openPage, openPageKey, openPageMarkdown, save, materialize } from "../../state/pages";
 import PageEditorSurface from "./PageEditorSurface.vue";
 
-// Temporary callback root prop (spec.md#islands-and-how-they-merge):
-// page-open logic (resolving a `[[Link]]` title, deciding already-open vs.
-// navigate, Recent, etc.) hasn't moved out of `main.ts` yet -- that's
-// ticket 07's "Article + backlinks" and beyond. Deleted once it has.
-const props = defineProps<{
-  /** Opens a `[[Link]]` chip's target the same way any other page-open path does. */
-  openPageByTitleInVanilla: (title: string) => Promise<void>;
+// Ticket 07: this used to take `openPageByTitleInVanilla`, a temporary
+// callback root prop reaching back into `main.ts` to open a `[[Link]]`
+// chip's target -- page-open logic hadn't moved out of vanilla code yet.
+// It's gone now: this container is only ever mounted by
+// `surfaces/article/ArticleContainer.vue`, which owns that logic itself
+// (it reads `state/pages.ts` and calls `vault-api` directly), so this is
+// just an ordinary emit up to its parent instead.
+const emit = defineEmits<{
+  linkClick: [title: string];
 }>();
 
 const AUTOSAVE_DEBOUNCE_MS = 1500;
@@ -83,7 +85,7 @@ function handleCommit(oldPageKey: string, markdown: string) {
 }
 
 function handleLinkClick(title: string) {
-  void props.openPageByTitleInVanilla(title);
+  emit("linkClick", title);
 }
 
 const surfaceRef = ref<InstanceType<typeof PageEditorSurface> | null>(null);
