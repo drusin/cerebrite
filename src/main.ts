@@ -2,18 +2,9 @@ import {
   getSettings,
   setTheme,
   pickVaultFolder,
-  listPages,
   getPage,
-  savePage,
-  createPage,
-  renamePage,
   resolvePage,
-  materializeAndSavePage,
   getBacklinks,
-  trashPage,
-  restorePage,
-  emptyTrash,
-  listTrashedPages,
   connectAccessToken,
   generateSshKey,
   importSshKey,
@@ -62,6 +53,7 @@ import {
   type OpenSettingsOptions,
 } from "./state/ui";
 import { vaultPath, openVault, applyVaultOpened } from "./state/vault";
+import * as pagesState from "./state/pages";
 import { friendlyVaultOpenError } from "./vault-open-error";
 import SyncIndicatorContainer from "./surfaces/sync-indicator/SyncIndicatorContainer.vue";
 import SyncPopupContainer from "./surfaces/sync-indicator/SyncPopupContainer.vue";
@@ -225,21 +217,23 @@ if (searchModalRootEl) {
 }
 
 // Ticket 04: the vault picker is now the `surfaces/vault-picker/` Vue
-// island, mounted at `#vault-picker-root`. Its three temporary callback
-// root props relies on the same `function`-hoisting as the search modal's
-// above. `#workspace`'s own visibility now follows `state/ui.ts`'s
+// island, mounted at `#vault-picker-root`. Two temporary callback root
+// props remain (the clone wizard/manual form don't migrate off `main.ts`
+// until step 9) -- they rely on the same `function`-hoisting as the search
+// modal's above. `#workspace`'s own visibility now follows `state/ui.ts`'s
 // `vaultView` (replacing `showVaultPicker`/`showWorkspace`'s toggling of
 // it) -- the picker's own visibility is the island's own `v-if` on that
 // same state.
+//
+// Ticket 05: `loadPagesAndTrashInVanilla` is gone -- page/trash state is
+// now `state/pages.ts`, so the container calls its `refreshPages`/
+// `refreshTrash` directly (via `registerVaultOpenedHandler`) instead of
+// routing through a callback into this file.
 const vaultPickerRootEl = document.querySelector<HTMLElement>("#vault-picker-root");
 if (vaultPickerRootEl) {
   mountIsland(vaultPickerRootEl, VaultPickerContainer, {
     openCloneWizardInVanilla: openCloneWizard,
     openCloneManualInVanilla: () => openCloneManualDialog(),
-    loadPagesAndTrashInVanilla: async () => {
-      await loadPages();
-      await loadTrash();
-    },
   });
 }
 watch(
@@ -340,70 +334,34 @@ const connectWizardCloseButtonEl = document.querySelector<HTMLButtonElement>("#c
 const connectWizardBackButtonEl = document.querySelector<HTMLButtonElement>("#connect-wizard-back-button");
 const connectWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#connect-wizard-manual-button");
 
-// The page currently loaded in the editor: either a persisted page (has an
-// id/file) or a dynamic page (issue 05 / ADR-0009) -- title-only, no
-// backing file until the first write materializes it. A persisted page may
-// currently sit in trash (issue 10 / ADR-0010) -- still resolves/renders,
-// but flagged so the UI can show an "in trash" indicator and restore prompt
-// instead of the ordinary "Delete page" action.
-type OpenPage =
-  | { kind: "persisted"; id: string; inTrash: boolean; trashedFilename: string | null }
-  | { kind: "dynamic"; title: string };
-
-let currentPage: OpenPage | null = null;
+// Ticket 05: the open page, page list, trash list, and Recent all moved
+// into `state/pages.ts` (`pagesState.openPage`/`pagesState.pages`/
+// `pagesState.trash`/`pagesState.recent`, all read-only) -- this file keeps
+// only the rendering that reads them and the editor/autosave machinery that
+// doesn't belong in a DOM-free state module. `watch()` below replaces the
+// old tightly-coupled fetch+render (`loadPages`/`loadTrash`/
+// `recordRecentOpen`/`pruneRecentEntries` each called their own
+// `renderPageList`/`renderTrashList`/`renderRecentList` inline): the state
+// module's actions just update state, and rendering reacts to it, same
+// pattern as `watch(vaultView, ...)` above.
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pageEditor: PageEditor | null = null;
 
-// --- Recent (issue 12) ---------------------------------------------------
-//
-// Last-*opened* pages (not last-edited), most-recent-first, capped at
-// RECENT_LIMIT, no pagination -- per issue 08's sidebar spec. Deliberately
-// in-memory only (module-level array, not persisted to disk/config): there
-// is no existing persistence mechanism for this kind of transient UI state
-// (the config file only stores the vault path + device id), and the ticket
-// doesn't require surviving a restart, so the simplest option -- resetting
-// each app launch -- is the pragmatic default here.
-const RECENT_LIMIT = 10;
+watch(pagesState.pages, (list) => renderPageList(list), { immediate: true });
+watch(pagesState.trash, (list) => renderTrashList(list), { immediate: true });
+watch(pagesState.recent, (list) => renderRecentList(list), { immediate: true });
 
-interface RecentEntry {
-  /** Dedupe/identity key: `p:<id>` for a persisted page, `d:<normalizedTitle>` for a dynamic one. */
-  key: string;
-  title: string;
-  kind: "persisted" | "dynamic";
-  /** Set only for `kind === "persisted"`; used to navigate via `selectPage`. */
-  pageId?: string;
-}
-
-let recentPages: RecentEntry[] = [];
-
-/** Records a page-open event: moves an existing entry to the top (no duplicate) or inserts a new one, capped at RECENT_LIMIT. */
-function recordRecentOpen(entry: RecentEntry) {
-  recentPages = recentPages.filter((existing) => existing.key !== entry.key);
-  recentPages.unshift(entry);
-  if (recentPages.length > RECENT_LIMIT) recentPages.length = RECENT_LIMIT;
-  renderRecentList();
-}
-
-/** Drops any Recent entries pointing at pages that are no longer valid (trashed or purged), then re-renders. */
-function pruneRecentEntries(removedPageIds: Iterable<string>) {
-  const removed = new Set(removedPageIds);
-  if (removed.size === 0) return;
-  const before = recentPages.length;
-  recentPages = recentPages.filter((entry) => !(entry.kind === "persisted" && entry.pageId && removed.has(entry.pageId)));
-  if (recentPages.length !== before) renderRecentList();
-}
-
-function renderRecentList() {
+function renderRecentList(entries: readonly pagesState.RecentEntry[]) {
   if (!recentListEl) return;
   recentListEl.innerHTML = "";
 
-  if (recentPages.length === 0) {
+  if (entries.length === 0) {
     recentEmptyEl?.removeAttribute("hidden");
   } else {
     recentEmptyEl?.setAttribute("hidden", "");
   }
 
-  for (const entry of recentPages) {
+  for (const entry of entries) {
     const li = document.createElement("li");
     const button = document.createElement("button");
     button.type = "button";
@@ -436,24 +394,14 @@ async function flushSave(markdown: string) {
     clearTimeout(saveTimer);
     saveTimer = null;
   }
-  if (!currentPage) return;
+  const current = pagesState.openPage.value;
+  if (!current) return;
 
   try {
-    if (currentPage.kind === "persisted") {
-      await savePage(currentPage.id, markdown);
+    if (current.kind === "persisted") {
+      await pagesState.save(current.id, markdown);
     } else {
-      const dynamicKey = `d:${currentPage.title}`;
-      const summary = await materializeAndSavePage(currentPage.title, markdown);
-      currentPage = { kind: "persisted", id: summary.id, inTrash: false, trashedFilename: null };
-      // Keep the Recent entry (if any) pointing at the same page now that it
-      // has materialized, rather than leaving a stale dynamic-kind entry.
-      recentPages = recentPages.map((entry) =>
-        entry.key === dynamicKey
-          ? { key: `p:${summary.id}`, title: summary.title, kind: "persisted", pageId: summary.id }
-          : entry
-      );
-      renderRecentList();
-      await loadPages();
+      await pagesState.materialize(current.title, markdown);
     }
   } catch (err) {
     console.error("Failed to save page", err);
@@ -470,16 +418,17 @@ function scheduleAutosave(markdown: string) {
 
 /** Flushes any pending save for the page currently loaded in the editor before switching away from it. */
 async function flushPendingSaveForCurrentPage() {
-  if (saveTimer === null || !currentPage || !pageEditor) return;
+  if (saveTimer === null || !pagesState.openPage.value || !pageEditor) return;
   const markdown = pageEditor.getMarkdown();
   if (markdown === null) return;
   await flushSave(markdown);
 }
 
 function highlightActivePage() {
+  const current = pagesState.openPage.value;
   const isActiveButton = (btn: HTMLButtonElement) => {
-    if (currentPage?.kind === "persisted") return btn.dataset.pageId === currentPage.id;
-    if (currentPage?.kind === "dynamic") return btn.dataset.dynamicTitle === currentPage.title;
+    if (current?.kind === "persisted") return btn.dataset.pageId === current.id;
+    if (current?.kind === "dynamic") return btn.dataset.dynamicTitle === current.title;
     return false;
   };
   pageListEl?.querySelectorAll<HTMLButtonElement>("button").forEach((btn) => {
@@ -498,17 +447,18 @@ function highlightActivePage() {
 // near the other module-scope island setup, above), and `#vault-picker`'s
 // own visibility is the Vue island's own `v-if` on that same state.
 
-function renderPageList(pages: PageSummary[]) {
+function renderPageList(pages: readonly PageSummary[]) {
   if (!pageListEl) return;
   pageListEl.innerHTML = "";
 
+  const current = pagesState.openPage.value;
   for (const page of pages) {
     const li = document.createElement("li");
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = page.title;
     button.dataset.pageId = page.id;
-    button.classList.toggle("active", currentPage?.kind === "persisted" && page.id === currentPage.id);
+    button.classList.toggle("active", current?.kind === "persisted" && page.id === current.id);
     button.addEventListener("click", () => void selectPage(page.id));
     li.appendChild(button);
     pageListEl.appendChild(li);
@@ -620,10 +570,10 @@ async function renderPageArticle(
 
   if (pageBodyEl) {
     if (!pageEditor) {
-      // `currentPage`/`scheduleAutosave` are read at callback time (not
-      // captured here), so this single instance stays correct across page
-      // switches -- including a dynamic page turning into a persisted one
-      // mid-session.
+      // `pagesState.openPage`/`scheduleAutosave` are read at callback time
+      // (not captured here), so this single instance stays correct across
+      // page switches -- including a dynamic page turning into a persisted
+      // one mid-session.
       pageEditor = new PageEditor(
         pageBodyEl,
         (markdown) => scheduleAutosave(markdown),
@@ -647,31 +597,26 @@ async function renderPageArticle(
   await renderBacklinks(title);
 }
 
-/** Opens whatever `resolution` points to: an existing persisted page, or a dynamic (unmaterialized) one. */
+/**
+ * Opens whatever `resolution` points to: an existing persisted page, or a
+ * dynamic (unmaterialized) one. The Recent-recording and open-page state
+ * update themselves live in `state/pages.ts`'s `open` action (ticket 05) --
+ * this function decides whether a (re)render is even needed (the "already
+ * open" skip, which reads the state module's `openPage`) and does the
+ * rendering the action itself has no DOM to do.
+ */
 async function openResolution(resolution: PageResolution) {
-  // Recent (issue 12) tracks last-*opened*, so every navigation here counts
-  // as an open -- including re-opening the already-active page (e.g. a
-  // different heading target on the same page) -- and moves it to the top
-  // rather than duplicating it. Trashed pages are excluded: they're reached
-  // only from the Trash list itself, and recording them would leave a dead
-  // link behind in Recent once the page is later purged.
-  const isTrashedPage = resolution.kind === "persisted" && resolution.inTrash === true;
-  if (!isTrashedPage) {
-    recordRecentOpen(
-      resolution.kind === "persisted"
-        ? { key: `p:${resolution.id}`, title: resolution.title, kind: "persisted", pageId: resolution.id }
-        : { key: `d:${resolution.normalizedTitle}`, title: resolution.normalizedTitle, kind: "dynamic" }
-    );
-  }
-
+  const current = pagesState.openPage.value;
   const alreadyOpen =
-    (resolution.kind === "persisted" && currentPage?.kind === "persisted" && currentPage.id === resolution.id) ||
-    (resolution.kind === "dynamic" &&
-      currentPage?.kind === "dynamic" &&
-      currentPage.title === resolution.normalizedTitle);
+    (resolution.kind === "persisted" && current?.kind === "persisted" && current.id === resolution.id) ||
+    (resolution.kind === "dynamic" && current?.kind === "dynamic" && current.title === resolution.normalizedTitle);
   // Even when the page is already open, a heading-targeted link still needs
-  // to scroll -- only skip the (re)load, not the scroll.
+  // to scroll -- only skip the (re)load, not the scroll. Recording it in
+  // Recent still happens either way (a different heading target on the same
+  // page still counts as an open), so `pagesState.open` runs unconditionally
+  // below regardless of this early return.
   if (alreadyOpen) {
+    pagesState.open(resolution);
     if (resolution.headingSlug) pageEditor?.scrollToHeading(resolution.headingSlug);
     return;
   }
@@ -679,11 +624,12 @@ async function openResolution(resolution: PageResolution) {
   // Persist any unsaved edit on the page we're leaving before switching.
   await flushPendingSaveForCurrentPage();
 
+  pagesState.open(resolution);
+  highlightActivePage();
+
   if (resolution.kind === "persisted") {
     const inTrash = resolution.inTrash ?? false;
     const trashedFilename = resolution.trashedFilename ?? null;
-    currentPage = { kind: "persisted", id: resolution.id, inTrash, trashedFilename };
-    highlightActivePage();
     await renderPageArticle(resolution.title, resolution.body, resolution.headingSlug, {
       deletable: true,
       pageId: resolution.id,
@@ -696,14 +642,13 @@ async function openResolution(resolution: PageResolution) {
     // normalized title, until the first write materializes it. Per the
     // ticket, a heading-specific dynamic target isn't a thing, so
     // `resolution.headingSlug` is intentionally not passed through here.
-    currentPage = { kind: "dynamic", title: resolution.normalizedTitle };
-    highlightActivePage();
     await renderPageArticle(resolution.normalizedTitle, "");
   }
 }
 
 async function selectPage(id: string) {
-  if (currentPage?.kind === "persisted" && currentPage.id === id && !currentPage.inTrash) return;
+  const current = pagesState.openPage.value;
+  if (current?.kind === "persisted" && current.id === id && !current.inTrash) return;
   const page = await getPage(id);
   await openResolution({ kind: "persisted", id: page.id, title: page.title, body: page.body, html: page.html });
 }
@@ -740,13 +685,8 @@ async function handleTodayClick() {
   await openPageByTitle(todaysDateTitle());
 }
 
-async function loadPages() {
-  const pages = await listPages();
-  renderPageList(pages);
-}
-
 /** Renders the sidebar's "Trash" list (issue 10): clicking an entry opens it the same way a `[[Link]]` to it would -- rendered with the "in trash" banner and inline restore action. */
-function renderTrashList(pages: TrashedPageSummary[]) {
+function renderTrashList(pages: readonly TrashedPageSummary[]) {
   if (!trashListEl) return;
   trashListEl.innerHTML = "";
 
@@ -761,11 +701,6 @@ function renderTrashList(pages: TrashedPageSummary[]) {
   }
 }
 
-async function loadTrash() {
-  const pages = await listTrashedPages();
-  renderTrashList(pages);
-}
-
 /**
  * Explicit "delete page" action (issue 10 / ADR-0010): moves the page's file
  * into `.cerebrite/trash/` (git-tracked move, auto-committed) and closes the
@@ -775,13 +710,9 @@ async function handleDeletePageClick(id: string) {
   if (!(await confirmDialog("Move this page to trash?"))) return;
 
   try {
-    await trashPage(id);
-    currentPage = null;
+    await pagesState.deletePage(id);
     pageArticleEl?.setAttribute("hidden", "");
     pageViewEmptyEl?.removeAttribute("hidden");
-    pruneRecentEntries([id]);
-    await loadPages();
-    await loadTrash();
   } catch (err) {
     await messageDialog(String(err));
   }
@@ -825,19 +756,13 @@ async function handleRenamePageClick(id: string, currentTitle: string) {
   }
 
   try {
-    const result = await renamePage(id, trimmed);
-    await loadPages();
+    const result = await pagesState.rename(id, trimmed);
 
-    recentPages = recentPages.map((entry) =>
-      entry.kind === "persisted" && entry.pageId === id ? { ...entry, title: result.title } : entry
-    );
-    renderRecentList();
-
+    const current = pagesState.openPage.value;
     const currentPageNeedsReload =
-      currentPage?.kind === "persisted" &&
-      (currentPage.id === id || result.affectedPageIds.includes(currentPage.id));
-    if (currentPageNeedsReload && currentPage?.kind === "persisted") {
-      const page = await getPage(currentPage.id);
+      current?.kind === "persisted" && (current.id === id || result.affectedPageIds.includes(current.id));
+    if (currentPageNeedsReload && current?.kind === "persisted") {
+      const page = await getPage(current.id);
       if (pageTitleEl) pageTitleEl.textContent = page.title;
       await pageEditor?.load(page.body);
       await renderBacklinks(page.title);
@@ -850,10 +775,7 @@ async function handleRenamePageClick(id: string, currentTitle: string) {
 /** Explicit "restore" action (issue 10): moves a trashed page's file back to its original path and reopens it as an ordinary persisted page. */
 async function handleRestoreClick(trashedFilename: string) {
   try {
-    const summary = await restorePage(trashedFilename);
-    await loadPages();
-    await loadTrash();
-    currentPage = null; // force a fresh render so the trash banner/button clear
+    const summary = await pagesState.restore(trashedFilename);
     await selectPage(summary.id);
   } catch (err) {
     await messageDialog(String(err));
@@ -864,16 +786,14 @@ async function handleRestoreClick(trashedFilename: string) {
 async function handleEmptyTrashClick() {
   if (!(await confirmDialog("Permanently delete all trashed pages? This cannot be undone."))) return;
 
+  const current = pagesState.openPage.value;
+  const wasViewingTrashedPage = current?.kind === "persisted" && current.inTrash;
   try {
-    const purgedIds = (await listTrashedPages()).map((page) => page.id);
-    await emptyTrash();
-    pruneRecentEntries(purgedIds);
-    if (currentPage?.kind === "persisted" && currentPage.inTrash) {
-      currentPage = null;
+    await pagesState.emptyTrash();
+    if (wasViewingTrashedPage) {
       pageArticleEl?.setAttribute("hidden", "");
       pageViewEmptyEl?.removeAttribute("hidden");
     }
-    await loadTrash();
   } catch (err) {
     await messageDialog(String(err));
   }
@@ -896,8 +816,7 @@ async function handleNewPageClick() {
   }
 
   try {
-    const summary = await createPage(trimmed);
-    await loadPages();
+    const summary = await pagesState.create(trimmed);
     await selectPage(summary.id);
   } catch (err) {
     await messageDialog(String(err));
@@ -912,11 +831,16 @@ async function handleNewPageClick() {
 // --- Search modal's temporary callbacks (ticket 03) ------------------------
 //
 // The search modal itself is now `surfaces/search/` (a Vue island mounted
-// above); these two intents are all it still needs from vanilla code --
-// page state/actions don't move into `src/state/` until step 4. Both close
-// the modal via `state/ui.ts`'s `closeModal` themselves, matching the old
-// `openSearchResult`/`handleCreatePageFromSearch`'s exact control flow
-// (in particular: on `createPage` failure, the modal stays open).
+// above); these two intents are all it still needs from vanilla code -- the
+// modal's rendering never migrated, so it still can't call `openResolution`/
+// `selectPage`'s rendering itself. Ticket 05 moved the state each of these
+// touches into `state/pages.ts`, but both callbacks stay (unlike the vault
+// picker's third callback, which was pure state and is gone) since the rest
+// of what they do -- closing the modal, rendering the opened/created page --
+// is still vanilla. Both close the modal via `state/ui.ts`'s `closeModal`
+// themselves, matching the old `openSearchResult`/`handleCreatePageFromSearch`'s
+// exact control flow (in particular: on `createPage` failure, the modal
+// stays open).
 
 /** Opens the resolved search result the same way clicking any `[[Link]]` chip or a Trash-list entry would -- `resolve_page` already handles the "in trash" state, so this works identically for a persisted or a trashed hit. */
 async function openPageByTitleInVanilla(title: string) {
@@ -927,9 +851,8 @@ async function openPageByTitleInVanilla(title: string) {
 /** Empty-state action: creates the typed query as a brand-new page and opens it straight into the editor, reusing the exact same action as the "New page" button. */
 async function createPageFromQueryInVanilla(query: string) {
   try {
-    const summary = await createPage(query);
+    const summary = await pagesState.create(query);
     closeModal();
-    await loadPages();
     await selectPage(summary.id);
   } catch (err) {
     await messageDialog(String(err));
@@ -985,11 +908,9 @@ async function handleChangeVaultFolderClick() {
   if (!path) return; // user cancelled
 
   await flushPendingSaveForCurrentPage();
-  currentPage = null;
+  pagesState.reset();
   pageArticleEl?.setAttribute("hidden", "");
   pageViewEmptyEl?.removeAttribute("hidden");
-  recentPages = [];
-  renderRecentList();
 
   try {
     closeSettingsModal();

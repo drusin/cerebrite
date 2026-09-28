@@ -8,26 +8,32 @@
 import { onMounted, ref } from "vue";
 import { vaultView, setVaultView } from "../../state/ui";
 import { openVault, registerVaultOpenedHandler } from "../../state/vault";
+import { refreshPages, refreshTrash } from "../../state/pages";
 import { getSettings, pickVaultFolder } from "../../vault-api";
 import { friendlyVaultOpenError } from "../../vault-open-error";
 import VaultPicker from "./VaultPicker.vue";
 
 // Temporary callback root props (spec.md#islands-and-how-they-merge): the
 // guided clone wizard and the standalone manual clone form don't migrate off
-// `main.ts` until step 9, and page/trash loading doesn't move into
-// `src/state/` until step 4 -- all three arrive here as root props, same
-// pattern as the search modal's (ticket 03).
+// `main.ts` until step 9 -- they still arrive here as root props, same
+// pattern as the search modal's (ticket 03). Page/trash loading (ticket 04's
+// third callback, `loadPagesAndTrashInVanilla`) is gone as of ticket 05:
+// `state/pages.ts`'s own `refreshPages`/`refreshTrash` cover it, so this
+// container calls them directly below instead of routing through `main.ts`.
 const props = defineProps<{
   /** Opens the full-screen guided clone wizard. */
   openCloneWizardInVanilla: () => void;
   /** Opens the standalone "git clone" manual form. */
   openCloneManualInVanilla: () => void;
-  /** Loads the page list and trash list -- run once a vault successfully
-   * opens, on every path (registered with `state/vault.ts`, which calls it
-   * from its `openVault` action). */
-  loadPagesAndTrashInVanilla: () => Promise<void>;
 }>();
-registerVaultOpenedHandler(props.loadPagesAndTrashInVanilla);
+
+/** Runs once a vault successfully opens, on every path (registered with
+ * `state/vault.ts`, which calls it from its `openVault` action). */
+async function loadPagesAndTrash(): Promise<void> {
+  await refreshPages();
+  await refreshTrash();
+}
+registerVaultOpenedHandler(loadPagesAndTrash);
 
 const error = ref<string | null>(null);
 
