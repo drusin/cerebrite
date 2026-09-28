@@ -56,14 +56,13 @@ function providerLabel(provider: WizardProvider | null): string {
   return "this provider";
 }
 
-export interface ConnectWizardOptions {
-  /** Ticket 11's temporary callback root prop (see `ConnectWizardContainer.vue`'s
-   * doc comment) -- refreshes Settings' still-vanilla "Commit as" fields
-   * after this wizard's own "Commit as" step saves a new one. */
-  refreshCommitAuthorFieldsInVanilla: () => Promise<void>;
-}
-
-export function useConnectWizard(options: ConnectWizardOptions) {
+// Ticket 12: this composable used to take a `refreshCommitAuthorFieldsInVanilla`
+// callback root prop (Settings was still vanilla and couldn't otherwise
+// learn a new commit author had been saved). Settings is now Vue and reads
+// `getCommitAuthor`/`commitAuthorPrefill` itself, refreshing whenever it
+// (re)opens -- including when this wizard closes back to it -- so no
+// callback is needed here anymore.
+export function useConnectWizard() {
   const state = ref<WizardState>({ ...initialWizardState });
 
   const oauthStatus = ref("");
@@ -367,7 +366,6 @@ export function useConnectWizard(options: ConnectWizardOptions) {
     commitAuthorError.value = null;
     try {
       await confirmCommitAuthor(name, email);
-      await options.refreshCommitAuthorFieldsInVanilla();
       dispatch({ type: "commitAuthorConfirmed" });
     } catch (err) {
       commitAuthorError.value = String(err);

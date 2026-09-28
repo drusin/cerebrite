@@ -7,13 +7,19 @@
 // Device flow and the SSH key sub-form were written inline here as the
 // first copies, alongside the clone wizard's own copies; ticket 11's
 // connect wizard is the second copy of each, so they're now
-// `components/DeviceFlow.vue`/`SshKey.vue` and this surface switches to
-// them below.
+// `components/DeviceFlow.vue`/`SshKey.vue`. Ticket 12 extracts the whole
+// credential-kind selector + its four sub-forms into
+// `components/CredentialKindForm.vue` (Settings' always-visible "Sync"
+// section is the second copy of *that*), and this surface switches to it --
+// with its shared repository-URL field hidden (`show-url-field="false"`)
+// since this form already has its own single `remoteUrl` field above, and no
+// `connect-label`, since the actual connect happens via this form's own
+// "Clone" button below, not a per-sub-form one.
+import type { DeviceCodeDisplay } from "../../components/DeviceFlow.vue";
 import { ref } from "vue";
-import DeviceFlow, { type DeviceCodeDisplay } from "../../components/DeviceFlow.vue";
-import SshKey from "../../components/SshKey.vue";
+import CredentialKindForm, { type CredentialKindOption } from "../../components/CredentialKindForm.vue";
 
-export type ManualCredentialKind = "accessToken" | "sshKey" | "githubOauth" | "gitlabOauth";
+export type ManualCredentialKind = CredentialKindOption;
 
 defineProps<{
   remoteUrl: string;
@@ -90,51 +96,24 @@ function handleKeydown(event: KeyboardEvent) {
         </label>
         <button type="button" @click="emit('pickDestination')">Choose folder…</button>
 
-        <label>
-          Credential kind
-          <select
-            :value="credentialKind"
-            @change="emit('update:credentialKind', ($event.target as HTMLSelectElement).value as ManualCredentialKind)"
-          >
-            <option value="accessToken">Access token</option>
-            <option value="sshKey">SSH key</option>
-            <option value="githubOauth">GitHub sign-in</option>
-            <option value="gitlabOauth">GitLab sign-in</option>
-          </select>
-        </label>
-
-        <div v-if="credentialKind === 'accessToken'" class="settings-connect-form">
-          <label>
-            Username
-            <input
-              type="text"
-              :value="tokenUsername"
-              @input="emit('update:tokenUsername', ($event.target as HTMLInputElement).value)"
-            />
-          </label>
-          <label>
-            Access token
-            <input
-              type="password"
-              :value="tokenValue"
-              @input="emit('update:tokenValue', ($event.target as HTMLInputElement).value)"
-            />
-          </label>
-        </div>
-
-        <div v-else-if="credentialKind === 'sshKey'" class="settings-connect-form">
-          <SshKey :status="sshKeyStatus" @generate="emit('generateSshKey')" @import="emit('importSshKey')" />
-        </div>
-
-        <div v-else-if="credentialKind === 'githubOauth'" class="settings-connect-form">
-          <button type="button" @click="emit('githubSignIn')">Sign in with GitHub</button>
-          <DeviceFlow v-if="githubStatus" :status="githubStatus" :device-code="githubDeviceCode" />
-        </div>
-
-        <div v-else class="settings-connect-form">
-          <button type="button" @click="emit('gitlabSignIn')">Sign in with GitLab</button>
-          <DeviceFlow v-if="gitlabStatus" :status="gitlabStatus" :device-code="gitlabDeviceCode" />
-        </div>
+        <CredentialKindForm
+          :credential-kind="credentialKind"
+          :show-url-field="false"
+          :token-username="tokenUsername"
+          :token-value="tokenValue"
+          :ssh-key-status="sshKeyStatus"
+          :github-device-code="githubDeviceCode"
+          :github-status="githubStatus"
+          :gitlab-device-code="gitlabDeviceCode"
+          :gitlab-status="gitlabStatus"
+          @update:credential-kind="emit('update:credentialKind', $event)"
+          @update:token-username="emit('update:tokenUsername', $event)"
+          @update:token-value="emit('update:tokenValue', $event)"
+          @generate-ssh-key="emit('generateSshKey')"
+          @import-ssh-key="emit('importSshKey')"
+          @github-sign-in="emit('githubSignIn')"
+          @gitlab-sign-in="emit('gitlabSignIn')"
+        />
 
         <button type="button" class="wizard-primary-action" :disabled="submitting" @click="emit('submit')">
           Clone

@@ -9,18 +9,10 @@ import { modal } from "../../state/ui";
 import { useConnectWizard } from "./useConnectWizard";
 import ConnectWizard from "./ConnectWizard.vue";
 
-// Temporary callback root prop (spec.md#islands-and-how-they-merge):
-// Settings hasn't migrated to Vue yet, so its "Commit as" fields are still
-// vanilla DOM this composable can't reach directly -- see
-// `useConnectWizard.ts`'s `ConnectWizardOptions` doc comment. Delete this
-// indirection once Settings migrates (ticket 12).
-const props = defineProps<{
-  refreshCommitAuthorFieldsInVanilla: () => Promise<void>;
-}>();
-
-const wizard = useConnectWizard({
-  refreshCommitAuthorFieldsInVanilla: () => props.refreshCommitAuthorFieldsInVanilla(),
-});
+// Ticket 12: this container used to take a `refreshCommitAuthorFieldsInVanilla`
+// callback root prop -- see `useConnectWizard.ts`'s doc comment for why it's
+// gone. No root props needed anymore.
+const wizard = useConnectWizard();
 
 // (Re)starts the wizard fresh every time it's opened -- same reset the old
 // `openConnectWizard()` did on every open.
