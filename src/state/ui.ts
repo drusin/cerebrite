@@ -61,44 +61,39 @@ export interface OpenSettingsOptions {
   provider?: string | null;
 }
 
-export type OpenSettingsHandler = (options: OpenSettingsOptions) => void;
+// Ticket 12: Settings itself is now Vue, so it can just watch this module's
+// state directly instead of a registered callback (spec.md#step-11-settings:
+// "Delete the Settings callbacks from steps 1 and 10" -- this retires
+// `registerOpenSettingsHandler`/`OpenSettingsHandler`/`openSettingsInVanilla`).
+// `openSettings`'s deep-link options are stashed here as plain reactive
+// state; `SettingsContainer.vue` watches both this and `modal` to apply them
+// (prefill a field, scroll to a section) every time Settings opens --
+// including reopening from the connect wizard's "Switch to manual setup".
+const settingsDeepLinkState: Ref<OpenSettingsOptions> = ref({});
 
-// Temporary callback root prop (spec.md#islands-and-how-they-merge):
-// Settings hasn't migrated to Vue yet, so the actual modal-opening/
-// prefilling/scrolling logic still lives in main.ts. It's registered here
-// by the sync popup's container, which receives it as a root prop
-// (`openSettingsInVanilla`) from `mountIsland`. `openSettings` itself stays
-// framework/DOM-agnostic; only the registered handler touches the vanilla
-// Settings DOM. Delete this indirection -- and call `openSettingsHandler`
-// directly -- once Settings itself migrates to Vue and can just read/act on
-// state the way every other migrated surface does.
-let openSettingsHandler: OpenSettingsHandler | null = null;
-
-export function registerOpenSettingsHandler(handler: OpenSettingsHandler): void {
-  openSettingsHandler = handler;
-}
+export const settingsDeepLink = readonly(settingsDeepLinkState);
 
 /** Deep-link action: opens Settings, optionally jumping straight to a
  * section and prefilling it. Also closes the sync popup, since every
  * current caller reaches this from there or wants it closed regardless. */
 export function openSettings(options: OpenSettingsOptions = {}): void {
   closeSyncPopup();
-  openSettingsHandler?.(options);
+  settingsDeepLinkState.value = options;
+  modalState.value = "settings";
 }
 
 // --- Modal state -------------------------------------------------------
 //
 // Replaces main.ts's own `#search-modal-overlay` `hidden`-attribute
 // toggling (`isSearchModalOpen`/`openSearchModal`/`closeSearchModal`). Per
-// spec.md#view-and-modal-state-stateuits, `modal` is eventually
+// spec.md#view-and-modal-state-stateuits, `modal` is
 // `null | 'search' | 'settings' | 'connectWizard'`; step 03 was the first
-// real use of the field (only `'search'`); ticket 11 adds `'connectWizard'`
-// (and the `'settings'` value it returns to on close -- bookkeeping only for
-// now, since Settings itself doesn't read `modal` until it migrates in
-// ticket 12: its visibility is still driven by its own vanilla
-// `hidden`-attribute toggling, which this doesn't touch). The sync popup
-// stays on its own `syncPopupOpen`/`syncPopupAnchor` state above, since it's
-// anchored rather than modal.
+// real use of the field (only `'search'`); ticket 11 added `'connectWizard'`
+// (and the `'settings'` value it returns to on close); ticket 12 is the
+// first to actually show/hide Settings from this -- `SettingsSurface.vue`'s
+// own `v-if="modal === 'settings'"`. The sync popup stays on its own
+// `syncPopupOpen`/`syncPopupAnchor` state above, since it's anchored rather
+// than modal.
 
 export type ModalId = "search" | "settings" | "connectWizard";
 
@@ -110,11 +105,11 @@ export function openSearchModal(): void {
   modalState.value = "search";
 }
 
-/** Opens the connect wizard -- called directly from the vanilla Settings
- * modal's "Connect…" buttons (`#connect-wizard-open-button`,
- * `#sync-section-connect-button` in main.ts), the same way those already
- * call `openSearchModal` directly: a plain state action, not a temporary
- * callback, since it's just as reachable from vanilla code as from Vue. */
+/** Opens the connect wizard -- called from Settings' own "Connect…" buttons
+ * (the "Connect a repository" section and the not-connected banner's
+ * shortcut), same as `openSearchModal`: a plain state action, not a
+ * callback, since it's just as reachable from a container as from vanilla
+ * code. */
 export function openConnectWizardModal(): void {
   modalState.value = "connectWizard";
 }
@@ -124,11 +119,10 @@ export function closeModal(): void {
 }
 
 /** Closes the connect wizard specifically -- per the ticket, it returns
- * `modal` to `'settings'` rather than `null`, since the vanilla Settings
- * modal is (and was, the whole time the wizard was open -- the wizard only
- * ever layers over it, per `styles.css`'s `.connect-wizard` doc comment)
- * still showing underneath. `'settings'` is bookkeeping only until ticket 12
- * (see this module's `ModalId` doc comment). */
+ * `modal` to `'settings'` rather than `null`, since the Settings modal is
+ * (and was, the whole time the wizard was open -- the wizard only ever
+ * layers over it, per `styles.css`'s `.connect-wizard` doc comment) still
+ * showing underneath. */
 export function closeConnectWizardModal(): void {
   modalState.value = "settings";
 }

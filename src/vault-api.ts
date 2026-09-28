@@ -276,11 +276,7 @@ export function importSshKey(privateKeyOpenssh: string, passphrase?: string): Pr
 }
 
 /// Connects with an SSH key (generated or imported): runs a real test fetch
-/// -- including this ticket's host-key check -- before persisting anything.
-/// A rejected/unconfirmed/mismatched host key surfaces as a rejected
-/// promise naming the host and fingerprint; confirm it via
-/// `confirmSshHostKey` (only after showing it to the user and getting
-/// explicit confirmation) and call this again.
+/// before persisting anything.
 /// `allowPlaintextFallback`: see `connectAccessToken`'s doc comment -- same
 /// consent gate, same rejection to catch and retry.
 export function connectSshKey(
@@ -290,13 +286,6 @@ export function connectSshKey(
   allowPlaintextFallback: boolean,
 ): Promise<void> {
   return invoke("connect_ssh_key", { remoteUrl, privateKeyOpenssh, passphrase, allowPlaintextFallback });
-}
-
-/// Persists explicit TOFU confirmation of `fingerprint` for `host` to
-/// Cerebrite's own known_hosts-equivalent file. Never call this without
-/// having actually shown the fingerprint to the user first.
-export function confirmSshHostKey(host: string, fingerprint: string): Promise<void> {
-  return invoke("confirm_ssh_host_key", { host, fingerprint });
 }
 
 /// Ticket 06's GitHub Device Authorization Grant sign-in. `startGithubDeviceFlow`

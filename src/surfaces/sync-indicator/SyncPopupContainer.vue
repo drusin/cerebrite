@@ -8,14 +8,7 @@
 // `openSyncSettingsFromPopup`.
 import { computed, ref, watch } from "vue";
 import { syncStatus } from "../../state/sync";
-import {
-  syncPopupOpen,
-  syncPopupAnchor,
-  closeSyncPopup,
-  openSettings,
-  registerOpenSettingsHandler,
-  type OpenSettingsOptions,
-} from "../../state/ui";
+import { syncPopupOpen, syncPopupAnchor, closeSyncPopup, openSettings } from "../../state/ui";
 import { syncIndicatorFor, type SyncCtaId } from "../../sync-status";
 import {
   getSyncDetails,
@@ -27,14 +20,10 @@ import {
 import { confirmDialog, messageDialog } from "../../dialogs";
 import SyncPopup from "./SyncPopup.vue";
 
-// Temporary callback root prop (state/ui.ts's doc comment has the full
-// rationale): the Settings side of `openSettings` -- Settings is still
-// vanilla, so the actual modal-opening/prefilling/scrolling logic still
-// lives in main.ts and arrives here as a root prop to register.
-const props = defineProps<{
-  openSettingsInVanilla: (options: OpenSettingsOptions) => void;
-}>();
-registerOpenSettingsHandler(props.openSettingsInVanilla);
+// Ticket 12: Settings itself is now Vue, so `openSettings` (below) needs no
+// registered callback root prop anymore -- see state/ui.ts's
+// `settingsDeepLink` doc comment. This retires this container's own
+// `openSettingsInVanilla` root prop.
 
 const indicator = computed(() => syncIndicatorFor(syncStatus.value));
 

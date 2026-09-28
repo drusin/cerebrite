@@ -13,6 +13,7 @@ import { computed, readonly, ref, type Ref } from "vue";
 import { openVault as openVaultCommand, type VaultInfo } from "../vault-api";
 import { refreshSyncStatus } from "./sync";
 import { setVaultView } from "./ui";
+import { reset as resetPages } from "./pages";
 
 const path: Ref<string | null> = ref(null);
 
@@ -22,13 +23,11 @@ export const vaultPath = readonly(path);
 /** Read-only outside this module -- derived from {@link vaultPath}. */
 export const vaultOpen = readonly(computed(() => path.value !== null));
 
-// Temporary callback (spec.md#islands-and-how-they-merge): page/trash state
-// doesn't move into `src/state/` until step 4, so loading them after a vault
-// opens still has to happen in still-vanilla code. Registered once by
-// whichever container mounts the vault picker -- mirrors `state/ui.ts`'s
-// `registerOpenSettingsHandler`. Delete this indirection -- and call
-// page-state's load actions directly from `openVault` below -- once step 4
-// lands.
+// Temporary callback (spec.md#islands-and-how-they-merge): registered once
+// by whichever container mounts the vault picker, so a vault open can load
+// page/trash state without this module importing `state/pages.ts` itself
+// (avoiding a cycle with {@link changeFolder} below, which does need that
+// import). Out of this ticket's scope to retire.
 export type VaultOpenedHandler = () => void | Promise<void>;
 let vaultOpenedHandler: VaultOpenedHandler | null = null;
 
@@ -66,4 +65,19 @@ export async function applyVaultOpened(folderPath: string): Promise<void> {
   setVaultView("workspace");
   await refreshSyncStatus();
   await vaultOpenedHandler?.();
+}
+
+/**
+ * Ticket 12's "Change folder…" action (spec.md#step-11-settings): a vault
+ * action, not a Settings-local handler, so it can do the one thing that
+ * genuinely belongs at this level -- resetting page state, since none of it
+ * (the open page, the page/trash lists, Recent) belongs to the vault being
+ * left. `folderPath` is already known (the container ran the native folder
+ * picker itself, same as every other native-dialog call -- spec.md#native-
+ * dialogs); rejects, leaving `vaultPath`/page state untouched, if the
+ * backend `open_vault` call itself fails, exactly like {@link openVault}.
+ */
+export async function changeFolder(folderPath: string): Promise<VaultInfo> {
+  resetPages();
+  return openVault(folderPath);
 }
