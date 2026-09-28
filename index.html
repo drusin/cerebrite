@@ -170,22 +170,11 @@
           <ul id="trash-list" class="page-list trash-list"></ul>
         </div>
 
-        <!-- Ticket 12: a persistent, quiet sync-status indicator -- never a
-             toast/banner (per issue 09's resolved decision). Reads
-             `get_sync_status` on load and stays live via `sync-status-changed`;
-             clicking opens `#sync-popup` (never auto-opens). -->
-        <div class="sidebar-footer">
-          <button
-            id="sync-status-button"
-            class="sync-status-button"
-            type="button"
-            aria-haspopup="dialog"
-            aria-expanded="false"
-          >
-            <span id="sync-status-icon" class="sync-status-icon" data-state="notConnected" aria-hidden="true">○</span>
-            <span id="sync-status-label" class="sync-status-label">Not connected</span>
-          </button>
-        </div>
+        <!-- Ticket 02: a persistent, quiet sync-status indicator -- never a
+             toast/banner (per issue 09's resolved decision). A Vue island
+             (`surfaces/sync-indicator/`) mounted here by `main.ts`; reads
+             `state/sync.ts` and opens the popup island (never auto-opens). -->
+        <div id="sync-indicator-footer-root" class="sidebar-footer"></div>
       </aside>
 
       <!-- Collapsed-state rail (desktop only): shown in place of the full
@@ -196,47 +185,18 @@
         <button id="sidebar-rail-search" class="sidebar-rail-button" type="button" aria-label="Search" title="Search">🔍</button>
         <button id="sidebar-rail-new-page" class="sidebar-rail-button" type="button" aria-label="New page" title="New page">+</button>
         <button id="sidebar-rail-settings" class="sidebar-rail-button" type="button" aria-label="Settings" title="Settings (Ctrl/Cmd+,)">⚙</button>
-        <!-- Ticket 12: same indicator as the expanded sidebar's footer, just
-             icon-only -- kept in sync by the same `applySyncIndicator` call. -->
-        <button
-          id="sidebar-rail-sync-status"
-          class="sidebar-rail-button sync-status-button"
-          type="button"
-          aria-haspopup="dialog"
-          aria-expanded="false"
-          aria-label="Sync status: not connected"
-          title="Sync status: not connected"
-        >
-          <span id="sync-status-icon-rail" class="sync-status-icon" data-state="notConnected" aria-hidden="true">○</span>
-        </button>
+        <!-- Ticket 02: same indicator as the expanded sidebar's footer, just
+             icon-only -- another instance of the same
+             `surfaces/sync-indicator/` island. -->
+        <div id="sync-indicator-rail-root"></div>
       </div>
 
-      <!-- Ticket 12: the sync-status popup -- opened only by clicking the
-           footer/rail icon, never auto-opened. Shows provider, last-synced
-           time, status text, a link into Settings' Sync section, and a
-           "Sync now" action that's always available. Closed by Escape or
-           clicking outside it.
-
-           Ticket 13: `#sync-popup-cause-actions` holds the cause-specific
-           CTA button(s) (`sync-status.ts`'s `ctasFor`) for a `needsAttention`
-           status -- empty/hidden for every other state, and for
-           `needsAttention` itself before ticket 13. `data-severity` on the
-           popup lets `refreshedSignInNotSaved`'s lower-key warning read
-           distinctly from a hard failure without being a separate icon
-           state. -->
-      <div id="sync-popup" class="sync-popup" hidden role="dialog" aria-label="Sync status">
-        <p class="sync-popup-status-line">
-          <span id="sync-popup-icon" class="sync-status-icon" data-state="notConnected" aria-hidden="true">○</span>
-          <span id="sync-popup-status-text" class="sync-popup-status-text">Not connected</span>
-        </p>
-        <p id="sync-popup-provider" class="sync-popup-detail" hidden></p>
-        <p id="sync-popup-last-synced" class="sync-popup-detail" hidden></p>
-        <div id="sync-popup-cause-actions" class="sync-popup-cause-actions" hidden></div>
-        <div class="sync-popup-actions">
-          <button id="sync-popup-sync-now-button" type="button">Sync now</button>
-          <button id="sync-popup-settings-link" type="button" class="sync-popup-settings-link">Sync settings…</button>
-        </div>
-      </div>
+      <!-- Ticket 02: the sync-status popup -- a Vue island
+           (`surfaces/sync-indicator/SyncPopupContainer.vue`) mounted here.
+           Opened only by clicking the footer/rail icon, never auto-opened.
+           Closed by Escape or clicking outside it (handled inside the
+           island itself now, not by `init`'s document listeners). -->
+      <div id="sync-popup-root"></div>
 
       <main id="page-view" class="page-view">
         <p id="page-view-empty" class="page-view-empty">Select a page from the list.</p>

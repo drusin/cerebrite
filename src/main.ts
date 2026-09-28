@@ -35,12 +35,6 @@ import {
   getCommitAuthor,
   confirmCommitAuthor,
   cloneAndOpenVault,
-  getSyncStatus,
-  getSyncDetails,
-  triggerSyncNow,
-  unlockKeychainAndRetrySync,
-  revealConflictBackups,
-  onSyncStatusChanged,
   disconnectVault,
   scanOrphanedConnections,
   cleanupOrphanedConnections,
@@ -58,10 +52,14 @@ import {
   type SshKeyInfo,
   type CloneCredential,
   type CommitAuthorPrefillResult,
-  type SyncStatus,
   type CredentialKind,
 } from "./vault-api";
-import { syncIndicatorFor, type SyncCtaId } from "./sync-status";
+import { mountIsland } from "./mount-island";
+import { refreshSyncStatus, syncStatus } from "./state/sync";
+import { openSettings, type OpenSettingsOptions } from "./state/ui";
+import SyncIndicatorContainer from "./surfaces/sync-indicator/SyncIndicatorContainer.vue";
+import SyncPopupContainer from "./surfaces/sync-indicator/SyncPopupContainer.vue";
+import { watch } from "vue";
 import {
   reduceWizard,
   initialWizardState,
@@ -158,28 +156,32 @@ const sidebarRailNewPageButtonEl = document.querySelector<HTMLButtonElement>("#s
 const settingsButtonEl = document.querySelector<HTMLButtonElement>("#settings-button");
 const sidebarRailSettingsButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-settings");
 
-// Ticket 12: the sidebar sync-status indicator -- footer icon (expanded
-// sidebar/compact drawer) plus the matching collapsed-rail icon, both kept
-// in sync by `applySyncIndicator`, and the popup either one opens.
-const syncStatusButtonEl = document.querySelector<HTMLButtonElement>("#sync-status-button");
-const syncStatusIconEl = document.querySelector<HTMLElement>("#sync-status-icon");
-const syncStatusLabelEl = document.querySelector<HTMLElement>("#sync-status-label");
-const sidebarRailSyncStatusButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-rail-sync-status");
-const sidebarRailSyncStatusIconEl = document.querySelector<HTMLElement>("#sync-status-icon-rail");
-const syncPopupEl = document.querySelector<HTMLElement>("#sync-popup");
-const syncPopupIconEl = document.querySelector<HTMLElement>("#sync-popup-icon");
-const syncPopupStatusTextEl = document.querySelector<HTMLElement>("#sync-popup-status-text");
-const syncPopupProviderEl = document.querySelector<HTMLElement>("#sync-popup-provider");
-const syncPopupLastSyncedEl = document.querySelector<HTMLElement>("#sync-popup-last-synced");
-const syncPopupCauseActionsEl = document.querySelector<HTMLElement>("#sync-popup-cause-actions");
-const syncPopupSyncNowButtonEl = document.querySelector<HTMLButtonElement>("#sync-popup-sync-now-button");
-const syncPopupSettingsLinkEl = document.querySelector<HTMLButtonElement>("#sync-popup-settings-link");
+// Ticket 02: the sidebar sync-status indicator (footer + rail icon) and its
+// popup are now the `surfaces/sync-indicator/` Vue island, mounted below at
+// `#sync-indicator-footer-root`/`#sync-indicator-rail-root`/
+// `#sync-popup-root`. Only Settings' still-vanilla "Sync" section elements
+// remain here.
 const syncSectionNotConnectedEl = document.querySelector<HTMLElement>("#sync-section-not-connected");
 const syncSectionConnectButtonEl = document.querySelector<HTMLButtonElement>("#sync-section-connect-button");
 // Ticket 14: "Disconnect…" (the inverse banner of the two above) plus the
 // standalone "Credentials" section's orphan notice and "Remove all" action.
 const syncSectionConnectedEl = document.querySelector<HTMLElement>("#sync-section-connected");
 const syncSectionDisconnectButtonEl = document.querySelector<HTMLButtonElement>("#sync-section-disconnect-button");
+
+// Ticket 02 (the pilot): the sync indicator/popup Vue islands, mounted at
+// module scope like every other DOM lookup here (the script is `defer`red,
+// so the DOM is already parsed by the time this file runs). Two indicator
+// instances share the same `state/sync.ts`/`state/ui.ts` state as the one
+// popup instance. `openSettingsInVanilla` is the popup's only temporary
+// callback root prop -- see its own doc comment below.
+const syncIndicatorFooterRootEl = document.querySelector<HTMLElement>("#sync-indicator-footer-root");
+const syncIndicatorRailRootEl = document.querySelector<HTMLElement>("#sync-indicator-rail-root");
+const syncPopupRootEl = document.querySelector<HTMLElement>("#sync-popup-root");
+if (syncIndicatorFooterRootEl) mountIsland(syncIndicatorFooterRootEl, SyncIndicatorContainer, { variant: "footer" });
+if (syncIndicatorRailRootEl) mountIsland(syncIndicatorRailRootEl, SyncIndicatorContainer, { variant: "rail" });
+if (syncPopupRootEl) {
+  mountIsland(syncPopupRootEl, SyncPopupContainer, { openSettingsInVanilla });
+}
 const settingsOrphanNoticeEl = document.querySelector<HTMLElement>("#settings-orphan-notice");
 const settingsOrphanCleanupButtonEl = document.querySelector<HTMLButtonElement>("#settings-orphan-cleanup-button");
 const settingsRemoveAllCredentialsButtonEl = document.querySelector<HTMLButtonElement>(
@@ -300,10 +302,6 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pageEditor: PageEditor | null = null;
 /** The currently open vault's folder path, shown in the Settings modal. */
 let currentVaultPath: string | null = null;
-/** Ticket 12: the last `SyncStatus` applied to the sidebar icon -- kept so
- * the Settings "Sync" section's not-connected banner can reflect it without
- * a separate fetch every time the modal opens. */
-let currentSyncStatus: SyncStatus = { state: "noRemote" };
 
 // --- Recent (issue 12) ---------------------------------------------------
 //
@@ -1461,223 +1459,28 @@ function updateSyncSubformVisibility() {
   });
 }
 
-// --- Ticket 12: sidebar sync-status indicator ------------------------------
+// --- Settings' still-vanilla "Sync" section ---------------------------------
 //
-// A persistent, quiet icon -- never a toast/banner -- with five states
-// (`syncIndicatorFor` in sync-status.ts does the actual `SyncStatus` ->
-// icon-state mapping, kept pure/testable there). This section owns the DOM
-// side: applying that mapping to both icon locations (expanded sidebar
-// footer + collapsed rail), and the click-to-open popup.
+// The sync indicator/popup themselves are `surfaces/sync-indicator/` (a
+// Vue island, see its own components for the `syncIndicatorFor` mapping and
+// the click-to-open popup). This section is what's left in main.ts: the
+// always-visible "Sync" section's not-connected/connected banners and its
+// raw sub-forms, none of which have migrated yet.
 
-/** Applies `status` to both sync-status icon locations (footer + rail) and,
- * if the popup is currently open, its own icon/status line too -- called on
- * load (`get_sync_status`) and on every `sync-status-changed` event, so the
- * icon "updates live" per the ticket without the frontend polling on a timer
- * of its own. Also refreshes the Settings "Sync" section's not-connected
- * banner, since that must never show stale state while Settings is open. */
-function applySyncIndicator(status: SyncStatus) {
-  currentSyncStatus = status;
-  const indicator = syncIndicatorFor(status);
-
-  for (const iconEl of [syncStatusIconEl, sidebarRailSyncStatusIconEl, syncPopupIconEl]) {
-    if (!iconEl) continue;
-    iconEl.textContent = indicator.glyph;
-    iconEl.dataset.state = indicator.iconState;
-  }
-  if (syncStatusLabelEl) syncStatusLabelEl.textContent = indicator.statusText;
-  const ariaLabel = `Sync status: ${indicator.statusText}`;
-  syncStatusButtonEl?.setAttribute("aria-label", ariaLabel);
-  sidebarRailSyncStatusButtonEl?.setAttribute("aria-label", ariaLabel);
-  sidebarRailSyncStatusButtonEl?.setAttribute("title", ariaLabel);
-  if (syncPopupStatusTextEl) syncPopupStatusTextEl.textContent = indicator.statusText;
-  // Ticket 13: `refreshedSignInNotSaved`'s lower-key warning reads
-  // distinctly from a hard failure via this attribute alone -- it's still
-  // the same `needsAttention` icon state, not a separate one (per the
-  // ticket's "not a separate top-level state" requirement).
-  if (indicator.severity === "warning") {
-    syncPopupEl?.setAttribute("data-severity", "warning");
-  } else {
-    syncPopupEl?.removeAttribute("data-severity");
-  }
-  renderSyncPopupCtas(indicator.ctas);
-
-  updateSyncSectionNotConnectedBanner();
-}
-
-/** Ticket 12 checklist item 5: the plain "Not connected -- connect a
- * repository" message, shown only while `currentSyncStatus` is `NoRemote` --
- * never nags otherwise. Called whenever the status changes and whenever
- * Settings opens, so it can't go stale while the modal is up. */
+/** Ticket 02: the Settings "Sync" section's not-connected/connected banners
+ * now read `state/sync.ts` directly instead of being written by the old
+ * `applySyncIndicator` -- driven by the `watch` below, so it can't go stale
+ * while the modal happens to be open. */
 function updateSyncSectionNotConnectedBanner() {
   if (!syncSectionNotConnectedEl) return;
-  syncSectionNotConnectedEl.hidden = currentSyncStatus.state !== "noRemote";
+  syncSectionNotConnectedEl.hidden = syncStatus.value.state !== "noRemote";
   // Ticket 14: the "Disconnect…" button's own banner is the exact inverse --
   // shown whenever this vault has *some* connection configured, regardless
   // of whether that connection is currently healthy (a needs-attention
   // connection is still one Disconnect should be able to tear down).
-  if (syncSectionConnectedEl) syncSectionConnectedEl.hidden = currentSyncStatus.state === "noRemote";
+  if (syncSectionConnectedEl) syncSectionConnectedEl.hidden = syncStatus.value.state === "noRemote";
 }
-
-/** Loads the current sync status once (on app start, and again once a vault
- * finishes opening) -- live updates after that come from
- * `sync-status-changed` alone, not further polling. */
-async function refreshSyncStatus() {
-  try {
-    applySyncIndicator(await getSyncStatus());
-  } catch {
-    // No vault open yet, or the command otherwise unavailable -- leave the
-    // icon at its default "not connected" state rather than erroring.
-  }
-}
-
-function isSyncPopupOpen(): boolean {
-  return !!syncPopupEl && !syncPopupEl.hasAttribute("hidden");
-}
-
-/** Positions `#sync-popup` just above/beside whichever icon (footer or
- * rail, whichever is actually visible) was clicked, then shows it and loads
- * the popup-only detail (`get_sync_details`) -- never auto-opened, only in
- * response to a click, per the ticket. */
-function openSyncPopup(anchor: HTMLElement) {
-  if (!syncPopupEl) return;
-  const anchorRect = anchor.getBoundingClientRect();
-  syncPopupEl.style.left = `${Math.round(anchorRect.left)}px`;
-  syncPopupEl.style.bottom = `${Math.round(window.innerHeight - anchorRect.top + 8)}px`;
-  syncPopupEl.style.top = "auto";
-  syncPopupEl.removeAttribute("hidden");
-  syncStatusButtonEl?.setAttribute("aria-expanded", "true");
-  sidebarRailSyncStatusButtonEl?.setAttribute("aria-expanded", "true");
-  void refreshSyncPopupDetails();
-}
-
-function closeSyncPopup() {
-  if (!syncPopupEl) return;
-  syncPopupEl.setAttribute("hidden", "");
-  syncStatusButtonEl?.setAttribute("aria-expanded", "false");
-  sidebarRailSyncStatusButtonEl?.setAttribute("aria-expanded", "false");
-}
-
-function toggleSyncPopup(anchor: HTMLElement) {
-  if (isSyncPopupOpen()) {
-    closeSyncPopup();
-  } else {
-    openSyncPopup(anchor);
-  }
-}
-
-/** Fills the popup's provider/last-synced lines from `get_sync_details` --
- * fetched only when the popup actually opens (ticket 12 checklist item 3),
- * not on every status change. */
-async function refreshSyncPopupDetails() {
-  if (!syncPopupProviderEl || !syncPopupLastSyncedEl) return;
-  try {
-    const details = await getSyncDetails();
-    if (details.provider) {
-      syncPopupProviderEl.textContent = details.provider;
-      syncPopupProviderEl.removeAttribute("hidden");
-    } else {
-      syncPopupProviderEl.setAttribute("hidden", "");
-    }
-    if (details.lastSyncedAt != null) {
-      const date = new Date(details.lastSyncedAt * 1000);
-      syncPopupLastSyncedEl.textContent = `Last synced: ${date.toLocaleString()}`;
-      syncPopupLastSyncedEl.removeAttribute("hidden");
-    } else {
-      syncPopupLastSyncedEl.setAttribute("hidden", "");
-    }
-  } catch {
-    syncPopupProviderEl.setAttribute("hidden", "");
-    syncPopupLastSyncedEl.setAttribute("hidden", "");
-  }
-}
-
-/** "Sync now" (ticket 12 checklist item 4): triggers an immediate attempt
- * independent of the background timer. The resulting status change arrives
- * via `sync-status-changed` like any other transition -- this doesn't wait
- * for or reflect the outcome itself, just fires the attempt. */
-async function handleSyncNowClick() {
-  if (!syncPopupSyncNowButtonEl) return;
-  syncPopupSyncNowButtonEl.setAttribute("disabled", "");
-  try {
-    await triggerSyncNow();
-  } catch {
-    // No vault open -- nothing to sync; the button simply has no effect.
-  } finally {
-    syncPopupSyncNowButtonEl.removeAttribute("disabled");
-  }
-}
-
-// --- Ticket 13: per-cause needs-attention CTAs -----------------------------
-//
-// `sync-status.ts`'s `ctasFor` maps a `SyncFailureCause` to zero or more
-// `{ id, label }` buttons; this section renders them into
-// `#sync-popup-cause-actions` and wires each `id` to its actual handler.
-
-/** Clears and re-renders the popup's cause-specific CTA buttons -- called
- * from `applySyncIndicator` on every status change, same as the rest of the
- * popup's content, so it never goes stale while the popup happens to be
- * open. */
-function renderSyncPopupCtas(ctas: { id: SyncCtaId; label: string }[]) {
-  if (!syncPopupCauseActionsEl) return;
-  syncPopupCauseActionsEl.replaceChildren();
-  if (ctas.length === 0) {
-    syncPopupCauseActionsEl.setAttribute("hidden", "");
-    return;
-  }
-  syncPopupCauseActionsEl.removeAttribute("hidden");
-  for (const cta of ctas) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = cta.label;
-    button.addEventListener("click", () => void handleSyncCtaClick(cta.id));
-    syncPopupCauseActionsEl.appendChild(button);
-  }
-}
-
-function handleSyncCtaClick(id: SyncCtaId): Promise<void> {
-  switch (id) {
-    case "reconnect":
-      return openQuickReconnect();
-    case "unlockAndRetry":
-      return handleUnlockAndRetryClick();
-    case "setUpKeychain":
-      return handleSetUpKeychainClick();
-    case "storeAsPlaintext":
-      return handleStoreAsPlaintextClick();
-    case "retrySync":
-      return handleSyncNowClick();
-    case "openConflictBackups":
-      return handleOpenConflictBackupsClick();
-  }
-}
-
-/** Ticket 13 checklist item 1: "Reconnect" for a rejected/expired/revoked
- * credential (any kind, including a mismatched/unconfirmed SSH host key --
- * re-establishing the connection is the fix either way). Jumps straight
- * into the matching credential-kind sub-form of the always-visible "Sync"
- * section (ticket 11), pre-filled with the already-known repository URL,
- * rather than restarting the guided connect wizard from the top. The
- * credential itself still has to be re-entered/re-authorized -- there is no
- * way to recover a rejected token/key without the user's involvement -- but
- * the provider and repository are carried over so they don't have to be. */
-async function openQuickReconnect(): Promise<void> {
-  closeSyncPopup();
-  let remoteUrl = "";
-  let subformKind = "accessToken";
-  try {
-    const details = await getSyncDetails();
-    remoteUrl = details.remoteUrl ?? "";
-    subformKind = syncSubformKindFor(details.credentialKind, details.provider);
-  } catch {
-    // No vault open, or the command otherwise unavailable -- still open the
-    // manual Sync section (unprefilled) rather than doing nothing.
-  }
-  openSyncManualForm(remoteUrl);
-  if (syncCredentialKindEl) {
-    syncCredentialKindEl.value = subformKind;
-    updateSyncSubformVisibility();
-  }
-}
+watch(syncStatus, updateSyncSectionNotConnectedBanner, { immediate: true });
 
 /** Maps a connection's stored `credentialKind` (+ `provider`, for
  * `oauth_sign_in`, which doesn't say by itself whether it's GitHub's or
@@ -1695,15 +1498,6 @@ function syncSubformKindFor(credentialKind: CredentialKind | null, provider: str
     case "access_token":
     case null:
       return "accessToken";
-  }
-}
-
-/** Ticket 13 checklist item 2: "Unlock and retry" for `keychainLocked`. */
-async function handleUnlockAndRetryClick(): Promise<void> {
-  try {
-    await unlockKeychainAndRetrySync();
-  } catch (e) {
-    alertBrowser(`Couldn't unlock the keychain: ${e}`);
   }
 }
 
@@ -1730,63 +1524,6 @@ async function withPlaintextFallbackConsent<T>(attempt: (allowPlaintextFallback:
     if (!confirmed) throw err;
     return attempt(true);
   }
-}
-
-/** Ticket 13 checklist item 3: "Set up a keychain" for `keychainUnavailable`.
- * There's no in-app way to install/start an OS keychain daemon -- this is
- * guidance plus a nudge toward "Retry sync" (always available in the popup)
- * once the user has done that outside the app. */
-function handleSetUpKeychainClick(): Promise<void> {
-  alertBrowser(
-    "No keychain could be reached. Set up or unlock your system's credential " +
-      "store (e.g. start your desktop's Secret Service/keychain daemon), then " +
-      'use "Sync now" below to retry.',
-  );
-  return Promise.resolve();
-}
-
-/** Ticket 13 checklist item 3: "Store as plaintext instead" for
- * `keychainUnavailable` -- reusing ticket 02's plaintext-fallback mechanism
- * (`credential::PlaintextStore`) and its consent requirement (ADR-0013),
- * which had no frontend consent dialog to reuse yet, so this is that
- * dialog's first, minimal (`window.confirm`-based) implementation. If the
- * secret this connection needs was only ever in the now-unreachable
- * keychain, there's no way to recover it without the user re-entering it --
- * confirming here jumps into the same quick-reconnect sub-form "Reconnect"
- * uses; every connect_* command already falls back to plaintext storage
- * automatically whenever a keychain probe fails (see `lib.rs`'s
- * `connect_access_token`/`connect_ssh_key`/etc.), so re-entering the
- * credential here naturally lands in plaintext storage without a separate
- * "force plaintext" flag. */
-async function handleStoreAsPlaintextClick(): Promise<void> {
-  const confirmed = confirmBrowser(
-    "Store this connection's credential as a plaintext file instead of the " +
-      "system keychain? This is less secure than the keychain, and should " +
-      "only be used when no keychain is available. You'll need to re-enter " +
-      "the credential.",
-  );
-  if (!confirmed) return;
-  await openQuickReconnect();
-}
-
-/** Ticket 13 checklist item 5: "Open backup folder" for `conflict` --
- * reveals `.cerebrite/conflict-backups/` in the system file manager; no
- * in-app conflict-resolution UI, per the ticket. */
-async function handleOpenConflictBackupsClick(): Promise<void> {
-  try {
-    await revealConflictBackups();
-  } catch (e) {
-    alertBrowser(`Couldn't open the conflict-backups folder: ${e}`);
-  }
-}
-
-/** The popup's "Sync settings…" link and the not-connected banner's
- * "Connect…" button both close the popup and open Settings' "Sync" section
- * -- reusing `openSyncManualForm`'s scroll-into-view, ticket 11's existing
- * entry point, rather than duplicating it. */
-function openSyncSettingsFromPopup() {
-  closeSyncPopup();
-  openSyncManualForm("");
 }
 
 /** Holds the generated/imported key between "Generate"/"Import" and "Connect" -- mirrors `wizardSshKey`. */
@@ -1854,21 +1591,30 @@ async function handleSettingsSshKeyConnectClick() {
 }
 
 /**
- * Ticket 11's carry-over into the manual "Sync" section: prefills every
- * sub-form's own repository URL field with `remoteUrl` (whatever the wizard
- * had already committed, if anything) so the user doesn't have to retype a
- * URL they already entered, even though which sub-form ends up visible
- * depends on the credential kind they pick next. Per the ticket, re-asking
- * for a credential is an accepted limitation -- this just avoids re-asking
- * for the URL too, where it's cheap to.
+ * Ticket 02: the vanilla side of `state/ui.ts`'s `openSettings` deep-link
+ * action, passed to the sync popup island as its `openSettingsInVanilla`
+ * temporary callback root prop (Settings itself hasn't migrated to Vue yet).
+ * Replaces the old `openSyncManualForm`/`openQuickReconnect`, which wrote
+ * into Settings' DOM directly instead of going through a shared action.
+ * Prefills every sub-form's own repository URL field with `prefillUrl`
+ * (whatever's already known, if anything) so the user doesn't have to
+ * retype a URL they already entered, and preselects the credential-kind
+ * sub-form when `credentialKind` is known. Per ticket 11's original
+ * decision, re-asking for the credential itself is an accepted limitation.
  */
-function openSyncManualForm(remoteUrl: string) {
+function openSettingsInVanilla(options: OpenSettingsOptions): void {
   openSettingsModal();
+  if (options.section !== "sync") return;
+  const remoteUrl = options.prefillUrl ?? "";
   if (remoteUrl) {
     if (settingsConnectUrlEl) settingsConnectUrlEl.value = remoteUrl;
     if (settingsSshKeyUrlEl) settingsSshKeyUrlEl.value = remoteUrl;
     if (settingsGithubUrlEl) settingsGithubUrlEl.value = remoteUrl;
     if (settingsGitlabUrlEl) settingsGitlabUrlEl.value = remoteUrl;
+  }
+  if (options.credentialKind !== undefined && syncCredentialKindEl) {
+    syncCredentialKindEl.value = syncSubformKindFor(options.credentialKind, options.provider ?? null);
+    updateSyncSubformVisibility();
   }
   document.getElementById("sync-section")?.scrollIntoView({ block: "start" });
 }
@@ -2176,13 +1922,13 @@ function closeConnectWizard() {
  * Ticket 11's "Switch to manual setup" escape hatch: closes this wizard's
  * own chrome and opens Settings' always-visible "Sync" section instead,
  * carrying over `wizardState.remoteUrl` if the wizard had already committed
- * one (a pasted/created/picked repository URL) -- see `openSyncManualForm`'s
+ * one (a pasted/created/picked repository URL) -- see `openSettingsInVanilla`'s
  * doc comment for what "carrying over" does and doesn't cover.
  */
 function handleWizardManualSetupClick() {
   const remoteUrl = wizardState.remoteUrl ?? "";
   closeConnectWizard();
-  openSyncManualForm(remoteUrl);
+  openSettings({ section: "sync", prefillUrl: remoteUrl });
 }
 
 function providerLabel(provider: WizardProvider | null): string {
@@ -3685,38 +3431,15 @@ async function init() {
   sidebarRailSettingsButtonEl?.addEventListener("click", openSettingsModal);
   settingsChangeFolderButtonEl?.addEventListener("click", () => void handleChangeVaultFolderClick());
   settingsThemeRadios.forEach((radio) => radio.addEventListener("change", (e) => void handleThemeRadioChange(e)));
-  // Ticket 12: sidebar sync-status icon (footer + collapsed rail) and its
-  // click-to-open popup -- never auto-opened.
-  syncStatusButtonEl?.addEventListener("click", () => {
-    if (syncStatusButtonEl) toggleSyncPopup(syncStatusButtonEl);
-  });
-  sidebarRailSyncStatusButtonEl?.addEventListener("click", () => {
-    if (sidebarRailSyncStatusButtonEl) toggleSyncPopup(sidebarRailSyncStatusButtonEl);
-  });
-  document.addEventListener("click", (event) => {
-    if (!isSyncPopupOpen()) return;
-    const target = event.target as Node;
-    if (
-      syncPopupEl?.contains(target) ||
-      syncStatusButtonEl?.contains(target) ||
-      sidebarRailSyncStatusButtonEl?.contains(target)
-    ) {
-      return;
-    }
-    closeSyncPopup();
-  });
-  window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && isSyncPopupOpen()) {
-      closeSyncPopup();
-    }
-  });
-  syncPopupSyncNowButtonEl?.addEventListener("click", () => void handleSyncNowClick());
-  syncPopupSettingsLinkEl?.addEventListener("click", openSyncSettingsFromPopup);
+  // Ticket 02: the sidebar sync-status icon (footer + rail) and its popup
+  // are now the `surfaces/sync-indicator/` Vue island (mounted near the top
+  // of this file, at module scope) -- it owns its own click-to-open/Escape/
+  // outside-click handling, replacing everything that used to be wired up
+  // here.
   syncSectionConnectButtonEl?.addEventListener("click", openConnectWizard);
   syncSectionDisconnectButtonEl?.addEventListener("click", () => void handleDisconnectClick());
   settingsOrphanCleanupButtonEl?.addEventListener("click", () => void handleOrphanCleanupClick());
   settingsRemoveAllCredentialsButtonEl?.addEventListener("click", () => void handleRemoveAllCredentialsClick());
-  void onSyncStatusChanged(applySyncIndicator);
   void refreshSyncStatus();
 
   connectWizardOpenButtonEl?.addEventListener("click", openConnectWizard);
