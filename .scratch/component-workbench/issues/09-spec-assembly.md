@@ -1,7 +1,7 @@
 # Assemble the handoff spec
 
 Type: task
-Status: open
+Status: resolved
 Blocked by: 08
 
 ## Question
@@ -16,3 +16,13 @@ It must cover:
 - **The out-of-scope list** from the map.
 
 The spec should be written so that the implementation map can turn each migration step into one ticket.
+
+## Answer
+
+**Done: [spec.md](../spec.md).** It covers tooling (Vue 3, `vue-tsc`, Storybook 10 `vue3-vite` with themes and viewports, the npm scripts, and the CI `storybook build`), the surface contract, the editor wrapper and `commit`, and the 13 migration steps. Each step section can be copied into one implementation ticket: scope, state moved, expected temporary callbacks, and the stories list taken from the surface inventory. Every step shares the same definition of done and the same checks. The spec ends with the out-of-scope list.
+
+No gaps needed a new ticket. A few placements are direct consequences of existing decisions, not new ones:
+- **Theme** moves into `src/state/` in step 11, since Settings holds the theme radios.
+- **Search** switches to `<Modal>`, and the clone surfaces switch to `DeviceFlow`, `SshKey`, `CommitAs`, and `CredentialKindForm`, in the step that extracts each one (extract on second copy).
+- **The editor exposes only `scrollToHeading`** (`getMarkdown` is not exposed), because data leaves a surface only through emits.
+- **The dead `#greet-input` rule** has no owning surface, so it is deleted in step 12's cleanup.
