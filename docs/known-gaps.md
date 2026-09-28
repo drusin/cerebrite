@@ -127,30 +127,32 @@ review's findings — below — are left for a human to pick up.
 
 ## Blocking manual follow-up (must happen before this ships)
 
-- **GitHub App not registered.** `src-tauri/src/github_oauth.rs` has
-  placeholder `GITHUB_CLIENT_ID`/`GITHUB_APP_SLUG` constants
-  (`"TODO_REGISTER_GITHUB_APP"`). A human needs to register Cerebrite as a
-  GitHub App (Device Flow enabled, "Contents: Read and write" scope) and
-  swap in the real values. Until then, "Sign in with GitHub" cannot work.
-- **GitLab application not registered, and its live spike (ticket 07) was
-  never run.** `src-tauri/src/gitlab_oauth.rs` has a placeholder
-  `GITLAB_CLIENT_ID`. Three facts ticket 07 flagged as needing a live test
-  against gitlab.com are still unverified: whether `write_repository` scope
-  alone is enough to `git push`, whether the device grant actually returns a
-  refresh token, and whether refresh works with no client secret. The code
-  handles both possible outcomes defensively (see
+- **(done)** GitHub App registered as `cerebrite-app` (Device Flow, "Contents:
+  Read and write"). `src-tauri/src/github_oauth.rs`'s `GITHUB_CLIENT_ID`/
+  `GITHUB_APP_SLUG` now hold the real values (commit `d77387b`). The manual
+  smoke test against a real GitHub repository (ticket 06's checklist) still
+  hasn't been run.
+- **GitLab application registered, but its live spike (ticket 07) still
+  hasn't been run.** `src-tauri/src/gitlab_oauth.rs`'s `GITLAB_CLIENT_ID` now
+  holds the real (non-confidential) application ID (commit `d77387b`). Three
+  facts ticket 07 flagged as needing a live test against gitlab.com remain
+  unverified: whether `write_repository` scope alone is enough to `git
+  push`, whether the device grant actually returns a refresh token, and
+  whether refresh works with no client secret. The code handles both
+  possible outcomes defensively (see
   `gitlab_oauth::OauthSecret.refresh_token: Option<String>` and
   `SyncFailureCause::OauthReconnectRequired`), but which branch is real is
   unconfirmed.
-- **No real manual QA.** Nothing in the sandbox that implemented this could
-  exercise the actual running Tauri app — no wizard, popup, or OS
-  keychain/Secret-Service prompt was ever clicked through by a human. Ticket
-  05 (SSH) is the one exception with real end-to-end coverage, via an
-  in-sandbox `sshd` fixture. Also untested against real infrastructure: the
-  access-token path (ticket 04) against a real non-GitHub/GitLab host, and
-  the OS keychain backends (Windows Credential Manager, Linux Secret
-  Service) — this sandbox has no Secret Service daemon, so ticket 02's
-  keyring integration was only exercised against an in-memory fake store.
+- **No real manual QA yet.** Nothing has exercised the actual running Tauri
+  app — no wizard, popup, or OS keychain/Secret-Service prompt has been
+  clicked through by a human. Ticket 05 (SSH) is the one exception with real
+  end-to-end coverage, via an in-sandbox `sshd` fixture. Also untested
+  against real infrastructure: the access-token path (ticket 04) against a
+  real non-GitHub/GitLab host, and the OS keychain backends (Windows
+  Credential Manager, Linux Secret Service) — the sandbox that implemented
+  this had no Secret Service daemon, so ticket 02's keyring integration was
+  only exercised against an in-memory fake store. GitHub and GitLab sign-in
+  are pending a manual test drive once CI is green on commit `d77387b`.
 
 ## Bugs / correctness gaps
 
