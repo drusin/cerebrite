@@ -59,7 +59,8 @@ import SyncIndicatorContainer from "./surfaces/sync-indicator/SyncIndicatorConta
 import SyncPopupContainer from "./surfaces/sync-indicator/SyncPopupContainer.vue";
 import SearchModalContainer from "./surfaces/search/SearchModalContainer.vue";
 import VaultPickerContainer from "./surfaces/vault-picker/VaultPickerContainer.vue";
-import { watch } from "vue";
+import PageEditorContainer from "./surfaces/page-editor/PageEditorContainer.vue";
+import { createApp, watch } from "vue";
 import {
   reduceWizard,
   initialWizardState,
@@ -85,13 +86,7 @@ import {
 // `window.alert`, and why a few pre-existing call sites still use those
 // broken globals unchanged.
 import { confirmDialog, messageDialog, promptDialog, confirmBrowser, alertBrowser } from "./dialogs";
-import { PageEditor } from "./page-editor";
 import { humanizeHeadingSlug } from "./heading-slug";
-
-// Autosave debounce: fires this long after the last edit with no further
-// typing, rather than on every keystroke or requiring an explicit "save"
-// action -- see issue 03's save-trigger note.
-const AUTOSAVE_DEBOUNCE_MS = 1500;
 
 // Ticket 10: the guided clone wizard's full-screen DOM handles. Its entry
 // point is now the `surfaces/vault-picker/` Vue island's "I already have a
@@ -192,7 +187,6 @@ const settingsRemoveAllCredentialsStatusEl = document.querySelector<HTMLElement>
 const pageViewEmptyEl = document.querySelector<HTMLElement>("#page-view-empty");
 const pageArticleEl = document.querySelector<HTMLElement>("#page-article");
 const pageTitleEl = document.querySelector<HTMLElement>("#page-title");
-const pageBodyEl = document.querySelector<HTMLElement>("#page-body");
 const backlinksListEl = document.querySelector<HTMLUListElement>("#backlinks-list");
 const backlinksEmptyEl = document.querySelector<HTMLElement>("#backlinks-empty");
 const renamePageButtonEl = document.querySelector<HTMLButtonElement>("#rename-page-button");
@@ -236,6 +230,47 @@ if (vaultPickerRootEl) {
     openCloneManualInVanilla: () => openCloneManualDialog(),
   });
 }
+
+// Ticket 06: the editor is now the `surfaces/page-editor/` Vue island,
+// mounted at `#page-editor-root` (replacing `#page-body`). Its one
+// temporary callback root prop, `openPageByTitleInVanilla`, is the same
+// link-click navigation the search modal already uses above.
+//
+// Mounted directly (not via `mountIsland`) so `pageEditorHandle` below can
+// keep a typed reference to the container's own `defineExpose` --
+// `mountIsland` intentionally returns only the `App` (see its own doc
+// comment), which doesn't expose that. This is the one place `main.ts`
+// still needs an imperative handle into an island, for `scrollToHeading`
+// (spec.md#imperative-escape-hatches) -- the rest of the click-through-to-
+// heading wiring (like the rest of the article view) stays here until
+// ticket 07 gives it a proper home.
+const pageEditorRootEl = document.querySelector<HTMLElement>("#page-editor-root");
+let pageEditorHandle: { scrollToHeading(slug: string): boolean } | null = null;
+if (pageEditorRootEl) {
+  const pageEditorApp = createApp(PageEditorContainer, { openPageByTitleInVanilla });
+  pageEditorHandle = pageEditorApp.mount(pageEditorRootEl) as unknown as { scrollToHeading(slug: string): boolean };
+}
+
+/**
+ * Calls the mounted editor's exposed `scrollToHeading`, retrying briefly:
+ * a fresh navigation reloads the editor's content asynchronously (the
+ * wrapper's own `pageKey` watcher awaits `PageEditor.load()`), so the
+ * heading's DOM node may not exist yet the instant this is called. Bounded
+ * and self-cancelling -- once `scrollToHeading` returns `true`, or the
+ * budget runs out, it stops. A no-op if nothing is mounted yet.
+ */
+function scrollToHeadingWhenReady(slug: string) {
+  const attempts = 20;
+  const intervalMs = 25;
+  let tries = 0;
+  const tick = () => {
+    if (pageEditorHandle?.scrollToHeading(slug)) return;
+    tries += 1;
+    if (tries < attempts) setTimeout(tick, intervalMs);
+  };
+  tick();
+}
+
 watch(
   vaultView,
   (view) => {
@@ -337,15 +372,19 @@ const connectWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#
 // Ticket 05: the open page, page list, trash list, and Recent all moved
 // into `state/pages.ts` (`pagesState.openPage`/`pagesState.pages`/
 // `pagesState.trash`/`pagesState.recent`, all read-only) -- this file keeps
-// only the rendering that reads them and the editor/autosave machinery that
-// doesn't belong in a DOM-free state module. `watch()` below replaces the
-// old tightly-coupled fetch+render (`loadPages`/`loadTrash`/
-// `recordRecentOpen`/`pruneRecentEntries` each called their own
-// `renderPageList`/`renderTrashList`/`renderRecentList` inline): the state
-// module's actions just update state, and rendering reacts to it, same
-// pattern as `watch(vaultView, ...)` above.
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let pageEditor: PageEditor | null = null;
+// only the rendering that reads them. `watch()` below replaces the old
+// tightly-coupled fetch+render (`loadPages`/`loadTrash`/`recordRecentOpen`/
+// `pruneRecentEntries` each called their own `renderPageList`/
+// `renderTrashList`/`renderRecentList` inline): the state module's actions
+// just update state, and rendering reacts to it, same pattern as
+// `watch(vaultView, ...)` above.
+//
+// Ticket 06: the editor and its autosave (`saveTimer`/`pageEditor`/
+// `scheduleAutosave`/`flushSave`/`flushPendingSaveForCurrentPage`, all
+// removed from this file) are now `surfaces/page-editor/`'s Vue island,
+// mounted below at `#page-editor-root`. Its container owns the debounce and
+// the immediate save-on-`commit` that fixes the lost-edit bug -- see its
+// own doc comments.
 
 watch(pagesState.pages, (list) => renderPageList(list), { immediate: true });
 watch(pagesState.trash, (list) => renderTrashList(list), { immediate: true });
@@ -379,49 +418,6 @@ function renderRecentList(entries: readonly pagesState.RecentEntry[]) {
   }
 
   highlightActivePage();
-}
-
-/**
- * Cancels any pending debounced autosave and immediately saves `markdown`
- * against whichever page is currently open, if not already saved.
- *
- * Branches per ADR-0009: a persisted page just saves normally; a dynamic
- * page materializes first (same mechanics as the explicit "new page"
- * action, issue 04) and then becomes the persisted page from now on.
- */
-async function flushSave(markdown: string) {
-  if (saveTimer !== null) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
-  }
-  const current = pagesState.openPage.value;
-  if (!current) return;
-
-  try {
-    if (current.kind === "persisted") {
-      await pagesState.save(current.id, markdown);
-    } else {
-      await pagesState.materialize(current.title, markdown);
-    }
-  } catch (err) {
-    console.error("Failed to save page", err);
-  }
-}
-
-function scheduleAutosave(markdown: string) {
-  if (saveTimer !== null) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    void flushSave(markdown);
-  }, AUTOSAVE_DEBOUNCE_MS);
-}
-
-/** Flushes any pending save for the page currently loaded in the editor before switching away from it. */
-async function flushPendingSaveForCurrentPage() {
-  if (saveTimer === null || !pagesState.openPage.value || !pageEditor) return;
-  const markdown = pageEditor.getMarkdown();
-  if (markdown === null) return;
-  await flushSave(markdown);
 }
 
 function highlightActivePage() {
@@ -525,14 +521,16 @@ async function renderBacklinks(title: string) {
 }
 
 /**
- * Renders the title/body into the article view and (re)loads them into the
- * editor. `headingSlug` (ticket 07), if given, is the target heading of the
- * `[[Page#Heading]]` link that navigated here -- once the fresh content is
- * mounted, the matching heading (if any) is scrolled into view.
+ * Renders the title into the article view. The body itself is no longer
+ * this function's job as of ticket 06 -- `openResolution` below already
+ * called `pagesState.open(resolution)`, which updates `openPageMarkdown`/
+ * `openPageKey`, and the `surfaces/page-editor/` island reacts to that on
+ * its own. `headingSlug` (ticket 07), if given, is the target heading of
+ * the `[[Page#Heading]]` link that navigated here -- once the (async)
+ * reload lands, the matching heading (if any) is scrolled into view.
  */
 async function renderPageArticle(
   title: string,
-  body: string,
   headingSlug?: string | null,
   options?: {
     /** Whether the "Delete page" button should be offered at all -- only a persisted, non-trashed page is deletable. */
@@ -568,27 +566,14 @@ async function renderPageArticle(
       inTrash && trashedFilename ? () => void handleRestoreClick(trashedFilename) : null;
   }
 
-  if (pageBodyEl) {
-    if (!pageEditor) {
-      // `pagesState.openPage`/`scheduleAutosave` are read at callback time
-      // (not captured here), so this single instance stays correct across
-      // page switches -- including a dynamic page turning into a persisted
-      // one mid-session.
-      pageEditor = new PageEditor(
-        pageBodyEl,
-        (markdown) => scheduleAutosave(markdown),
-        (linkTitle) => void openPageByTitle(linkTitle)
-      );
-    }
-    await pageEditor.load(body);
-
-    // Click-through-to-heading (ticket 07): a link to a heading that
-    // doesn't (yet) exist on the target page is simply a no-op scroll here
-    // -- the page itself still opens normally, per the ticket's "behaves
-    // like a dynamic-page link at the page level" acceptance criterion.
-    if (headingSlug) {
-      pageEditor.scrollToHeading(headingSlug);
-    }
+  // Click-through-to-heading (ticket 07): a link to a heading that doesn't
+  // (yet) exist on the target page is simply a no-op scroll -- the page
+  // itself still opens normally, per the ticket's "behaves like a
+  // dynamic-page link at the page level" acceptance criterion.
+  // `scrollToHeadingWhenReady` retries briefly since the editor island
+  // reloads asynchronously (see its own doc comment above).
+  if (headingSlug) {
+    scrollToHeadingWhenReady(headingSlug);
   }
 
   // Always appended at the bottom of the page's rendered content (issue 06),
@@ -617,20 +602,21 @@ async function openResolution(resolution: PageResolution) {
   // below regardless of this early return.
   if (alreadyOpen) {
     pagesState.open(resolution);
-    if (resolution.headingSlug) pageEditor?.scrollToHeading(resolution.headingSlug);
+    if (resolution.headingSlug) scrollToHeadingWhenReady(resolution.headingSlug);
     return;
   }
 
-  // Persist any unsaved edit on the page we're leaving before switching.
-  await flushPendingSaveForCurrentPage();
-
+  // Ticket 06: no more explicit pre-switch flush here -- `pagesState.open`
+  // below updates `openPageKey`, which the editor island's wrapper watches;
+  // its own `commit` flush (the lost-edit fix) fires from that, not from a
+  // synchronous call this function has to remember to make first.
   pagesState.open(resolution);
   highlightActivePage();
 
   if (resolution.kind === "persisted") {
     const inTrash = resolution.inTrash ?? false;
     const trashedFilename = resolution.trashedFilename ?? null;
-    await renderPageArticle(resolution.title, resolution.body, resolution.headingSlug, {
+    await renderPageArticle(resolution.title, resolution.headingSlug, {
       deletable: true,
       pageId: resolution.id,
       inTrash,
@@ -642,7 +628,7 @@ async function openResolution(resolution: PageResolution) {
     // normalized title, until the first write materializes it. Per the
     // ticket, a heading-specific dynamic target isn't a thing, so
     // `resolution.headingSlug` is intentionally not passed through here.
-    await renderPageArticle(resolution.normalizedTitle, "");
+    await renderPageArticle(resolution.normalizedTitle);
   }
 }
 
@@ -764,7 +750,11 @@ async function handleRenamePageClick(id: string, currentTitle: string) {
     if (currentPageNeedsReload && current?.kind === "persisted") {
       const page = await getPage(current.id);
       if (pageTitleEl) pageTitleEl.textContent = page.title;
-      await pageEditor?.load(page.body);
+      // The renamed page's own id (and so `openPageKey`) doesn't change --
+      // the editor island's wrapper only reloads on a `pageKey` change, so
+      // a same-id content refresh needs this forced-reload action instead
+      // (ticket 06; see its own doc comment in state/pages.ts).
+      pagesState.reloadOpenPage(page.body);
       await renderBacklinks(page.title);
     }
   } catch (err) {
@@ -894,8 +884,23 @@ function setThemeRadioValue(theme: Theme) {
  * "Change vault folder" action: a heavy, one-shot operation (full
  * index/git-repo rebuild against the new path, same as first-run
  * `open_vault`), so the native folder picker is the only confirmation --
- * no extra in-app dialog. Flushes any pending autosave first, and clears the
- * currently open page since it belongs to the vault being left.
+ * no extra in-app dialog. Clears the currently open page since it belongs
+ * to the vault being left.
+ *
+ * Ticket 06 known gap: `pagesState.reset()` below sets `openPage` to
+ * `null`, which unmounts the editor island and so still fires its
+ * "commit unsaved edit" flush (same mechanism as switching pages) -- but
+ * that flush's own save call is fire-and-forget from here, no longer
+ * `await`ed before `openVault(path)` starts against the new vault the way
+ * the old, now-removed `flushPendingSaveForCurrentPage` guaranteed. A save
+ * for an edit made in the last ~200ms before changing vaults could
+ * therefore race the new vault opening -- narrower than the bug this
+ * ticket fixes (that race needs both "editing" and "changing vaults" in
+ * the same instant), and reaching it exposes only a console-logged failed
+ * save (the backend errors on an id it can't find in the new vault), not
+ * silent data corruption. Exposing a way to await it isn't possible within
+ * this ticket's constraints (`defineExpose` is scrollToHeading-only, per
+ * spec.md#imperative-escape-hatches); left as a documented gap.
  */
 async function handleChangeVaultFolderClick() {
   let path: string | null;
@@ -907,7 +912,6 @@ async function handleChangeVaultFolderClick() {
   }
   if (!path) return; // user cancelled
 
-  await flushPendingSaveForCurrentPage();
   pagesState.reset();
   pageArticleEl?.setAttribute("hidden", "");
   pageViewEmptyEl?.removeAttribute("hidden");

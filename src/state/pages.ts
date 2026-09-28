@@ -43,6 +43,60 @@ const openPageState: Ref<OpenPage | null> = ref(null);
 /** Read-only outside this module. `null` means no page is open. */
 export const openPage = readonly(openPageState);
 
+// --- Open page's editor content (ticket 06) ---------------------------------
+//
+// The markdown body the editor wrapper (`surfaces/page-editor/`) should be
+// showing, plus a stable identity key for it -- fed straight into the
+// wrapper's `pageKey`/`markdown` props by its container, reactively, so
+// `main.ts` doesn't need to push them down as one-shot root props (which
+// wouldn't update after the initial mount -- see spec.md#islands-and-how-
+// they-merge: root props are for static config/callbacks, not changing
+// data).
+//
+// `openPageKey` is deliberately its own piece of state, not derived from
+// `openPage.value` on the fly: `openPage.value.kind` flips from "dynamic"
+// to "persisted" the moment a dynamic page's first autosave materializes
+// it (see `materialize` below), but that must NOT look like a page change
+// to the editor wrapper -- reloading at that moment would reset the
+// cursor mid-typing, the exact bug this ticket exists to avoid
+// reintroducing. `open()` below only bumps this key when the page's
+// identity actually changes; `materialize()` deliberately never touches
+// it.
+const openPageKeyState: Ref<string> = ref("");
+
+/** Read-only outside this module. `""` when no page is open. Stable across a dynamic page materializing mid-edit; see the comment above. */
+export const openPageKey = readonly(openPageKeyState);
+
+const openPageMarkdownState: Ref<string> = ref("");
+
+/** Read-only outside this module. The editor's current page body -- updated on a real navigation (`open`) or an explicit forced refresh (`reloadOpenPage`), never on every keystroke (the editor wrapper owns its own live content; this is only the value it (re)loads from). */
+export const openPageMarkdown = readonly(openPageMarkdownState);
+
+/** `p:<id>` / `d:<title>` -- same scheme as {@link RecentEntry.key}, reused here as the editor's stable per-page identity. */
+function keyForResolution(resolution: PageResolution): string {
+  return resolution.kind === "persisted" ? `p:${resolution.id}` : `d:${resolution.normalizedTitle}`;
+}
+
+let reloadCounter = 0;
+
+/**
+ * Forces the editor wrapper to reload the currently open page's content
+ * even though its identity (`openPageKey`) hasn't changed -- e.g. a rename
+ * rewrote the *currently open* page's own `[[Link]]` text without
+ * navigating away from it (`main.ts`'s `handleRenamePageClick`, still
+ * living there until ticket 07). The wrapper only reloads on a `pageKey`
+ * change (by design -- see the comment above), so a genuine content
+ * refresh needs its own key bump. Harmless side effect: the *next* time
+ * this same page is reopened via `open()` below, its key will have this
+ * suffix and so will no longer match, causing one extra (but correct,
+ * self-healing) reload -- acceptable since that's a rare, cold path.
+ */
+export function reloadOpenPage(markdown: string): void {
+  if (!openPageState.value) return;
+  openPageMarkdownState.value = markdown;
+  openPageKeyState.value = `${openPageKeyState.value}#${++reloadCounter}`;
+}
+
 // --- Page list / trash list -------------------------------------------------
 
 const pagesState: Ref<PageSummary[]> = ref([]);
@@ -120,7 +174,11 @@ function pruneRecentEntries(removedPageIds: Iterable<string>): void {
  * trash lists (a `resolve_page`/`get_page` result never changes either),
  * and doesn't render anything -- callers (`main.ts`'s `openResolution`)
  * still own deciding whether the page is already open (skip-vs-reload) and
- * pushing the resolved title/body into the article view and editor.
+ * pushing the resolved title into the article view (ticket 07). The
+ * editor's own content (`openPageKey`/`openPageMarkdown`, ticket 06) *is*
+ * updated here, but only when `resolution`'s identity actually differs
+ * from what's already open -- re-opening the same page (e.g. a different
+ * heading target) must not look like a page change to the editor wrapper.
  */
 export function open(resolution: PageResolution): void {
   // Recent tracks last-*opened*, so every navigation here counts as an open
@@ -147,6 +205,12 @@ export function open(resolution: PageResolution): void {
     };
   } else {
     openPageState.value = { kind: "dynamic", title: resolution.normalizedTitle };
+  }
+
+  const newKey = keyForResolution(resolution);
+  if (newKey !== openPageKeyState.value) {
+    openPageKeyState.value = newKey;
+    openPageMarkdownState.value = resolution.kind === "persisted" ? resolution.body : "";
   }
 }
 
@@ -181,7 +245,15 @@ export async function save(id: string, markdown: string): Promise<void> {
 export async function materialize(title: string, markdown: string): Promise<PageSummary> {
   const dynamicKey = `d:${title}`;
   const summary = await materializeAndSavePage(title, markdown);
-  openPageState.value = { kind: "persisted", id: summary.id, inTrash: false, trashedFilename: null };
+  // Ticket 06's "commit on page switch" flush can call this for a page the
+  // user has since navigated away from (a slow materialize racing a fast
+  // switch) -- only update the *currently open* page if it's still this
+  // same dynamic page, so a late-resolving materialize doesn't clobber
+  // whatever's since been navigated to. `openPageKey` is deliberately left
+  // untouched either way -- see its own comment above.
+  if (openPageState.value?.kind === "dynamic" && openPageState.value.title === title) {
+    openPageState.value = { kind: "persisted", id: summary.id, inTrash: false, trashedFilename: null };
+  }
   recentState.value = recentState.value.map((entry) =>
     entry.key === dynamicKey
       ? { key: `p:${summary.id}`, title: summary.title, kind: "persisted", pageId: summary.id }
@@ -218,6 +290,8 @@ export async function deletePage(id: string): Promise<void> {
   await trashPageCommand(id);
   if (openPageState.value?.kind === "persisted" && openPageState.value.id === id) {
     openPageState.value = null;
+    openPageKeyState.value = "";
+    openPageMarkdownState.value = "";
   }
   pruneRecentEntries([id]);
   await refreshPages();
@@ -236,6 +310,8 @@ export async function deletePage(id: string): Promise<void> {
 export async function restore(trashedFilename: string): Promise<PageSummary> {
   const summary = await restorePage(trashedFilename);
   openPageState.value = null;
+  openPageKeyState.value = "";
+  openPageMarkdownState.value = "";
   await refreshPages();
   await refreshTrash();
   return summary;
@@ -254,6 +330,8 @@ export async function emptyTrash(): Promise<void> {
   pruneRecentEntries(purgedIds);
   if (openPageState.value?.kind === "persisted" && openPageState.value.inTrash) {
     openPageState.value = null;
+    openPageKeyState.value = "";
+    openPageMarkdownState.value = "";
   }
   await refreshTrash();
 }
@@ -270,4 +348,6 @@ export function reset(): void {
   trashState.value = [];
   recentState.value = [];
   openPageState.value = null;
+  openPageKeyState.value = "";
+  openPageMarkdownState.value = "";
 }

@@ -203,7 +203,10 @@
             This page is in trash.
             <button id="restore-page-button" type="button">Restore</button>
           </p>
-          <div id="page-body" class="milkdown-root"></div>
+          <!-- Ticket 06: the editor is now the `surfaces/page-editor/` Vue
+               island (mounted in main.ts). It renders its own
+               `.milkdown-root` div; this is just the mount point. -->
+          <div id="page-editor-root"></div>
           <section id="backlinks-section" class="backlinks-section">
             <h2>Backlinks</h2>
             <p id="backlinks-empty" class="backlinks-empty" hidden>No backlinks yet.</p>
