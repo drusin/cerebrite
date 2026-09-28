@@ -9,25 +9,12 @@
 // OAuth is just a different way of *obtaining* that token, not a third
 // parallel auth path.
 //
-// # BLOCKED ON MANUAL FOLLOW-UP -- read before shipping
+// Registered as the `cerebrite-app` GitHub App (https://github.com/apps/cerebrite-app),
+// Device Flow enabled, "Contents: Read and write" permission.
 //
-// This module cannot be exercised against real GitHub from this sandbox:
-// registering a GitHub App requires a human with a GitHub account driving
-// GitHub's web UI (App creation, Device Flow opt-in, "Contents: Read and
-// write" permission, generating the app slug). Until that happens:
-//
-// - `GITHUB_CLIENT_ID` is a placeholder and must be replaced with the real
-//   registered app's client id.
-// - `GITHUB_APP_SLUG` is a placeholder and must be replaced with the real
-//   app's slug (used to build the installation URL).
-// - The manual smoke test against a real GitHub repository (ticket 06
-//   checklist's last item) has not been run and cannot be until the above
-//   exists.
-//
-// Everything else -- the device-flow protocol logic, the refresh exchange,
-// and the installation check -- is implemented for real and exercised
-// against a local mock HTTP server in this module's tests (`mock_server`
-// below), never against api.github.com/github.com.
+// The manual smoke test against a real GitHub repository (ticket 06
+// checklist's last item) still needs to be run now that real credentials
+// are in place.
 #![allow(dead_code)]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,16 +22,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// TODO: replace with the real GitHub App's client id once it's registered
-/// (see this module's doc comment -- item #1 of ticket 06's manual
-/// follow-up). A device-flow request made with this placeholder will be
-/// rejected by GitHub with `error=incorrect_client_credentials`.
-pub const GITHUB_CLIENT_ID: &str = "TODO_REGISTER_GITHUB_APP";
+/// The registered `cerebrite-app` GitHub App's client id. Not a secret --
+/// public identifiers used in every device-flow request.
+pub const GITHUB_CLIENT_ID: &str = "Iv23ctyfotkgau5V27rX";
 
-/// TODO: replace with the real GitHub App's slug once registered -- used to
-/// build the "install this app on your repo" URL
-/// (`https://github.com/apps/<slug>/installations/new`).
-pub const GITHUB_APP_SLUG: &str = "TODO_REGISTER_GITHUB_APP";
+/// The registered GitHub App's slug -- used to build the "install this app
+/// on your repo" URL (`https://github.com/apps/<slug>/installations/new`).
+pub const GITHUB_APP_SLUG: &str = "cerebrite-app";
 
 /// GitHub asks a device-flow client to poll no more often than this many
 /// seconds by default (`interval` in its response normally says the same,

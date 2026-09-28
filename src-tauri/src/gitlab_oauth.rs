@@ -15,21 +15,11 @@
 //
 // # BLOCKED ON MANUAL FOLLOW-UP -- read before shipping
 //
-// This module cannot be exercised against real gitlab.com from this
-// sandbox: registering a GitLab application requires a human with a
-// GitLab account driving GitLab's web UI (Application creation, leaving
-// "Confidential" unchecked, enabling the `device_code` grant type), and
-// ticket 07's own checklist calls for a *live spike* against gitlab.com
-// before implementation to settle three facts the decision doc flagged as
-// unverified. Neither can happen unattended in this sandbox. Until a human
-// does both:
+// Registered as the non-confidential "Cerebrite-App" GitLab application
+// (Application ID below), device grant enabled. Still outstanding:
 //
-// - `GITLAB_CLIENT_ID` is a placeholder and must be replaced with the real
-//   registered application's client id. A device-flow request made with
-//   this placeholder will be rejected by GitLab.
 // - The manual smoke test against a real GitLab.com repository (ticket 07
-//   checklist's next-to-last item) has not been run and cannot be until
-//   the above exists.
+//   checklist's next-to-last item) has not been run yet.
 // - **The live spike itself (ticket 07 checklist's first item) is still
 //   outstanding**, and this module is written *defensively* around its
 //   three unresolved facts rather than assuming an answer:
@@ -65,11 +55,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// TODO: replace with real GitLab application client ID once registered
-/// (see this module's doc comment -- item #1 of ticket 07's manual
-/// follow-up). A device-flow request made with this placeholder will be
-/// rejected by GitLab.
-pub const GITLAB_CLIENT_ID: &str = "TODO_REGISTER_GITLAB_APP";
+/// The registered "Cerebrite-App" GitLab application's client ID. Not a
+/// secret -- a non-confidential application has none.
+pub const GITLAB_CLIENT_ID: &str =
+    "3fbabdb4df2341815c63a2bdcb72adf1f378c36084c98486654996de078cd791";
 
 /// The scope requested at the device-code step -- see this module's doc
 /// comment, unresolved fact #1: GitLab's current docs say this is enough
