@@ -81,16 +81,12 @@ import {
   type CloneWizardState,
   type CloneWizardAction,
 } from "./clone-wizard";
-// `confirm`/`message` from the dialog plugin, not `window.confirm`/`window.alert`:
-// tauri-plugin-dialog's auto-injected webview shim (init-iife.js in the 2.7.3
-// crate) overrides those globals to call a `plugin:dialog|confirm` IPC
-// command that plugin version never actually registers (only `message` is),
-// so `window.confirm()` always rejects with "Command not found" and
-// `window.alert()` fires-and-forgets without blocking. The plugin's own JS
-// API calls the correct `plugin:dialog|message` command under the hood and
-// actually works. `window.prompt()` is untouched by that shim and still
-// works natively, so it's used as-is elsewhere in this file.
-import { confirm as confirmDialog, message as messageDialog } from "@tauri-apps/plugin-dialog";
+// Foundation ticket (01): every native dialog call in this file goes
+// through `./dialogs`, which documents (in one place) why `confirm`/
+// `message` come from the dialog plugin rather than `window.confirm`/
+// `window.alert`, and why a few pre-existing call sites still use those
+// broken globals unchanged.
+import { confirmDialog, messageDialog, promptDialog, confirmBrowser, alertBrowser } from "./dialogs";
 import { PageEditor } from "./page-editor";
 import { humanizeHeadingSlug } from "./heading-slug";
 
@@ -791,7 +787,7 @@ async function handleDeletePageClick(id: string) {
  * would overwrite the just-rewritten file with its stale in-memory content.
  */
 async function handleRenamePageClick(id: string, currentTitle: string) {
-  const newTitle = window.prompt("New title for this page:", currentTitle);
+  const newTitle = promptDialog("New title for this page:", currentTitle);
   if (newTitle === null) return; // user cancelled
 
   const trimmed = newTitle.trim();
@@ -876,7 +872,7 @@ async function handleEmptyTrashClick() {
  * page straight into the editor.
  */
 async function handleNewPageClick() {
-  const title = window.prompt("Title for the new page:");
+  const title = promptDialog("Title for the new page:");
   if (title === null) return; // user cancelled
 
   const trimmed = title.trim();
@@ -1707,7 +1703,7 @@ async function handleUnlockAndRetryClick(): Promise<void> {
   try {
     await unlockKeychainAndRetrySync();
   } catch (e) {
-    window.alert(`Couldn't unlock the keychain: ${e}`);
+    alertBrowser(`Couldn't unlock the keychain: ${e}`);
   }
 }
 
@@ -1726,7 +1722,7 @@ async function withPlaintextFallbackConsent<T>(attempt: (allowPlaintextFallback:
     return await attempt(false);
   } catch (err) {
     if (String(err) !== PLAINTEXT_CONSENT_REQUIRED_ERROR) throw err;
-    const confirmed = window.confirm(
+    const confirmed = confirmBrowser(
       "No keychain is available on this device. Store this connection's credential as a plaintext " +
         "file instead? This is less secure than the keychain, and should only be used when no keychain " +
         "is available.",
@@ -1741,7 +1737,7 @@ async function withPlaintextFallbackConsent<T>(attempt: (allowPlaintextFallback:
  * guidance plus a nudge toward "Retry sync" (always available in the popup)
  * once the user has done that outside the app. */
 function handleSetUpKeychainClick(): Promise<void> {
-  window.alert(
+  alertBrowser(
     "No keychain could be reached. Set up or unlock your system's credential " +
       "store (e.g. start your desktop's Secret Service/keychain daemon), then " +
       'use "Sync now" below to retry.',
@@ -1763,7 +1759,7 @@ function handleSetUpKeychainClick(): Promise<void> {
  * credential here naturally lands in plaintext storage without a separate
  * "force plaintext" flag. */
 async function handleStoreAsPlaintextClick(): Promise<void> {
-  const confirmed = window.confirm(
+  const confirmed = confirmBrowser(
     "Store this connection's credential as a plaintext file instead of the " +
       "system keychain? This is less secure than the keychain, and should " +
       "only be used when no keychain is available. You'll need to re-enter " +
@@ -1780,7 +1776,7 @@ async function handleOpenConflictBackupsClick(): Promise<void> {
   try {
     await revealConflictBackups();
   } catch (e) {
-    window.alert(`Couldn't open the conflict-backups folder: ${e}`);
+    alertBrowser(`Couldn't open the conflict-backups folder: ${e}`);
   }
 }
 
@@ -1812,9 +1808,9 @@ async function handleSettingsSshKeyGenerateClick() {
 /** Same `window.prompt`-based import as the guided wizard's `handleWizardImportSshKey`. */
 async function handleSettingsSshKeyImportClick() {
   if (!settingsSshKeyStatusEl) return;
-  const privateKeyOpenssh = window.prompt("Paste the private key (OpenSSH format):");
+  const privateKeyOpenssh = promptDialog("Paste the private key (OpenSSH format):");
   if (privateKeyOpenssh === null || !privateKeyOpenssh.trim()) return;
-  const passphrase = window.prompt("Passphrase (leave blank if none):") ?? undefined;
+  const passphrase = promptDialog("Passphrase (leave blank if none):") ?? undefined;
 
   settingsSshKeyStatusEl.textContent = "Importing…";
   settingsSshKeyStatusEl.removeAttribute("hidden");
@@ -1956,7 +1952,7 @@ function disconnectResultMessage(outcome: DisconnectOutcome): string {
  * 09-13), then deletes the stored secret, connection record, and origin
  * remote, then shows the honest, per-kind result via `disconnectResultMessage`. */
 async function handleDisconnectClick() {
-  const confirmed = window.confirm(
+  const confirmed = confirmBrowser(
     "Disconnect this vault from its remote repository? Cerebrite deletes the stored " +
       "credential and connection record from this device. This can't be undone from within " +
       "Cerebrite.",
@@ -1965,9 +1961,9 @@ async function handleDisconnectClick() {
 
   try {
     const outcome = await disconnectVault();
-    window.alert(outcome ? disconnectResultMessage(outcome) : "Nothing was connected.");
+    alertBrowser(outcome ? disconnectResultMessage(outcome) : "Nothing was connected.");
   } catch (err) {
-    window.alert(`Couldn't disconnect: ${err}`);
+    alertBrowser(`Couldn't disconnect: ${err}`);
   } finally {
     await refreshSyncStatus();
     updateSyncSectionNotConnectedBanner();
@@ -1994,7 +1990,7 @@ async function handleOrphanCleanupClick() {
   try {
     await cleanupOrphanedConnections();
   } catch (err) {
-    window.alert(`Couldn't clean up orphaned credentials: ${err}`);
+    alertBrowser(`Couldn't clean up orphaned credentials: ${err}`);
   } finally {
     settingsOrphanCleanupButtonEl?.removeAttribute("disabled");
     await refreshOrphanNotice();
@@ -2006,7 +2002,7 @@ async function handleOrphanCleanupClick() {
  * (not just this vault's), best-effort. Reports which ones (if any) failed
  * rather than silently swallowing a partial failure. */
 async function handleRemoveAllCredentialsClick() {
-  const confirmed = window.confirm(
+  const confirmed = confirmBrowser(
     "Remove all stored Cerebrite credentials? This permanently deletes every credential " +
       "Cerebrite has stored on this device, for every vault it has ever connected -- not just " +
       "this one. This does not revoke anything at the provider, and can't be undone from " +
@@ -2631,9 +2627,9 @@ async function handleWizardGenerateSshKey(statusEl: HTMLElement) {
  * anything, same as `handleWizardGenerateSshKey`.
  */
 async function handleWizardImportSshKey(statusEl: HTMLElement) {
-  const privateKeyOpenssh = window.prompt("Paste the private key (OpenSSH format):");
+  const privateKeyOpenssh = promptDialog("Paste the private key (OpenSSH format):");
   if (privateKeyOpenssh === null || !privateKeyOpenssh.trim()) return;
-  const passphrase = window.prompt("Passphrase (leave blank if none):") ?? undefined;
+  const passphrase = promptDialog("Passphrase (leave blank if none):") ?? undefined;
 
   statusEl.textContent = "Importing…";
   try {
@@ -3179,9 +3175,9 @@ async function handleCloneWizardGenerateSshKey(statusEl: HTMLElement) {
 }
 
 async function handleCloneWizardImportSshKey(statusEl: HTMLElement) {
-  const privateKeyOpenssh = window.prompt("Paste the private key (OpenSSH format):");
+  const privateKeyOpenssh = promptDialog("Paste the private key (OpenSSH format):");
   if (privateKeyOpenssh === null || !privateKeyOpenssh.trim()) return;
-  const passphrase = window.prompt("Passphrase (leave blank if none):") ?? undefined;
+  const passphrase = promptDialog("Passphrase (leave blank if none):") ?? undefined;
 
   statusEl.textContent = "Importing…";
   try {
@@ -3436,9 +3432,9 @@ async function handleCloneManualSshKeyGenerateClick() {
 
 async function handleCloneManualSshKeyImportClick() {
   if (!cloneManualSshKeyStatusEl) return;
-  const privateKeyOpenssh = window.prompt("Paste the private key (OpenSSH format):");
+  const privateKeyOpenssh = promptDialog("Paste the private key (OpenSSH format):");
   if (privateKeyOpenssh === null || !privateKeyOpenssh.trim()) return;
-  const passphrase = window.prompt("Passphrase (leave blank if none):") ?? undefined;
+  const passphrase = promptDialog("Passphrase (leave blank if none):") ?? undefined;
 
   cloneManualSshKeyStatusEl.textContent = "Importing…";
   cloneManualSshKeyStatusEl.removeAttribute("hidden");

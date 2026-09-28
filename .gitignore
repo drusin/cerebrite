@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Storybook's throwaway compile-check output (ticket 01, foundation) --
+# never uploaded or deployed, see spec.md#storybook.
+storybook-static
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

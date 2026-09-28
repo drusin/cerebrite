@@ -54,6 +54,12 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # Component-workbench ticket 01 (foundation) / spec.md#storybook: a
+      # compile check only, so stories break loudly as main.ts shrinks.
+      # Output is never uploaded or deployed.
+      - name: Build Storybook
+        run: npm run build-storybook
+
       - name: Run Rust tests
         working-directory: src-tauri
         run: cargo test

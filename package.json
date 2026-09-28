@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build -o storybook-static"
   },
   "dependencies": {
     "@milkdown/kit": "^7.22.1",
@@ -15,12 +17,18 @@
     "@tauri-apps/plugin-dialog": "^2.7.3",
     "@tauri-apps/plugin-opener": "^2",
     "jsdom": "^30.0.1",
-    "mdast-util-find-and-replace": "^3.0.2"
+    "mdast-util-find-and-replace": "^3.0.2",
+    "vue": "^3.5.43"
   },
   "devDependencies": {
+    "@storybook/addon-themes": "^10.6.0",
+    "@storybook/vue3-vite": "^10.6.0",
     "@tauri-apps/cli": "^2",
     "@types/mdast": "^4.0.4",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "storybook": "^10.6.0",
     "typescript": "~6.0.3",
-    "vite": "^8.0.16"
+    "vite": "^8.0.16",
+    "vue-tsc": "^3.3.11"
   }
 }
