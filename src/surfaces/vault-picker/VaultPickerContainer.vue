@@ -13,19 +13,16 @@ import { getSettings, pickVaultFolder } from "../../vault-api";
 import { friendlyVaultOpenError } from "../../vault-open-error";
 import VaultPicker from "./VaultPicker.vue";
 
-// Temporary callback root props (spec.md#islands-and-how-they-merge): the
-// guided clone wizard and the standalone manual clone form don't migrate off
-// `main.ts` until step 9 -- they still arrive here as root props, same
-// pattern as the search modal's (ticket 03). Page/trash loading (ticket 04's
-// third callback, `loadPagesAndTrashInVanilla`) is gone as of ticket 05:
+// Ticket 04's two temporary callback root props
+// (`openCloneWizardInVanilla`/`openCloneManualInVanilla`) are gone as of
+// ticket 10: the guided clone wizard and the standalone manual clone form
+// are now their own Vue islands (`surfaces/clone-wizard/`/`surfaces/clone-
+// manual-form/`), each driven by `ui.vaultView` alone -- so this container
+// just sets that view directly instead of calling back into `main.ts`.
+// Page/trash loading (ticket 04's third callback,
+// `loadPagesAndTrashInVanilla`) was already gone as of ticket 05:
 // `state/pages.ts`'s own `refreshPages`/`refreshTrash` cover it, so this
 // container calls them directly below instead of routing through `main.ts`.
-const props = defineProps<{
-  /** Opens the full-screen guided clone wizard. */
-  openCloneWizardInVanilla: () => void;
-  /** Opens the standalone "git clone" manual form. */
-  openCloneManualInVanilla: () => void;
-}>();
 
 /** Runs once a vault successfully opens, on every path (registered with
  * `state/vault.ts`, which calls it from its `openVault` action). */
@@ -60,16 +57,10 @@ async function handleSelect() {
 
 function handleOpenCloneWizard() {
   setVaultView("cloneWizard");
-  props.openCloneWizardInVanilla();
 }
 
 function handleOpenCloneManual() {
-  // Unlike the clone wizard (a full-screen takeover that replaces this
-  // picker), the manual form is a modal overlay on top of it -- same as
-  // today, the picker stays visible (dimmed by the overlay backdrop)
-  // underneath, so `vaultView` doesn't change here. `"cloneManual"` stays
-  // unused until step 9 actually migrates the manual form onto this state.
-  props.openCloneManualInVanilla();
+  setVaultView("cloneManual");
 }
 
 // Auto-opens the remembered vault at launch -- same effect as main.ts's old

@@ -14,100 +14,15 @@
          `vaultView` instead of a DOM `hidden` attribute. -->
     <div id="vault-picker-root"></div>
 
-    <!-- Ticket 11: the standalone "git clone" manual form -- variant B's
-         transparent, full-git-vocabulary door into the same
-         `clone_and_open_vault` command the guided clone wizard (ticket 10)
-         uses, reachable from the first-run screen above and from that
-         wizard's own persistent "Switch to manual setup" link. Same
-         test-fetch-then-persist gate as the guided wizard: nothing is saved
-         unless `clone_and_open_vault` itself succeeds. -->
-    <div id="clone-manual-overlay" class="settings-modal-overlay" hidden>
-      <div id="clone-manual-dialog" class="settings-modal" role="dialog" aria-modal="true" aria-label="Clone a repository (manual)">
-        <div class="settings-modal-header">
-          <h2>Clone a repository</h2>
-          <button id="clone-manual-close-button" type="button" aria-label="Close">✕</button>
-        </div>
-        <div class="settings-section">
-          <label>
-            Remote URL
-            <input id="clone-manual-url" type="text" placeholder="https://example.com/user/repo.git" />
-          </label>
-          <label>
-            Branch
-            <input id="clone-manual-branch" type="text" value="(the repository's default branch)" disabled />
-          </label>
-          <label>
-            Destination folder
-            <input id="clone-manual-destination" type="text" readonly placeholder="Choose a folder…" />
-          </label>
-          <button id="clone-manual-destination-button" type="button">Choose folder…</button>
-
-          <label>
-            Credential kind
-            <select id="clone-manual-credential-kind">
-              <option value="accessToken">Access token</option>
-              <option value="sshKey">SSH key</option>
-              <option value="githubOauth">GitHub sign-in</option>
-              <option value="gitlabOauth">GitLab sign-in</option>
-            </select>
-          </label>
-
-          <div class="settings-connect-form sync-subform" data-clone-kind="accessToken">
-            <label>
-              Username
-              <input id="clone-manual-token-username" type="text" />
-            </label>
-            <label>
-              Access token
-              <input id="clone-manual-token-value" type="password" />
-            </label>
-          </div>
-
-          <div class="settings-connect-form sync-subform" data-clone-kind="sshKey" hidden>
-            <div class="wizard-button-row">
-              <button id="clone-manual-sshkey-generate-button" type="button">Generate a new key</button>
-              <button id="clone-manual-sshkey-import-button" type="button">Import an existing key</button>
-            </div>
-            <p id="clone-manual-sshkey-status" class="settings-connect-status" hidden></p>
-          </div>
-
-          <div class="settings-connect-form sync-subform" data-clone-kind="githubOauth" hidden>
-            <button id="clone-manual-github-signin-button" type="button">Sign in with GitHub</button>
-            <div id="clone-manual-github-device-code" class="settings-connect-status" hidden></div>
-            <p id="clone-manual-github-status" class="settings-connect-status" hidden></p>
-          </div>
-
-          <div class="settings-connect-form sync-subform" data-clone-kind="gitlabOauth" hidden>
-            <button id="clone-manual-gitlab-signin-button" type="button">Sign in with GitLab</button>
-            <div id="clone-manual-gitlab-device-code" class="settings-connect-status" hidden></div>
-            <p id="clone-manual-gitlab-status" class="settings-connect-status" hidden></p>
-          </div>
-
-          <button id="clone-manual-submit-button" type="button" class="wizard-primary-action">Clone</button>
-          <p id="clone-manual-status" class="settings-connect-status" hidden></p>
-        </div>
-      </div>
-    </div>
-
-    <!-- Ticket 10: the guided clone wizard's full-screen surface.
-         `#clone-wizard-body` is rebuilt per-step by main.ts
-         (clone-wizard.ts's pure reducer drives *which* step; main.ts owns
-         rendering it and the actual `invoke` calls), mirroring ticket 09's
-         connect wizard's rendering pattern exactly, just full-screen instead
-         of a modal layered over Settings. -->
-    <section id="clone-wizard-overlay" class="clone-wizard-overlay" hidden>
-      <div id="clone-wizard" class="clone-wizard" role="dialog" aria-modal="true" aria-label="Clone a repository">
-        <div class="clone-wizard-header">
-          <h1>Clone a repository</h1>
-          <button id="clone-wizard-close-button" type="button" aria-label="Cancel">✕</button>
-        </div>
-        <div id="clone-wizard-body" class="clone-wizard-body"></div>
-        <div class="clone-wizard-footer">
-          <button id="clone-wizard-back-button" type="button">Back</button>
-          <button id="clone-wizard-manual-button" type="button">Switch to manual setup</button>
-        </div>
-      </div>
-    </section>
+    <!-- Ticket 10: the guided clone wizard (full-screen, no vault/window yet
+         to anchor a modal on top of) and the standalone "git clone" manual
+         form (variant B's transparent, full-git-vocabulary door into the
+         same `clone_and_open_vault` command) are now the
+         `surfaces/clone-wizard/`/`surfaces/clone-manual-form/` Vue islands --
+         each shows/hides itself from `state/ui.ts`'s `vaultView` instead of
+         a DOM `hidden` attribute. -->
+    <div id="clone-wizard-root"></div>
+    <div id="clone-manual-root"></div>
 
     <div id="workspace" class="workspace" hidden>
       <!-- Android-proxy layout only (viewport-width heuristic, see main.ts):

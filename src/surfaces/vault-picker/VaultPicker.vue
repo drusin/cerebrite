@@ -10,11 +10,10 @@ defineProps<{
 
 const emit = defineEmits<{
   select: [];
-  /** Temporary callback (spec.md#islands-and-how-they-merge): the guided
-   * clone wizard is still vanilla until step 9. */
+  /** Opens the full-screen guided clone wizard (`surfaces/clone-wizard/`). */
   openCloneWizard: [];
-  /** Temporary callback: the standalone "git clone" manual form is still
-   * vanilla until step 9. */
+  /** Opens the standalone "git clone" manual form
+   * (`surfaces/clone-manual-form/`). */
   openCloneManual: [];
 }>();
 </script>

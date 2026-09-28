@@ -2,8 +2,8 @@
 // see spec.md#step-3-vault-picker. Plain `ref()` plus actions, same shape as
 // `state/sync.ts`. The open action is the single choke point every
 // vault-opening path funnels through (a first-run pick, a remembered vault
-// at launch, "Change folder…" in Settings, and -- once steps 9/11 migrate --
-// the clone wizard/manual form's successful clone): it runs the backend
+// at launch, "Change folder…" in Settings, and -- as of ticket 10 -- the
+// clone wizard/manual form's successful clone): it runs the backend
 // `open_vault` call, updates this module's state, switches `ui.vaultView` to
 // `"workspace"`, and refreshes sync status (`state/sync.ts`'s
 // `refreshSyncStatus`) -- replacing main.ts's own `openVaultAndLoad` and its
@@ -55,10 +55,11 @@ export async function openVault(folderPath: string): Promise<VaultInfo> {
  * page/trash load (the temporary callback above) -- on every path,
  * including flows that open the vault through a *different* backend
  * command than `open_vault` above (the clone wizard/manual form's
- * `clone_and_open_vault`, until they migrate in step 9), which call this
- * directly with the path the clone already opened. This is what fixes the
- * clone manual form's previously-missing `refreshSyncStatus` call
- * (spec.md#step-9-clone-wizard--clone-manual-form's "incidental fix").
+ * `clone_and_open_vault`, ticket 10's `useCloneWizard`/
+ * `CloneManualFormContainer`), which call this directly with the path the
+ * clone already opened. This is what fixes the clone manual form's
+ * previously-missing `refreshSyncStatus` call (spec.md#step-9-clone-
+ * wizard--clone-manual-form's "incidental fix").
  */
 export async function applyVaultOpened(folderPath: string): Promise<void> {
   path.value = folderPath;
