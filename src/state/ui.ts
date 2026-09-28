@@ -85,3 +85,28 @@ export function openSettings(options: OpenSettingsOptions = {}): void {
   closeSyncPopup();
   openSettingsHandler?.(options);
 }
+
+// --- Modal state -------------------------------------------------------
+//
+// Replaces main.ts's own `#search-modal-overlay` `hidden`-attribute
+// toggling (`isSearchModalOpen`/`openSearchModal`/`closeSearchModal`). Per
+// spec.md#view-and-modal-state-stateuits, `modal` is eventually
+// `null | 'search' | 'settings' | 'connectWizard'`; this step (03) is the
+// first real use of the field, so only `'search'` exists so far -- later
+// steps extend the union as Settings and the connect wizard migrate. The
+// sync popup stays on its own `syncPopupOpen`/`syncPopupAnchor` state above,
+// since it's anchored rather than modal.
+
+export type ModalId = "search";
+
+const modalState: Ref<ModalId | null> = ref(null);
+
+export const modal = readonly(modalState);
+
+export function openSearchModal(): void {
+  modalState.value = "search";
+}
+
+export function closeModal(): void {
+  modalState.value = null;
+}

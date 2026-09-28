@@ -15,7 +15,6 @@ import {
   restorePage,
   emptyTrash,
   listTrashedPages,
-  searchPages,
   connectAccessToken,
   generateSshKey,
   importSshKey,
@@ -46,7 +45,6 @@ import {
   type PageSummary,
   type PageResolution,
   type TrashedPageSummary,
-  type SearchResult,
   type Theme,
   type RepoInfo,
   type SshKeyInfo,
@@ -56,9 +54,10 @@ import {
 } from "./vault-api";
 import { mountIsland } from "./mount-island";
 import { refreshSyncStatus, syncStatus } from "./state/sync";
-import { openSettings, type OpenSettingsOptions } from "./state/ui";
+import { openSettings, openSearchModal, closeModal, type OpenSettingsOptions } from "./state/ui";
 import SyncIndicatorContainer from "./surfaces/sync-indicator/SyncIndicatorContainer.vue";
 import SyncPopupContainer from "./surfaces/sync-indicator/SyncPopupContainer.vue";
+import SearchModalContainer from "./surfaces/search/SearchModalContainer.vue";
 import { watch } from "vue";
 import {
   reduceWizard,
@@ -204,11 +203,19 @@ const restorePageButtonEl = document.querySelector<HTMLButtonElement>("#restore-
 const trashListEl = document.querySelector<HTMLUListElement>("#trash-list");
 const emptyTrashButtonEl = document.querySelector<HTMLButtonElement>("#empty-trash-button");
 
-const searchModalOverlayEl = document.querySelector<HTMLElement>("#search-modal-overlay");
-const searchInputEl = document.querySelector<HTMLInputElement>("#search-input");
-const searchIncludeTrashEl = document.querySelector<HTMLInputElement>("#search-include-trash");
-const searchResultsListEl = document.querySelector<HTMLUListElement>("#search-results-list");
-const searchEmptyHintEl = document.querySelector<HTMLElement>("#search-empty-hint");
+// Ticket 03: the search modal is now the `surfaces/search/` Vue island,
+// mounted at `#search-modal-root`. Its two temporary callback root props
+// (`openPageByTitleInVanilla`/`createPageFromQueryInVanilla`) are defined
+// further down, alongside `openPageByTitle`/`createPage`'s other callers --
+// referencing them here relies on `function` hoisting, same as
+// `openSettingsInVanilla` above.
+const searchModalRootEl = document.querySelector<HTMLElement>("#search-modal-root");
+if (searchModalRootEl) {
+  mountIsland(searchModalRootEl, SearchModalContainer, {
+    openPageByTitleInVanilla,
+    createPageFromQueryInVanilla,
+  });
+}
 
 const settingsModalOverlayEl = document.querySelector<HTMLElement>("#settings-modal-overlay");
 const settingsVaultPathEl = document.querySelector<HTMLElement>("#settings-vault-path");
@@ -913,231 +920,30 @@ async function handleSelectVaultClick() {
   }
 }
 
-// --- Search modal (ticket 13) --------------------------------------------
+// --- Search modal's temporary callbacks (ticket 03) ------------------------
 //
-// A single quick-switcher-style overlay (per the referenced prototype spec,
-// issue 11): one query against title/tags/body, results in three strict
-// tiers, one row per page. Opened via the sidebar's Search button and
-// Ctrl/Cmd+K; closed by Escape or clicking outside the modal card.
-
-/** One rendered row in the search results list: either a real search hit, or the trailing "Create page" action. */
-type SearchEntry = { kind: "result"; result: SearchResult } | { kind: "create"; query: string };
-
-let searchEntries: SearchEntry[] = [];
-let searchSelectedIndex = -1;
-let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-/** Guards against a slow, now-stale search response overwriting a newer one. */
-let searchRequestId = 0;
-
-const SEARCH_DEBOUNCE_MS = 120;
-
-/** Splits an FTS5 snippet built with ``/`` markers (search.rs's `body_fts_matches`) into DOM nodes, wrapping the marked span(s) in `<mark>` without ever using `innerHTML` on vault-derived text. */
-function renderHighlightedSnippet(container: HTMLElement, snippet: string) {
-  const parts = snippet.split("");
-  container.appendChild(document.createTextNode(parts[0] ?? ""));
-  for (const part of parts.slice(1)) {
-    const [marked, ...restParts] = part.split("");
-    const mark = document.createElement("mark");
-    mark.textContent = marked ?? "";
-    container.appendChild(mark);
-    container.appendChild(document.createTextNode(restParts.join("")));
-  }
-}
+// The search modal itself is now `surfaces/search/` (a Vue island mounted
+// above); these two intents are all it still needs from vanilla code --
+// page state/actions don't move into `src/state/` until step 4. Both close
+// the modal via `state/ui.ts`'s `closeModal` themselves, matching the old
+// `openSearchResult`/`handleCreatePageFromSearch`'s exact control flow
+// (in particular: on `createPage` failure, the modal stays open).
 
 /** Opens the resolved search result the same way clicking any `[[Link]]` chip or a Trash-list entry would -- `resolve_page` already handles the "in trash" state, so this works identically for a persisted or a trashed hit. */
-async function openSearchResult(result: SearchResult) {
-  closeSearchModal();
-  await openPageByTitle(result.title);
+async function openPageByTitleInVanilla(title: string) {
+  closeModal();
+  await openPageByTitle(title);
 }
 
-/** Empty-state action (ticket 13 point 6): creates the typed query as a brand-new page and opens it straight into the editor, reusing the exact same action as the "New page" button. */
-async function handleCreatePageFromSearch(query: string) {
+/** Empty-state action: creates the typed query as a brand-new page and opens it straight into the editor, reusing the exact same action as the "New page" button. */
+async function createPageFromQueryInVanilla(query: string) {
   try {
     const summary = await createPage(query);
-    closeSearchModal();
+    closeModal();
     await loadPages();
     await selectPage(summary.id);
   } catch (err) {
     await messageDialog(String(err));
-  }
-}
-
-function searchResultRowLabel(result: SearchResult): string {
-  return result.inTrash ? `${result.title} (in trash)` : result.title;
-}
-
-function renderSearchEntries() {
-  if (!searchResultsListEl) return;
-  searchResultsListEl.innerHTML = "";
-
-  const query = searchInputEl?.value.trim() ?? "";
-  if (searchEmptyHintEl) {
-    if (query === "") {
-      searchEmptyHintEl.textContent = "Type to search.";
-      searchEmptyHintEl.removeAttribute("hidden");
-    } else if (searchEntries.length === 0) {
-      searchEmptyHintEl.textContent = "No results.";
-      searchEmptyHintEl.removeAttribute("hidden");
-    } else {
-      searchEmptyHintEl.setAttribute("hidden", "");
-    }
-  }
-
-  searchEntries.forEach((entry, index) => {
-    const li = document.createElement("li");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "search-result";
-    button.classList.toggle("active", index === searchSelectedIndex);
-
-    if (entry.kind === "result") {
-      const { result } = entry;
-      const titleRow = document.createElement("span");
-      titleRow.className = "search-result-title";
-      const titleText = document.createElement("span");
-      titleText.textContent = searchResultRowLabel(result);
-      titleRow.appendChild(titleText);
-      if (result.inTrash) {
-        const badge = document.createElement("span");
-        badge.className = "search-result-in-trash-badge";
-        badge.textContent = "In trash";
-        titleRow.appendChild(badge);
-      }
-      button.appendChild(titleRow);
-
-      if (result.tier === 2 && result.matchedTag) {
-        const chip = document.createElement("span");
-        chip.className = "search-result-tag-chip";
-        chip.textContent = `#${result.matchedTag}`;
-        button.appendChild(chip);
-      } else if (result.tier === 3 && result.snippet) {
-        const snippetEl = document.createElement("span");
-        snippetEl.className = "search-result-snippet";
-        renderHighlightedSnippet(snippetEl, result.snippet);
-        button.appendChild(snippetEl);
-      }
-
-      button.addEventListener("click", () => void openSearchResult(result));
-    } else {
-      button.classList.add("create-page-action");
-      button.textContent = `Create page: '${entry.query}'`;
-      button.addEventListener("click", () => void handleCreatePageFromSearch(entry.query));
-    }
-
-    li.appendChild(button);
-    searchResultsListEl.appendChild(li);
-  });
-}
-
-/**
- * Runs one search for whatever's currently in the input, builds the
- * strict-tier results into `searchEntries`, and appends the "Create page"
- * action (ticket 13 point 6) whenever there's no exact title match among the
- * results -- not only when there are zero results, per the prototype spec.
- */
-async function runSearch() {
-  const query = searchInputEl?.value ?? "";
-  const trimmed = query.trim();
-  const includeTrash = searchIncludeTrashEl?.checked ?? false;
-
-  if (trimmed === "") {
-    searchEntries = [];
-    searchSelectedIndex = -1;
-    renderSearchEntries();
-    return;
-  }
-
-  const requestId = ++searchRequestId;
-  let results: SearchResult[];
-  try {
-    results = await searchPages(trimmed, includeTrash);
-  } catch (err) {
-    console.error("Search failed", err);
-    results = [];
-  }
-  if (requestId !== searchRequestId) return; // a newer search has since started
-
-  const trimmedLower = trimmed.toLowerCase();
-  const hasExactTitleMatch = results.some((r) => r.title.toLowerCase() === trimmedLower);
-
-  searchEntries = results.map((result): SearchEntry => ({ kind: "result", result }));
-  if (!hasExactTitleMatch) {
-    searchEntries.push({ kind: "create", query: trimmed });
-  }
-  searchSelectedIndex = searchEntries.length > 0 ? 0 : -1;
-  renderSearchEntries();
-}
-
-function scheduleSearch() {
-  if (searchDebounceTimer !== null) clearTimeout(searchDebounceTimer);
-  searchDebounceTimer = setTimeout(() => {
-    searchDebounceTimer = null;
-    void runSearch();
-  }, SEARCH_DEBOUNCE_MS);
-}
-
-function isSearchModalOpen(): boolean {
-  return searchModalOverlayEl ? !searchModalOverlayEl.hasAttribute("hidden") : false;
-}
-
-function openSearchModal() {
-  if (!searchModalOverlayEl) return;
-  searchModalOverlayEl.removeAttribute("hidden");
-  if (searchInputEl) {
-    searchInputEl.value = "";
-    searchInputEl.focus();
-  }
-  if (searchIncludeTrashEl) searchIncludeTrashEl.checked = false;
-  searchEntries = [];
-  searchSelectedIndex = -1;
-  renderSearchEntries();
-}
-
-function closeSearchModal() {
-  if (searchDebounceTimer !== null) {
-    clearTimeout(searchDebounceTimer);
-    searchDebounceTimer = null;
-  }
-  searchModalOverlayEl?.setAttribute("hidden", "");
-  searchInputEl?.blur();
-}
-
-function moveSearchSelection(delta: number) {
-  if (searchEntries.length === 0) return;
-  const next = searchSelectedIndex < 0 ? 0 : searchSelectedIndex + delta;
-  searchSelectedIndex = Math.max(0, Math.min(searchEntries.length - 1, next));
-  renderSearchEntries();
-  const rows = searchResultsListEl?.querySelectorAll<HTMLButtonElement>(".search-result");
-  rows?.[searchSelectedIndex]?.scrollIntoView({ block: "nearest" });
-}
-
-function activateSelectedSearchEntry() {
-  const index = searchSelectedIndex >= 0 ? searchSelectedIndex : 0;
-  const entry = searchEntries[index];
-  if (!entry) return;
-  if (entry.kind === "result") void openSearchResult(entry.result);
-  else void handleCreatePageFromSearch(entry.query);
-}
-
-function handleSearchModalKeydown(event: KeyboardEvent) {
-  switch (event.key) {
-    case "Escape":
-      event.preventDefault();
-      event.stopPropagation();
-      closeSearchModal();
-      break;
-    case "ArrowDown":
-      event.preventDefault();
-      moveSearchSelection(1);
-      break;
-    case "ArrowUp":
-      event.preventDefault();
-      moveSearchSelection(-1);
-      break;
-    case "Enter":
-      event.preventDefault();
-      activateSelectedSearchEntry();
-      break;
   }
 }
 
@@ -3410,11 +3216,10 @@ async function init() {
     const isSettingsShortcut = (event.ctrlKey || event.metaKey) && event.key === ",";
     if (isSearchShortcut) {
       event.preventDefault();
-      if (isSearchModalOpen()) {
-        searchInputEl?.focus();
-      } else {
-        openSearchModal();
-      }
+      // Ticket 03: `state/ui.ts`'s `openSearchModal` action -- idempotent
+      // when the modal's already open (the surface itself keeps input
+      // focus in that case, so there's nothing more to do here).
+      openSearchModal();
     } else if (isSettingsShortcut) {
       event.preventDefault();
       if (isSettingsModalOpen()) {
@@ -3505,13 +3310,10 @@ async function init() {
     if (event.target === settingsModalOverlayEl) closeSettingsModal();
   });
 
-  searchInputEl?.addEventListener("input", scheduleSearch);
-  searchIncludeTrashEl?.addEventListener("change", () => void runSearch());
-  searchModalOverlayEl?.addEventListener("keydown", handleSearchModalKeydown);
-  // Clicking the dimmed backdrop (not the modal card itself) closes it.
-  searchModalOverlayEl?.addEventListener("click", (event) => {
-    if (event.target === searchModalOverlayEl) closeSearchModal();
-  });
+  // Ticket 03: the search modal is now the `surfaces/search/` Vue island
+  // (mounted near the top of this file, at module scope) -- it owns its
+  // own input/checkbox/keyboard-nav/Escape/backdrop-click handling,
+  // replacing everything that used to be wired up here.
 
   sidebarCollapseToggleEl?.addEventListener("click", () => {
     workspaceEl?.classList.add("sidebar-collapsed");

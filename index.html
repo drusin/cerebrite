@@ -133,9 +133,8 @@
 
       <aside id="sidebar" class="sidebar">
         <div class="sidebar-top">
-          <!-- Ticket 13 stub: reserves the "prominent Search entry point" UI
-               slot per issue 08. No search UI/modal here -- that's ticket
-               13's job. -->
+          <!-- Opens the search modal (ticket 03: `surfaces/search/`,
+               mounted at `#search-modal-root`). -->
           <button id="search-button" class="search-button" type="button">🔍 Search</button>
           <button id="settings-button" class="sidebar-icon-button" type="button" aria-label="Settings" title="Settings (Ctrl/Cmd+,)">⚙</button>
           <button id="sidebar-collapse-toggle" class="sidebar-collapse-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">←</button>
@@ -228,29 +227,12 @@
         </article>
       </main>
 
-      <!-- Full search modal (ticket 13): opened by the sidebar's Search
-           button and Ctrl/Cmd+K, closed by Escape or clicking outside
-           (`#search-modal-overlay` itself, not its `#search-modal` child). -->
-      <div id="search-modal-overlay" class="search-modal-overlay" hidden>
-        <div id="search-modal" class="search-modal" role="dialog" aria-modal="true" aria-label="Search">
-          <div class="search-modal-header">
-            <input
-              id="search-input"
-              class="search-input"
-              type="text"
-              placeholder="Search title, tags, and body…"
-              autocomplete="off"
-              spellcheck="false"
-            />
-            <label class="search-include-trash">
-              <input id="search-include-trash" type="checkbox" />
-              Include trash
-            </label>
-          </div>
-          <ul id="search-results-list" class="search-results-list"></ul>
-          <p id="search-empty-hint" class="search-empty-hint" hidden>Type to search.</p>
-        </div>
-      </div>
+      <!-- Ticket 03: the search modal -- a Vue island
+           (`surfaces/search/SearchModalContainer.vue`) mounted here.
+           Opened by the sidebar's Search button and Ctrl/Cmd+K
+           (`state/ui.ts`'s `openSearchModal`), closed by Escape or
+           clicking outside (handled inside the island itself). -->
+      <div id="search-modal-root"></div>
 
       <!-- Settings modal: opened via the sidebar's gear button (expanded and
            collapsed-rail states) and Ctrl/Cmd+,, closed by Escape or
