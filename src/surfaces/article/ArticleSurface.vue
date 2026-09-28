@@ -7,10 +7,12 @@
 // `surfaces/page-editor/PageEditorContainer.vue`, which this file never
 // imports, so this surface stays mountable from props alone), and
 // backlinks -- the first copy of a "page list"-shaped UI, written inline
-// per spec.md#shared-components (extracted into `PageList` on its second
-// copy, ticket 08).
+// per spec.md#shared-components. Ticket 08 extracted the second copy
+// (the sidebar's "All pages"/Recent) into `components/PageList.vue` and
+// switched this surface's own backlinks over to it too.
 import { computed } from "vue";
 import { humanizeHeadingSlug } from "../../heading-slug";
+import PageList, { type PageListRow } from "../../components/PageList.vue";
 import type { BacklinkEntry } from "./backlink-entry";
 
 const props = defineProps<{
@@ -35,19 +37,30 @@ const emit = defineEmits<{
   openBacklinkSource: [id: string];
 }>();
 
-type BacklinkRow =
-  | { kind: "header"; sourceId: string; sourceTitle: string }
-  | { kind: "snippet"; entry: BacklinkEntry };
-
-const backlinkRows = computed<BacklinkRow[]>(() => {
-  const rows: BacklinkRow[] = [];
+/** `PageList`'s row shape (spec.md#shared-components): a header per source
+ * page, most-recently-modified source first (same order `get_backlinks`
+ * returns) -- this only groups consecutive same-source entries under one
+ * header, it never re-sorts. Both a header and its snippets emit `select`
+ * with the same `value` (the source page's id); `key` stays unique across
+ * rows for Vue's `:key` (see `PageList.vue`'s own doc comment). */
+const backlinkRows = computed<PageListRow[]>(() => {
+  const rows: PageListRow[] = [];
   let lastSourceId: string | null = null;
+  let i = 0;
   for (const entry of props.backlinks) {
     if (entry.sourceId !== lastSourceId) {
-      rows.push({ kind: "header", sourceId: entry.sourceId, sourceTitle: entry.sourceTitle });
+      rows.push({ kind: "header", key: `h-${entry.sourceId}-${i}`, value: entry.sourceId, label: entry.sourceTitle });
       lastSourceId = entry.sourceId;
+      i++;
     }
-    rows.push({ kind: "snippet", entry });
+    rows.push({
+      kind: "item",
+      key: `s-${entry.sourceId}-${i}`,
+      value: entry.sourceId,
+      label: entry.snippet,
+      annotation: entry.targetHeadingSlug ? `→ ${humanizeHeadingSlug(entry.targetHeadingSlug)}` : null,
+    });
+    i++;
   }
   return rows;
 });
@@ -90,26 +103,12 @@ const backlinkRows = computed<BacklinkRow[]>(() => {
 
       <section class="backlinks-section">
         <h2>Backlinks</h2>
-        <p v-if="backlinkRows.length === 0" class="backlinks-empty">No backlinks yet.</p>
-        <ul v-else class="backlinks-list">
-          <li
-            v-for="(row, i) in backlinkRows"
-            :key="row.kind === 'header' ? `h-${row.sourceId}-${i}` : `s-${row.entry.sourceId}-${i}`"
-            :class="row.kind === 'header' ? 'backlink-group-header' : 'backlink-snippet'"
-          >
-            <button v-if="row.kind === 'header'" type="button" @click="emit('openBacklinkSource', row.sourceId)">
-              {{ row.sourceTitle }}
-            </button>
-            <template v-else>
-              <button type="button" @click="emit('openBacklinkSource', row.entry.sourceId)">
-                {{ row.entry.snippet }}
-              </button>
-              <span v-if="row.entry.targetHeadingSlug" class="backlink-heading-label">
-                → {{ humanizeHeadingSlug(row.entry.targetHeadingSlug) }}
-              </span>
-            </template>
-          </li>
-        </ul>
+        <PageList
+          :rows="backlinkRows"
+          empty-text="No backlinks yet."
+          variant="grouped"
+          @select="emit('openBacklinkSource', $event)"
+        />
       </section>
     </article>
   </main>

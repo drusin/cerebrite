@@ -31,7 +31,6 @@ import {
   type DisconnectOutcome,
   type Provider,
   type CommitAuthor,
-  type PageSummary,
   type PageResolution,
   type TrashedPageSummary,
   type Theme,
@@ -59,6 +58,8 @@ import SyncPopupContainer from "./surfaces/sync-indicator/SyncPopupContainer.vue
 import SearchModalContainer from "./surfaces/search/SearchModalContainer.vue";
 import VaultPickerContainer from "./surfaces/vault-picker/VaultPickerContainer.vue";
 import ArticleContainer from "./surfaces/article/ArticleContainer.vue";
+import PageListContainer from "./surfaces/page-list/PageListContainer.vue";
+import RecentContainer from "./surfaces/recent/RecentContainer.vue";
 import { createApp, watch } from "vue";
 import {
   reduceWizard,
@@ -131,12 +132,7 @@ const cloneManualStatusEl = document.querySelector<HTMLElement>("#clone-manual-s
 
 const workspaceEl = document.querySelector<HTMLElement>("#workspace");
 const sidebarEl = document.querySelector<HTMLElement>("#sidebar");
-const pageListEl = document.querySelector<HTMLUListElement>("#page-list");
-const newPageButtonEl = document.querySelector<HTMLButtonElement>("#new-page-button");
-const todayButtonEl = document.querySelector<HTMLButtonElement>("#today-button");
 const searchButtonEl = document.querySelector<HTMLButtonElement>("#search-button");
-const recentListEl = document.querySelector<HTMLUListElement>("#recent-list");
-const recentEmptyEl = document.querySelector<HTMLElement>("#recent-empty");
 const sidebarOpenButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-open-button");
 const sidebarCloseButtonEl = document.querySelector<HTMLButtonElement>("#sidebar-close-button");
 const sidebarCollapseToggleEl = document.querySelector<HTMLButtonElement>("#sidebar-collapse-toggle");
@@ -244,6 +240,31 @@ let articleHandle: { scrollToHeading(slug: string): boolean } | null = null;
 if (articleRootEl) {
   const articleApp = createApp(ArticleContainer);
   articleHandle = articleApp.mount(articleRootEl) as unknown as { scrollToHeading(slug: string): boolean };
+}
+
+// Ticket 08: the sidebar's Recent list is now the `surfaces/recent/` Vue
+// island, mounted at `#recent-root` -- it reads `state/pages.ts` and calls
+// `vault-api` directly, so it needs no root props. `highlightActivePage`
+// (removed below) used to reach into this list's DOM; the active item now
+// comes from the container's own `activeKey` prop instead.
+const recentRootEl = document.querySelector<HTMLElement>("#recent-root");
+if (recentRootEl) mountIsland(recentRootEl, RecentContainer);
+
+// Ticket 08: the sidebar's "All pages" list (New page, Today) is now the
+// `surfaces/page-list/` Vue island, mounted at `#page-list-root` -- same
+// no-root-props shape as Recent above.
+//
+// Mounted directly (not via `mountIsland`), same reason as the article
+// island above: `pageListHandle` keeps a typed reference to the
+// container's own `defineExpose({ newPage })`, so the still-vanilla
+// sidebar rail's own "+" icon (a separate button on a surface that hasn't
+// migrated yet) can trigger the exact same "new page" flow the sidebar's
+// own button (now inside the island) does.
+const pageListRootEl = document.querySelector<HTMLElement>("#page-list-root");
+let pageListHandle: { newPage(): Promise<void> } | null = null;
+if (pageListRootEl) {
+  const pageListApp = createApp(PageListContainer);
+  pageListHandle = pageListApp.mount(pageListRootEl) as unknown as { newPage(): Promise<void> };
 }
 
 /**
@@ -366,13 +387,17 @@ const connectWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#
 
 // Ticket 05: the open page, page list, trash list, and Recent all moved
 // into `state/pages.ts` (`pagesState.openPage`/`pagesState.pages`/
-// `pagesState.trash`/`pagesState.recent`, all read-only) -- this file keeps
-// only the rendering that reads them. `watch()` below replaces the old
-// tightly-coupled fetch+render (`loadPages`/`loadTrash`/`recordRecentOpen`/
-// `pruneRecentEntries` each called their own `renderPageList`/
-// `renderTrashList`/`renderRecentList` inline): the state module's actions
-// just update state, and rendering reacts to it, same pattern as
-// `watch(vaultView, ...)` above.
+// `pagesState.trash`/`pagesState.recent`, all read-only) -- this file used
+// to keep the rendering that read them.
+//
+// Ticket 08: the page list and Recent renderers (`renderPageList`/
+// `renderRecentList`) and the sidebar's active-item highlight
+// (`highlightActivePage`, which reached into both lists' DOM) are gone --
+// they're now the `surfaces/page-list/`/`surfaces/recent/` Vue islands
+// (mounted above), each reading `pagesState.pages`/`pagesState.openPage`/
+// `pagesState.recent` reactively and deriving their own active item from a
+// prop instead. Trash (ticket 09) hasn't migrated yet, so its `watch()` and
+// renderer stay.
 //
 // Ticket 06: the editor and its autosave (`saveTimer`/`pageEditor`/
 // `scheduleAutosave`/`flushSave`/`flushPendingSaveForCurrentPage`, all
@@ -382,54 +407,7 @@ const connectWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#
 // save-on-`commit` that fixes the lost-edit bug -- see its own doc
 // comments.
 
-watch(pagesState.pages, (list) => renderPageList(list), { immediate: true });
 watch(pagesState.trash, (list) => renderTrashList(list), { immediate: true });
-watch(pagesState.recent, (list) => renderRecentList(list), { immediate: true });
-
-function renderRecentList(entries: readonly pagesState.RecentEntry[]) {
-  if (!recentListEl) return;
-  recentListEl.innerHTML = "";
-
-  if (entries.length === 0) {
-    recentEmptyEl?.removeAttribute("hidden");
-  } else {
-    recentEmptyEl?.setAttribute("hidden", "");
-  }
-
-  for (const entry of entries) {
-    const li = document.createElement("li");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = entry.title;
-    if (entry.kind === "persisted" && entry.pageId) {
-      const pageId = entry.pageId;
-      button.dataset.pageId = pageId;
-      button.addEventListener("click", () => void selectPage(pageId));
-    } else {
-      button.dataset.dynamicTitle = entry.title;
-      button.addEventListener("click", () => void openPageByTitle(entry.title));
-    }
-    li.appendChild(button);
-    recentListEl.appendChild(li);
-  }
-
-  highlightActivePage();
-}
-
-function highlightActivePage() {
-  const current = pagesState.openPage.value;
-  const isActiveButton = (btn: HTMLButtonElement) => {
-    if (current?.kind === "persisted") return btn.dataset.pageId === current.id;
-    if (current?.kind === "dynamic") return btn.dataset.dynamicTitle === current.title;
-    return false;
-  };
-  pageListEl?.querySelectorAll<HTMLButtonElement>("button").forEach((btn) => {
-    btn.classList.toggle("active", isActiveButton(btn));
-  });
-  recentListEl?.querySelectorAll<HTMLButtonElement>("button").forEach((btn) => {
-    btn.classList.toggle("active", isActiveButton(btn));
-  });
-}
 
 // Ticket 04: `friendlyVaultOpenError` moved to `./vault-open-error` (shared
 // by the vault picker Vue island and "Change folder…" below).
@@ -438,24 +416,6 @@ function highlightActivePage() {
 // now follows `state/ui.ts`'s `vaultView` (see the `watch(vaultView, ...)`
 // near the other module-scope island setup, above), and `#vault-picker`'s
 // own visibility is the Vue island's own `v-if` on that same state.
-
-function renderPageList(pages: readonly PageSummary[]) {
-  if (!pageListEl) return;
-  pageListEl.innerHTML = "";
-
-  const current = pagesState.openPage.value;
-  for (const page of pages) {
-    const li = document.createElement("li");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = page.title;
-    button.dataset.pageId = page.id;
-    button.classList.toggle("active", current?.kind === "persisted" && page.id === current.id);
-    button.addEventListener("click", () => void selectPage(page.id));
-    li.appendChild(button);
-    pageListEl.appendChild(li);
-  }
-}
 
 /**
  * Opens whatever `resolution` points to: an existing persisted page, or a
@@ -468,16 +428,21 @@ function renderPageList(pages: readonly PageSummary[]) {
  * anything itself, and no longer needs the "already open" skip it used to
  * (a `pagesState.open()` call whose resolution doesn't actually change
  * `openPage`'s value is a no-op for anyone `watch`ing it, article island
- * included). It still owns what's not the article island's job: the
- * sidebar's active-item highlight, and the heading-targeted scroll for a
- * navigation that originates outside the article surface itself (a
- * `[[Link]]` clicked *inside* the editor scrolls entirely within the
- * island instead; see `surfaces/article/ArticleContainer.vue`'s
- * `handleLinkClick`).
+ * included).
+ *
+ * Ticket 08: `highlightActivePage()` is gone (the page list/Recent islands
+ * derive their own active item from state now), so this only remains for
+ * its other job: the heading-targeted scroll for a navigation that
+ * originates outside the article surface itself. The only remaining
+ * callers are the still-vanilla Trash list below and the search modal's
+ * `openPageByTitleInVanilla` callback -- the page list/Recent islands and
+ * "Today" (ticket 08) call `vault-api`/`state/pages.ts` directly instead
+ * (see `surfaces/page-list/PageListContainer.vue`/
+ * `surfaces/recent/RecentContainer.vue`), since neither ever has a heading
+ * target to scroll to.
  */
 async function openResolution(resolution: PageResolution) {
   pagesState.open(resolution);
-  highlightActivePage();
   if (resolution.headingSlug) scrollToHeadingWhenReady(resolution.headingSlug);
 }
 
@@ -492,32 +457,6 @@ async function selectPage(id: string) {
 async function openPageByTitle(rawTitle: string) {
   const resolution = await resolvePage(rawTitle);
   await openResolution(resolution);
-}
-
-/**
- * Today's date as an ISO-8601 `YYYY-MM-DD` string, per issue 11 / the "Daily
- * note" glossary entry -- built from the *local* calendar date
- * (getFullYear/getMonth/getDate), not `toISOString()`, which reports the UTC
- * date and would land on the wrong day whenever local time is far enough
- * from UTC (e.g. any time after ~4pm PST or before ~2am CEST).
- */
-function todaysDateTitle(): string {
-  const now = new Date();
-  const year = String(now.getFullYear()).padStart(4, "0");
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-/**
- * Sidebar "Today" shortcut (issue 11): navigates to today's date-titled page
- * through the exact same `resolve_page` flow a `[[YYYY-MM-DD]]` link chip
- * would use -- no distinct "daily note" code path. If a page with that exact
- * title already exists, it opens normally; otherwise it opens as an ordinary
- * dynamic page (ADR-0009), materializing only on first write.
- */
-async function handleTodayClick() {
-  await openPageByTitle(todaysDateTitle());
 }
 
 /** Renders the sidebar's "Trash" list (issue 10): clicking an entry opens it the same way a `[[Link]]` to it would -- rendered with the "in trash" banner and inline restore action. */
@@ -557,29 +496,10 @@ async function handleEmptyTrashClick() {
   }
 }
 
-/**
- * Explicit "new page" action (issue 04): prompts for a title, persists a
- * real file immediately via the `create_page` command, refreshes the "All
- * pages" list (alphabetical re-sort happens server-side), and opens the new
- * page straight into the editor.
- */
-async function handleNewPageClick() {
-  const title = promptDialog("Title for the new page:");
-  if (title === null) return; // user cancelled
-
-  const trimmed = title.trim();
-  if (!trimmed) {
-    await messageDialog("Title cannot be empty.");
-    return;
-  }
-
-  try {
-    const summary = await pagesState.create(trimmed);
-    await selectPage(summary.id);
-  } catch (err) {
-    await messageDialog(String(err));
-  }
-}
+// Ticket 08: "new page" (prompt, `pagesState.create`, open it) moved into
+// `surfaces/page-list/PageListContainer.vue`. The still-vanilla sidebar
+// rail's own "+" icon triggers it via `pageListHandle.newPage()` (mounted
+// above) instead of calling a local function here.
 
 // Ticket 04: `openVaultAndLoad`/`handleSelectVaultClick` moved into
 // `surfaces/vault-picker/VaultPickerContainer.vue` (its "Select vault
@@ -1855,7 +1775,8 @@ async function handleWizardGenerateSshKey(statusEl: HTMLElement) {
 /**
  * Ticket 05's import path, offered here via `window.prompt` the same way
  * this app already collects a couple of other simple text values (e.g.
- * `handleNewPageClick`'s title prompt) rather than a bespoke multi-line
+ * the "new page" title prompt, now `PageListContainer.vue`'s `newPage`)
+ * rather than a bespoke multi-line
  * form -- validates the key (and passphrase, if given) without persisting
  * anything, same as `handleWizardGenerateSshKey`.
  */
@@ -2887,8 +2808,6 @@ function applyLayoutMode() {
 }
 
 async function init() {
-  newPageButtonEl?.addEventListener("click", () => void handleNewPageClick());
-  todayButtonEl?.addEventListener("click", () => void handleTodayClick());
   emptyTrashButtonEl?.addEventListener("click", () => void handleEmptyTrashClick());
 
   searchButtonEl?.addEventListener("click", openSearchModal);
@@ -3001,7 +2920,7 @@ async function init() {
     workspaceEl?.classList.remove("sidebar-collapsed");
   });
   sidebarRailSearchButtonEl?.addEventListener("click", openSearchModal);
-  sidebarRailNewPageButtonEl?.addEventListener("click", () => void handleNewPageClick());
+  sidebarRailNewPageButtonEl?.addEventListener("click", () => void pageListHandle?.newPage());
   sidebarOpenButtonEl?.addEventListener("click", () => {
     sidebarEl?.classList.add("drawer-open");
     sidebarOverlayEl?.removeAttribute("hidden");

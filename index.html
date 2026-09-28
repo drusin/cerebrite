@@ -126,25 +126,17 @@
           <button id="sidebar-close-button" class="sidebar-close-button" type="button" aria-label="Close sidebar">✕</button>
         </div>
 
-        <div class="sidebar-section">
-          <div class="sidebar-header">
-            <h2>Recent</h2>
-          </div>
-          <ul id="recent-list" class="page-list recent-list"></ul>
-          <p id="recent-empty" class="sidebar-empty-hint">No pages opened yet.</p>
-        </div>
+        <!-- Ticket 08: the sidebar's Recent list is now the
+             `surfaces/recent/` Vue island, mounted here. -->
+        <div id="recent-root"></div>
 
-        <div class="sidebar-section">
-          <div class="sidebar-header">
-            <h2>All pages</h2>
-            <button id="new-page-button" type="button">+ New page</button>
-          </div>
-          <ul id="page-list" class="page-list"></ul>
-        </div>
-
-        <div class="sidebar-section">
-          <button id="today-button" class="today-button" type="button">Today</button>
-        </div>
+        <!-- Ticket 08: the sidebar's "All pages" list (New page, Today) is
+             now the `surfaces/page-list/` Vue island, mounted here.
+             `main.ts` keeps a typed handle to it (`pageListHandle`), the
+             same imperative-escape-hatch pattern as the article island's
+             `scrollToHeading`, so the still-vanilla sidebar rail's own "+"
+             button can trigger the same "new page" flow. -->
+        <div id="page-list-root"></div>
 
         <div class="sidebar-section">
           <div class="sidebar-header sidebar-trash-header">
