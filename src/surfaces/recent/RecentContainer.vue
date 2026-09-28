@@ -1,10 +1,10 @@
 <script setup lang="ts">
 // Container (spec.md#surface-contract): owns state reads and backend
 // calls. No story (containers aren't storied). Replaces `main.ts`'s
-// `renderRecentList` -- `selectPage`/`openPageByTitle` stay in `main.ts` a
-// while longer (Trash and the search modal's still-vanilla callback both
-// still need them), so this container's own navigation is written
-// independently, same as `PageListContainer.vue`.
+// `renderRecentList`. `selectPage`/`openPageByTitle` live in
+// `state/navigation.ts` since ticket 13, but this container still writes
+// its own navigation independently, same as `PageListContainer.vue`, since
+// it never has a heading target to scroll to.
 import { computed } from "vue";
 import * as pagesState from "../../state/pages";
 import { getPage, resolvePage } from "../../vault-api";

@@ -2,12 +2,11 @@
 // Container (spec.md#surface-contract): owns state reads, backend calls,
 // and dialog confirmations. No story (containers aren't storied).
 // Replaces `main.ts`'s `renderPageList`/`handleNewPageClick`/
-// `handleTodayClick`/`todaysDateTitle` -- `selectPage`/`openResolution`
-// stay in `main.ts` a while longer (Trash and the search modal's
-// still-vanilla callback both still need them), so this container's own
-// navigation is written independently, the same way `ArticleContainer.vue`
-// (ticket 07) writes its own instead of reusing `main.ts`'s private
-// functions.
+// `handleTodayClick`/`todaysDateTitle`. `selectPage`/`openResolution` live
+// in `state/navigation.ts` since ticket 13, but this container still
+// writes its own `openPersisted` independently (same as
+// `ArticleContainer.vue`'s own navigation, ticket 07) since it never has a
+// heading target to scroll to.
 import { computed } from "vue";
 import * as pagesState from "../../state/pages";
 import { getPage, resolvePage } from "../../vault-api";

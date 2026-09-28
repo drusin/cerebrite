@@ -6,22 +6,18 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { modal, closeModal } from "../../state/ui";
 import { searchPages, type SearchResult } from "../../vault-api";
+import * as pagesState from "../../state/pages";
+import { openPageByTitle, selectPage } from "../../state/navigation";
+import { messageDialog } from "../../dialogs";
 import SearchModal from "./SearchModal.vue";
 import type { SearchEntry, SearchResultEntry } from "./search-entry";
 
-// Temporary callback root props (spec.md#islands-and-how-they-merge): page
-// logic itself doesn't move into `src/state/` until step 4, so both intents
-// this modal needs still live in `main.ts` and arrive here as root props.
-// Each already closes the modal (via `state/ui.ts`'s `closeModal`) and
-// handles its own errors internally -- see their doc comments in main.ts.
-const props = defineProps<{
-  /** Opens the resolved search result the same way clicking any
-   * `[[Link]]` chip or a Trash-list entry would. */
-  openPageByTitleInVanilla: (title: string) => Promise<void>;
-  /** Creates the typed query as a brand-new page and opens it straight
-   * into the editor. */
-  createPageFromQueryInVanilla: (query: string) => Promise<void>;
-}>();
+// Ticket 13 (app shell): this container used to take two temporary callback
+// root props (`openPageByTitleInVanilla`/`createPageFromQueryInVanilla`),
+// since page logic didn't move into `src/state/` until step 4 and the app
+// was still several separate islands until now. Both intents are plain
+// imports from `state/navigation.ts`/`state/pages.ts` today -- there's no
+// more vanilla code for a callback to reach back into.
 
 const SEARCH_DEBOUNCE_MS = 120;
 
@@ -115,12 +111,21 @@ watch(isOpen, (open) => {
   void nextTick(() => modalRef.value?.focus());
 });
 
+/** Opens the resolved search result the same way clicking any `[[Link]]` chip or a Trash-list entry would -- `resolve_page` already handles the "in trash" state, so this works identically for a persisted or a trashed hit. */
 async function handleOpen(result: SearchResultEntry) {
-  await props.openPageByTitleInVanilla(result.title);
+  closeModal();
+  await openPageByTitle(result.title);
 }
 
+/** Empty-state action: creates the typed query as a brand-new page and opens it straight into the editor, reusing the exact same action as the "New page" button. On failure, the modal stays open, matching the old `createPageFromQueryInVanilla`'s behavior. */
 async function handleCreate(searchQuery: string) {
-  await props.createPageFromQueryInVanilla(searchQuery);
+  try {
+    const summary = await pagesState.create(searchQuery);
+    closeModal();
+    await selectPage(summary.id);
+  } catch (err) {
+    await messageDialog(String(err));
+  }
 }
 </script>
 

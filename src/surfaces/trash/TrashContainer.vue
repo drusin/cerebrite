@@ -1,12 +1,11 @@
 <script setup lang="ts">
 // Container (spec.md#surface-contract): owns state reads, the backend
 // call, and the dialog confirmation. No story (containers aren't storied).
-// Replaces `main.ts`'s `renderTrashList`/`handleEmptyTrashClick` --
-// `openPageByTitle`/`openResolution` stay in `main.ts` a while longer (the
-// search modal's still-vanilla callback also needs `openPageByTitle`), so
-// this container's own navigation is written independently, the same way
-// `PageListContainer.vue`/`RecentContainer.vue` (ticket 08) write their
-// own instead of reusing `main.ts`'s private functions.
+// Replaces `main.ts`'s `renderTrashList`/`handleEmptyTrashClick`.
+// `openPageByTitle`/`openResolution` live in `state/navigation.ts` since
+// ticket 13, but this container still writes its own navigation
+// independently (same as `PageListContainer.vue`/`RecentContainer.vue`,
+// ticket 08) since it never has a heading target to scroll to.
 import { computed } from "vue";
 import * as pagesState from "../../state/pages";
 import { resolvePage } from "../../vault-api";
