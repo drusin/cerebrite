@@ -20,7 +20,7 @@ Settled in charting; not open for relitigation.
 - **As little backend as feasible.** Surfaces should prefer plain props/data in and events out. A fake `vault-api` is allowed only where that keeps code simpler than avoiding it.
 - **Framework: Vue 3.** Decided in [Framework or not: how surfaces are built](issues/04-framework-decision.md) ([ADR-0014](../../docs/adr/0014-vue-3-for-frontend-surfaces.md)).
 - **Workbench: Storybook 10 `vue3-vite`.** Decided in [Which workbench tool](issues/05-workbench-tool-decision.md).
-- **Incremental migration.** One surface at a time, and the app keeps working after every step.
+- **Incremental migration.** One surface at a time, and the app keeps working after every step. Nothing ships in between: this is a way to verify each step and keep bugs local, not a rollout requirement ([Pilot surface and migration order](issues/08-migration-order.md)).
 - **The page editor (Milkdown + wiki-link plugin) is a first-class story**, fed sample markdown directly.
 - **Styling stays global.** The workbench loads `styles.css` and offers a light/dark toggle plus phone/tablet viewport presets.
 - **Dev-only.** Runs in a normal desktop browser via its own npm script, is never in the Tauri bundle, and is never deployed.
@@ -37,10 +37,11 @@ Settled in charting; not open for relitigation.
 - [Which workbench tool](issues/05-workbench-tool-decision.md): Storybook `^10.6` with `@storybook/vue3-vite`. Only surfaces migrated to Vue get stories, and writing them is part of each migration step. Stories are colocated CSF3, one per interesting state. `addon-themes` offers System/Light/Dark, and the viewport has phone and tablet presets. CI runs `storybook build` as a compile check and never publishes it. The future test path is `play` + `addon-vitest`; whether to pin Vitest 4.1 or move to Storybook 11 is left to the test effort.
 - [Editor in Vue: wrap `PageEditor` or adopt `@milkdown/vue`](issues/06-editor-in-vue.md): A thin Vue SFC wraps the unchanged `PageEditor`: a page-key prop triggers `load()`, and `onChange`/`onLinkClick` become emits. `@milkdown/vue` is rejected: it needed more glue, the whole editor setup written again, and it pins an exact `@milkdown/kit` version and pulls in `@milkdown/crepe`. The editor story seeds plain prose, wiki-links, and a long document. The prototype found a lost-edit bug (the listener's 200 ms debounce is cancelled on destroy), handed to Surface contract.
 - [Surface contract](issues/07-surface-contract.md): Each surface is a presentational SFC (props in, emits out; no `vault-api`, dialogs, or state) plus a container. The wizards render reducer state, and their effects run in composables, so stories need no fake backend. Shared state and a `ui` view/modal module are plain `reactive()` action modules in `src/state/`, with no Pinia and no router. Islands are mounted with `mountIsland` and use temporary callback root props, and they merge at a named app-shell step. The editor emits `commit(oldPageKey, markdown)` before a swap or unmount. `defineExpose` is limited to scroll and focus. Dialogs go through a `dialogs.ts` called from containers. Shared components are extracted when a second copy migrates. Code lives under `src/surfaces/<surface>/`.
+- [Pilot surface and migration order](issues/08-migration-order.md): Thirteen steps. Foundation (Vue, `vue-tsc`, `mountIsland`, `dialogs.ts`, Storybook config), then the sync indicator + popup as pilot, search, vault picker, a page-state-only step, editor, article + backlinks, page list + Recent (`PageList` extracted), Trash, clone wizard + manual, connect wizard (device flow, SSH key, Commit as, and `<Modal>` extracted), Settings, and finally the app shell. The shell goes last so `App.vue` never has to host vanilla DOM. Every step has stories, deletes the callbacks it replaced, and passes `vue-tsc`, `vite build`, `storybook build`, and a manual run of the real app.
 
 ## Not yet specified
 
-- **Spec assembly.** Pulling the decisions into `spec.md` for handoff.
+_Nothing left. The final ticket is [Assemble the handoff spec](issues/09-spec-assembly.md)._
 
 ## Out of scope
 
