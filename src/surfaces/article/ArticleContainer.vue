@@ -5,8 +5,8 @@
 // `renderPageArticle`/`renderBacklinks`/`handleRenamePageClick`/
 // `handleDeletePageClick`/`handleRestoreClick` -- the navigation-only parts
 // of the old flow (`openResolution`/`selectPage`/`openPageByTitle`, still
-// needed by the not-yet-migrated sidebar/search/trash-list) stay in
-// `main.ts`; only the "render the open page into the article view" and
+// needed by the search modal's still-vanilla callback) stay in `main.ts`;
+// only the "render the open page into the article view" and
 // "confirm + mutate" halves move here.
 import { computed, ref, watch } from "vue";
 import * as pagesState from "../../state/pages";

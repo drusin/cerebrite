@@ -138,13 +138,9 @@
              button can trigger the same "new page" flow. -->
         <div id="page-list-root"></div>
 
-        <div class="sidebar-section">
-          <div class="sidebar-header sidebar-trash-header">
-            <h2>Trash</h2>
-            <button id="empty-trash-button" type="button">Empty trash</button>
-          </div>
-          <ul id="trash-list" class="page-list trash-list"></ul>
-        </div>
+        <!-- Ticket 09: the sidebar's Trash list (with Empty trash) is now
+             the `surfaces/trash/` Vue island, mounted here. -->
+        <div id="trash-root"></div>
 
         <!-- Ticket 02: a persistent, quiet sync-status indicator -- never a
              toast/banner (per issue 09's resolved decision). A Vue island

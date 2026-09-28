@@ -32,7 +32,6 @@ import {
   type Provider,
   type CommitAuthor,
   type PageResolution,
-  type TrashedPageSummary,
   type Theme,
   type RepoInfo,
   type SshKeyInfo,
@@ -60,6 +59,7 @@ import VaultPickerContainer from "./surfaces/vault-picker/VaultPickerContainer.v
 import ArticleContainer from "./surfaces/article/ArticleContainer.vue";
 import PageListContainer from "./surfaces/page-list/PageListContainer.vue";
 import RecentContainer from "./surfaces/recent/RecentContainer.vue";
+import TrashContainer from "./surfaces/trash/TrashContainer.vue";
 import { createApp, watch } from "vue";
 import {
   reduceWizard,
@@ -178,9 +178,6 @@ const settingsRemoveAllCredentialsStatusEl = document.querySelector<HTMLElement>
   "#settings-remove-all-credentials-status",
 );
 
-const trashListEl = document.querySelector<HTMLUListElement>("#trash-list");
-const emptyTrashButtonEl = document.querySelector<HTMLButtonElement>("#empty-trash-button");
-
 // Ticket 03: the search modal is now the `surfaces/search/` Vue island,
 // mounted at `#search-modal-root`. Its two temporary callback root props
 // (`openPageByTitleInVanilla`/`createPageFromQueryInVanilla`) are defined
@@ -266,6 +263,15 @@ if (pageListRootEl) {
   const pageListApp = createApp(PageListContainer);
   pageListHandle = pageListApp.mount(pageListRootEl) as unknown as { newPage(): Promise<void> };
 }
+
+// Ticket 09: the sidebar's Trash list (with Empty trash) is now the
+// `surfaces/trash/` Vue island, mounted at `#trash-root` -- same
+// no-root-props shape as Recent/"All pages" above. `renderTrashList`/
+// `handleEmptyTrashClick` (removed below) used to live here;
+// `TrashContainer.vue` now confirms "Empty trash" through `dialogs.ts`
+// itself and calls `state/pages.ts`'s `emptyTrash` action directly.
+const trashRootEl = document.querySelector<HTMLElement>("#trash-root");
+if (trashRootEl) mountIsland(trashRootEl, TrashContainer);
 
 /**
  * Calls the mounted article island's exposed `scrollToHeading`, retrying
@@ -396,8 +402,11 @@ const connectWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#
 // they're now the `surfaces/page-list/`/`surfaces/recent/` Vue islands
 // (mounted above), each reading `pagesState.pages`/`pagesState.openPage`/
 // `pagesState.recent` reactively and deriving their own active item from a
-// prop instead. Trash (ticket 09) hasn't migrated yet, so its `watch()` and
-// renderer stay.
+// prop instead.
+//
+// Ticket 09: the Trash renderer (`renderTrashList`) and its `watch()` are
+// gone too -- now the `surfaces/trash/` Vue island (mounted above), reading
+// `pagesState.trash` reactively.
 //
 // Ticket 06: the editor and its autosave (`saveTimer`/`pageEditor`/
 // `scheduleAutosave`/`flushSave`/`flushPendingSaveForCurrentPage`, all
@@ -406,8 +415,6 @@ const connectWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#
 // `#article-root`). Its container owns the debounce and the immediate
 // save-on-`commit` that fixes the lost-edit bug -- see its own doc
 // comments.
-
-watch(pagesState.trash, (list) => renderTrashList(list), { immediate: true });
 
 // Ticket 04: `friendlyVaultOpenError` moved to `./vault-open-error` (shared
 // by the vault picker Vue island and "Change folder…" below).
@@ -433,13 +440,12 @@ watch(pagesState.trash, (list) => renderTrashList(list), { immediate: true });
  * Ticket 08: `highlightActivePage()` is gone (the page list/Recent islands
  * derive their own active item from state now), so this only remains for
  * its other job: the heading-targeted scroll for a navigation that
- * originates outside the article surface itself. The only remaining
- * callers are the still-vanilla Trash list below and the search modal's
- * `openPageByTitleInVanilla` callback -- the page list/Recent islands and
- * "Today" (ticket 08) call `vault-api`/`state/pages.ts` directly instead
- * (see `surfaces/page-list/PageListContainer.vue`/
- * `surfaces/recent/RecentContainer.vue`), since neither ever has a heading
- * target to scroll to.
+ * originates outside the article surface itself. The only remaining caller
+ * is the search modal's `openPageByTitleInVanilla` callback -- the page
+ * list/Recent/Trash islands and "Today" call `vault-api`/`state/pages.ts`
+ * directly instead (see `surfaces/page-list/PageListContainer.vue`/
+ * `surfaces/recent/RecentContainer.vue`/`surfaces/trash/TrashContainer.vue`),
+ * since none of them ever has a heading target to scroll to.
  */
 async function openResolution(resolution: PageResolution) {
   pagesState.open(resolution);
@@ -459,22 +465,6 @@ async function openPageByTitle(rawTitle: string) {
   await openResolution(resolution);
 }
 
-/** Renders the sidebar's "Trash" list (issue 10): clicking an entry opens it the same way a `[[Link]]` to it would -- rendered with the "in trash" banner and inline restore action. */
-function renderTrashList(pages: readonly TrashedPageSummary[]) {
-  if (!trashListEl) return;
-  trashListEl.innerHTML = "";
-
-  for (const page of pages) {
-    const li = document.createElement("li");
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = page.title;
-    button.addEventListener("click", () => void openPageByTitle(page.title));
-    li.appendChild(button);
-    trashListEl.appendChild(li);
-  }
-}
-
 // Ticket 07: "delete page"/"rename page"/"restore" (issue 10 / ADR-0010,
 // and the rename action the ticket 04 checklist left undone) are now
 // `surfaces/article/ArticleContainer.vue`'s job -- it confirms through
@@ -482,19 +472,11 @@ function renderTrashList(pages: readonly TrashedPageSummary[]) {
 // reactive read of `openPage`/`pages`/`trash` (for the article's title)
 // means it doesn't need this file to push a re-render at it afterwards.
 
-/** Explicit "empty trash" action (issue 10): permanently deletes every trashed page. There is no other purge path. */
-async function handleEmptyTrashClick() {
-  if (!(await confirmDialog("Permanently delete all trashed pages? This cannot be undone."))) return;
-
-  try {
-    // `pagesState.emptyTrash()` itself clears the open page when it was a
-    // trashed one -- the article island reacts to that on its own (ticket
-    // 07), so there's no DOM to clear here anymore.
-    await pagesState.emptyTrash();
-  } catch (err) {
-    await messageDialog(String(err));
-  }
-}
+// Ticket 09: the Trash list's rendering (`renderTrashList`) and "Empty
+// trash" (`handleEmptyTrashClick`) moved into `surfaces/trash/
+// TrashContainer.vue`, which confirms through `dialogs.ts` and calls
+// `state/pages.ts`'s `emptyTrash` action itself, the same shape as the
+// article container above.
 
 // Ticket 08: "new page" (prompt, `pagesState.create`, open it) moved into
 // `surfaces/page-list/PageListContainer.vue`. The still-vanilla sidebar
@@ -2808,8 +2790,6 @@ function applyLayoutMode() {
 }
 
 async function init() {
-  emptyTrashButtonEl?.addEventListener("click", () => void handleEmptyTrashClick());
-
   searchButtonEl?.addEventListener("click", openSearchModal);
   window.addEventListener("keydown", (event) => {
     const isSearchShortcut = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k";
