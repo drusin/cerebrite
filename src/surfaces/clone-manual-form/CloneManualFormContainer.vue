@@ -24,7 +24,7 @@ import {
   type CloneCredential,
 } from "../../vault-api";
 import CloneManualForm, { type ManualCredentialKind } from "./CloneManualForm.vue";
-import type { DeviceCodeDisplay } from "../clone-wizard/useCloneWizard";
+import type { DeviceCodeDisplay } from "../../components/DeviceFlow.vue";
 
 const isOpen = computed(() => vaultView.value === "cloneManual");
 

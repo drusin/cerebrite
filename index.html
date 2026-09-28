@@ -350,25 +350,12 @@
         </div>
       </div>
 
-      <!-- Ticket 09: the guided connect wizard's compact modal, layered
-           above the Settings modal. `#connect-wizard-body` is rebuilt
-           per-step by main.ts (connect-wizard.ts's pure reducer drives
-           *which* step; main.ts owns rendering it and the actual `invoke`
-           calls) -- closed by Escape or clicking outside the card, same as
-           every other modal here. -->
-      <div id="connect-wizard-overlay" class="settings-modal-overlay" hidden>
-        <div id="connect-wizard" class="settings-modal connect-wizard" role="dialog" aria-modal="true" aria-label="Connect a repository">
-          <div class="settings-modal-header">
-            <h2>Connect a repository</h2>
-            <button id="connect-wizard-close-button" type="button" aria-label="Close">✕</button>
-          </div>
-          <div id="connect-wizard-body" class="connect-wizard-body"></div>
-          <div class="connect-wizard-footer">
-            <button id="connect-wizard-back-button" type="button">Back</button>
-            <button id="connect-wizard-manual-button" type="button">Switch to manual setup</button>
-          </div>
-        </div>
-      </div>
+      <!-- Ticket 11: the guided connect wizard is now the
+           `surfaces/connect-wizard/` Vue island, mounted here -- a compact
+           modal (`components/Modal.vue`) layered above the still-vanilla
+           Settings modal, shown from `state/ui.ts`'s `modal` state
+           (`'connectWizard'`), same as before. -->
+      <div id="connect-wizard-root"></div>
     </div>
   </body>
 </html>

@@ -91,13 +91,16 @@ export function openSettings(options: OpenSettingsOptions = {}): void {
 // Replaces main.ts's own `#search-modal-overlay` `hidden`-attribute
 // toggling (`isSearchModalOpen`/`openSearchModal`/`closeSearchModal`). Per
 // spec.md#view-and-modal-state-stateuits, `modal` is eventually
-// `null | 'search' | 'settings' | 'connectWizard'`; this step (03) is the
-// first real use of the field, so only `'search'` exists so far -- later
-// steps extend the union as Settings and the connect wizard migrate. The
-// sync popup stays on its own `syncPopupOpen`/`syncPopupAnchor` state above,
-// since it's anchored rather than modal.
+// `null | 'search' | 'settings' | 'connectWizard'`; step 03 was the first
+// real use of the field (only `'search'`); ticket 11 adds `'connectWizard'`
+// (and the `'settings'` value it returns to on close -- bookkeeping only for
+// now, since Settings itself doesn't read `modal` until it migrates in
+// ticket 12: its visibility is still driven by its own vanilla
+// `hidden`-attribute toggling, which this doesn't touch). The sync popup
+// stays on its own `syncPopupOpen`/`syncPopupAnchor` state above, since it's
+// anchored rather than modal.
 
-export type ModalId = "search";
+export type ModalId = "search" | "settings" | "connectWizard";
 
 const modalState: Ref<ModalId | null> = ref(null);
 
@@ -107,8 +110,27 @@ export function openSearchModal(): void {
   modalState.value = "search";
 }
 
+/** Opens the connect wizard -- called directly from the vanilla Settings
+ * modal's "Connect…" buttons (`#connect-wizard-open-button`,
+ * `#sync-section-connect-button` in main.ts), the same way those already
+ * call `openSearchModal` directly: a plain state action, not a temporary
+ * callback, since it's just as reachable from vanilla code as from Vue. */
+export function openConnectWizardModal(): void {
+  modalState.value = "connectWizard";
+}
+
 export function closeModal(): void {
   modalState.value = null;
+}
+
+/** Closes the connect wizard specifically -- per the ticket, it returns
+ * `modal` to `'settings'` rather than `null`, since the vanilla Settings
+ * modal is (and was, the whole time the wizard was open -- the wizard only
+ * ever layers over it, per `styles.css`'s `.connect-wizard` doc comment)
+ * still showing underneath. `'settings'` is bookkeeping only until ticket 12
+ * (see this module's `ModalId` doc comment). */
+export function closeConnectWizardModal(): void {
+  modalState.value = "settings";
 }
 
 // --- Vault view state ----------------------------------------------------

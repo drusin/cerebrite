@@ -3,14 +3,19 @@
 // alone, no `vault-api`/`dialogs.ts`/`src/state/` imports. Renders
 // `#clone-wizard-overlay`'s old markup/classes verbatim (spec.md#step-9-
 // clone-wizard--clone-manual-form) -- full-screen, not a modal (there is no
-// vault/window yet to anchor a modal on top of). Device flow and the SSH
-// key sub-form are written inline here (first copies, per the ticket);
-// they're extracted into shared components (`DeviceFlow`/`SshKey`) once a
-// second copy exists in step 10's connect wizard.
-import { ref, watch } from "vue";
+// vault/window yet to anchor a modal on top of). Device flow, the SSH key
+// sub-form, and "Commit as" were written inline here as the first copies;
+// ticket 11's connect wizard is the second copy of each, so they're now
+// `components/DeviceFlow.vue`/`SshKey.vue`/`CommitAs.vue` and this surface
+// switches to them below.
+import { ref } from "vue";
 import { isCloneWizardBusyStep, type CloneWizardState } from "../../clone-wizard";
 import type { WizardProvider } from "../../connect-wizard";
-import type { DeviceCodeDisplay } from "./useCloneWizard";
+import DeviceFlow, { type DeviceCodeDisplay } from "../../components/DeviceFlow.vue";
+import SshKey from "../../components/SshKey.vue";
+import CommitAs, { type CommitAuthorValue } from "../../components/CommitAs.vue";
+
+export type { CommitAuthorValue };
 
 /** Just enough of `vault-api`'s `RepoInfo` to render a pickable list entry --
  * kept local rather than imported, per spec.md#surface-contract (this
@@ -19,13 +24,6 @@ export interface CloneRepoOption {
   fullName: string;
   private: boolean;
   cloneUrl: string;
-}
-
-/** Just enough of `vault-api`'s `CommitAuthor` to prefill the "Commit as"
- * step -- same "never imports `vault-api`" reasoning as above. */
-export interface CommitAuthorValue {
-  name: string;
-  email: string;
 }
 
 const props = defineProps<{
@@ -95,31 +93,6 @@ function submitPasteUrlSshKey() {
   emit("submitPasteUrlSshKey", remoteUrl);
 }
 
-// The "Commit as" step's name/email fields, same "surface collects its own
-// input" reasoning as pasteUrl above.
-const commitAuthorName = ref("");
-const commitAuthorEmail = ref("");
-
-function primeCommitAuthorFields(author: CommitAuthorValue | null) {
-  commitAuthorName.value = author?.name ?? "";
-  commitAuthorEmail.value = author?.email ?? "";
-}
-
-// Primes the "Commit as" fields from `authorPrefill` the moment the wizard
-// reaches that step -- mirrors the old render function reading
-// `cloneWizardAuthorPrefill` fresh each time the step is (re)rendered.
-watch(
-  () => [props.state.step, props.authorPrefill] as const,
-  ([step, author]) => {
-    if (step === "commitAuthor") primeCommitAuthorFields(author);
-  },
-  { immediate: true },
-);
-
-function submitCommitAuthor() {
-  emit("commitAuthorConfirmed", commitAuthorName.value.trim(), commitAuthorEmail.value.trim());
-}
-
 function handleKeydown(event: KeyboardEvent) {
   if (event.key === "Escape" && !isCloneWizardBusyStep(props.state.step)) {
     event.preventDefault();
@@ -165,16 +138,7 @@ function handleKeydown(event: KeyboardEvent) {
         </template>
 
         <template v-else-if="state.step === 'oauthSignIn'">
-          <p class="settings-connect-status">{{ oauthStatus }}</p>
-          <div v-if="oauthDeviceCode" class="settings-connect-status">
-            <p>
-              Go to
-              <a :href="oauthDeviceCode.verificationUri" target="_blank" rel="noopener">{{
-                oauthDeviceCode.verificationUri
-              }}</a>
-              and enter code: <strong>{{ oauthDeviceCode.userCode }}</strong>
-            </p>
-          </div>
+          <DeviceFlow :status="oauthStatus" :device-code="oauthDeviceCode" />
         </template>
 
         <template v-else-if="state.step === 'repoPicker'">
@@ -201,9 +165,7 @@ function handleKeydown(event: KeyboardEvent) {
           </template>
 
           <template v-else>
-            <p class="settings-connect-status">{{ sshKeyStatus }}</p>
-            <button type="button" @click="emit('generateSshKey')">Generate a new key</button>
-            <button type="button" @click="emit('importSshKey')">Import an existing key</button>
+            <SshKey :status="sshKeyStatus" @generate="emit('generateSshKey')" @import="emit('importSshKey')" />
             <button type="button" class="wizard-primary-action" @click="submitPasteUrlSshKey()">Continue</button>
             <p v-if="pasteUrlError" class="error wizard-inline-error">{{ pasteUrlError }}</p>
           </template>
@@ -227,11 +189,11 @@ function handleKeydown(event: KeyboardEvent) {
         </template>
 
         <template v-else-if="state.step === 'commitAuthor'">
-          <p class="wizard-question">Commit as:</p>
-          <input v-model="commitAuthorName" type="text" placeholder="Name" />
-          <input v-model="commitAuthorEmail" type="text" placeholder="Email" />
-          <button type="button" class="wizard-primary-action" @click="submitCommitAuthor()">Finish</button>
-          <p v-if="commitAuthorError" class="error wizard-inline-error">{{ commitAuthorError }}</p>
+          <CommitAs
+            :prefill="authorPrefill"
+            :error="commitAuthorError"
+            @submit="(name, email) => emit('commitAuthorConfirmed', name, email)"
+          />
         </template>
       </div>
 

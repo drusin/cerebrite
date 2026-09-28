@@ -25,6 +25,7 @@ import {
   type MessageDialogOptions,
   type MessageDialogResult,
 } from "@tauri-apps/plugin-dialog";
+import { PLAINTEXT_CONSENT_REQUIRED_ERROR } from "./vault-api";
 
 /** The dialog plugin's blocking, native confirm/cancel dialog. Use this, not
  * {@link confirmBrowser}, unless a call site already relies on
@@ -59,4 +60,35 @@ export function confirmBrowser(message: string): boolean {
  * {@link messageDialog}. */
 export function alertBrowser(message: string): void {
   window.alert(message);
+}
+
+/**
+ * Ticket 02/04 code-review follow-up, moved here in ticket 11 (was a
+ * `main.ts`-local helper, duplicated by nothing else until the connect
+ * wizard's `useConnectWizard.ts` needed it too -- moving it next to every
+ * other native-dialog wrapper, rather than copy-pasting a second copy into
+ * the composable, avoids that duplication): wraps a `connect*` call so the
+ * backend's {@link PLAINTEXT_CONSENT_REQUIRED_ERROR} rejection (no keychain
+ * reachable, and the caller hadn't consented to plaintext storage yet) turns
+ * into a "store as plaintext instead?" consent dialog. `attempt` is always
+ * first called with `allowPlaintextFallback: false`; it's retried with
+ * `true` only if that specific rejection comes back and the user confirms.
+ * Any other rejection (wrong token, unreachable remote, rejected SSH host
+ * key, ...) passes straight through unchanged.
+ */
+export async function withPlaintextFallbackConsent<T>(
+  attempt: (allowPlaintextFallback: boolean) => Promise<T>,
+): Promise<T> {
+  try {
+    return await attempt(false);
+  } catch (err) {
+    if (String(err) !== PLAINTEXT_CONSENT_REQUIRED_ERROR) throw err;
+    const confirmed = confirmBrowser(
+      "No keychain is available on this device. Store this connection's credential as a plaintext " +
+        "file instead? This is less secure than the keychain, and should only be used when no keychain " +
+        "is available.",
+    );
+    if (!confirmed) throw err;
+    return attempt(true);
+  }
 }

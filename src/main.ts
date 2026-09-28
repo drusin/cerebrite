@@ -12,13 +12,9 @@ import {
   pollGithubDeviceFlow,
   checkGithubInstallation,
   connectGithubOauth,
-  createGithubRepository,
-  listGithubRepositories,
   startGitlabDeviceFlow,
   pollGitlabDeviceFlow,
   connectGitlabOauth,
-  createGitlabRepository,
-  listGitlabRepositories,
   commitAuthorPrefill,
   getCommitAuthor,
   confirmCommitAuthor,
@@ -26,21 +22,19 @@ import {
   scanOrphanedConnections,
   cleanupOrphanedConnections,
   removeAllStoredCredentials,
-  PLAINTEXT_CONSENT_REQUIRED_ERROR,
   type DisconnectOutcome,
   type Provider,
   type CommitAuthor,
   type PageResolution,
   type Theme,
-  type RepoInfo,
   type SshKeyInfo,
   type CredentialKind,
 } from "./vault-api";
 import { mountIsland } from "./mount-island";
 import { refreshSyncStatus, syncStatus } from "./state/sync";
 import {
-  openSettings,
   openSearchModal,
+  openConnectWizardModal,
   closeModal,
   vaultView,
   type OpenSettingsOptions,
@@ -54,27 +48,25 @@ import SearchModalContainer from "./surfaces/search/SearchModalContainer.vue";
 import VaultPickerContainer from "./surfaces/vault-picker/VaultPickerContainer.vue";
 import CloneWizardContainer from "./surfaces/clone-wizard/CloneWizardContainer.vue";
 import CloneManualFormContainer from "./surfaces/clone-manual-form/CloneManualFormContainer.vue";
+import ConnectWizardContainer from "./surfaces/connect-wizard/ConnectWizardContainer.vue";
 import ArticleContainer from "./surfaces/article/ArticleContainer.vue";
 import PageListContainer from "./surfaces/page-list/PageListContainer.vue";
 import RecentContainer from "./surfaces/recent/RecentContainer.vue";
 import TrashContainer from "./surfaces/trash/TrashContainer.vue";
 import { createApp, watch } from "vue";
-import {
-  reduceWizard,
-  initialWizardState,
-  isDone as isWizardDone,
-  isSwitchedToManual as isWizardSwitchedToManual,
-  isBusyStep,
-  type WizardState,
-  type WizardAction,
-  type WizardProvider,
-} from "./connect-wizard";
 // Foundation ticket (01): every native dialog call in this file goes
 // through `./dialogs`, which documents (in one place) why `confirm`/
 // `message` come from the dialog plugin rather than `window.confirm`/
 // `window.alert`, and why a few pre-existing call sites still use those
 // broken globals unchanged.
-import { confirmDialog, messageDialog, promptDialog, confirmBrowser, alertBrowser } from "./dialogs";
+import {
+  confirmDialog,
+  messageDialog,
+  promptDialog,
+  confirmBrowser,
+  alertBrowser,
+  withPlaintextFallbackConsent,
+} from "./dialogs";
 
 // Ticket 10: the guided clone wizard and the standalone "git clone" manual
 // form are now the `surfaces/clone-wizard/`/`surfaces/clone-manual-form/`
@@ -85,6 +77,24 @@ const cloneWizardRootEl = document.querySelector<HTMLElement>("#clone-wizard-roo
 if (cloneWizardRootEl) mountIsland(cloneWizardRootEl, CloneWizardContainer);
 const cloneManualRootEl = document.querySelector<HTMLElement>("#clone-manual-root");
 if (cloneManualRootEl) mountIsland(cloneManualRootEl, CloneManualFormContainer);
+
+// Ticket 11: the guided connect wizard is now the `surfaces/connect-wizard/`
+// Vue island, mounted at `#connect-wizard-root` -- shown from `state/ui.ts`'s
+// `modal` state (`'connectWizard'`), layered over the still-vanilla Settings
+// modal exactly as before (see `styles.css`'s `.connect-wizard` doc
+// comment). `refreshCommitAuthorFieldsInVanilla` is its one temporary
+// callback root prop: once the wizard's own "Commit as" step saves a new
+// commit author, Settings' still-vanilla "Commit as" fields (which the
+// wizard never touches directly) need to be repopulated the same way
+// `refreshCommitAuthorFields` already keeps them in sync everywhere else in
+// this file -- delete this indirection once Settings migrates to Vue
+// (ticket 12) and can just read `state/` like every other migrated surface.
+const connectWizardRootEl = document.querySelector<HTMLElement>("#connect-wizard-root");
+if (connectWizardRootEl) {
+  mountIsland(connectWizardRootEl, ConnectWizardContainer, {
+    refreshCommitAuthorFieldsInVanilla: refreshCommitAuthorFields,
+  });
+}
 
 const workspaceEl = document.querySelector<HTMLElement>("#workspace");
 const sidebarEl = document.querySelector<HTMLElement>("#sidebar");
@@ -337,15 +347,15 @@ const settingsCommitAuthorEmailEl = document.querySelector<HTMLInputElement>("#s
 const settingsCommitAuthorButtonEl = document.querySelector<HTMLButtonElement>("#settings-commit-author-button");
 const settingsCommitAuthorStatusEl = document.querySelector<HTMLElement>("#settings-commit-author-status");
 
-// Ticket 09: the guided connect wizard's DOM handles. `connectWizardBodyEl`
-// is rebuilt per-step by `renderWizardStep` below; everything else is
-// static chrome (header, back/manual-setup footer) shared by every step.
+// Ticket 11: the guided connect wizard is now the `surfaces/connect-wizard/`
+// Vue island, mounted at `#connect-wizard-root` -- it shows itself from
+// `state/ui.ts`'s `modal` state. Only its still-vanilla entry point inside
+// Settings (`#connect-wizard-open-button`) needs a DOM handle here;
+// `#sync-section-connect-button` already has one above
+// (`syncSectionConnectButtonEl`). Both now call `state/ui.ts`'s
+// `openConnectWizardModal` directly instead of this file's own (now
+// deleted) `openConnectWizard` -- see `init()` below.
 const connectWizardOpenButtonEl = document.querySelector<HTMLButtonElement>("#connect-wizard-open-button");
-const connectWizardOverlayEl = document.querySelector<HTMLElement>("#connect-wizard-overlay");
-const connectWizardBodyEl = document.querySelector<HTMLElement>("#connect-wizard-body");
-const connectWizardCloseButtonEl = document.querySelector<HTMLButtonElement>("#connect-wizard-close-button");
-const connectWizardBackButtonEl = document.querySelector<HTMLButtonElement>("#connect-wizard-back-button");
-const connectWizardManualButtonEl = document.querySelector<HTMLButtonElement>("#connect-wizard-manual-button");
 
 // Ticket 05: the open page, page list, trash list, and Recent all moved
 // into `state/pages.ts` (`pagesState.openPage`/`pagesState.pages`/
@@ -847,32 +857,7 @@ function syncSubformKindFor(credentialKind: CredentialKind | null, provider: str
   }
 }
 
-/** Code-review follow-up (ticket 02/04): wraps a `connect*` call so the
- * backend's `PLAINTEXT_CONSENT_REQUIRED_ERROR` rejection (no keychain
- * reachable, and the caller hadn't consented to plaintext storage yet) turns
- * into the same "store as plaintext instead?" consent dialog ticket 13's
- * reconnect path already uses (`handleStoreAsPlaintextClick`) -- reused here
- * for the *initial* connect path, which never had one before. `attempt` is
- * always first called with `allowPlaintextFallback: false`; it's retried
- * with `true` only if that specific rejection comes back and the user
- * confirms. Any other rejection (wrong token, unreachable remote, rejected
- * SSH host key, ...) passes straight through unchanged. */
-async function withPlaintextFallbackConsent<T>(attempt: (allowPlaintextFallback: boolean) => Promise<T>): Promise<T> {
-  try {
-    return await attempt(false);
-  } catch (err) {
-    if (String(err) !== PLAINTEXT_CONSENT_REQUIRED_ERROR) throw err;
-    const confirmed = confirmBrowser(
-      "No keychain is available on this device. Store this connection's credential as a plaintext " +
-        "file instead? This is less secure than the keychain, and should only be used when no keychain " +
-        "is available.",
-    );
-    if (!confirmed) throw err;
-    return attempt(true);
-  }
-}
-
-/** Holds the generated/imported key between "Generate"/"Import" and "Connect" -- mirrors `wizardSshKey`. */
+/** Holds the generated/imported key between "Generate"/"Import" and "Connect" -- same pattern `useConnectWizard.ts`'s own local `sshKey` variable now uses. */
 let settingsSshKey: SshKeyInfo | null = null;
 
 async function handleSettingsSshKeyGenerateClick() {
@@ -1191,666 +1176,6 @@ async function maybeOfferProviderCommitAuthorSwitch(suggested: CommitAuthor | nu
   await refreshCommitAuthorFields();
 }
 
-// --- Ticket 09: guided connect wizard -------------------------------------
-//
-// A compact modal (layered over the Settings modal, not full-screen -- see
-// index.html's `#connect-wizard-overlay`) driven by `connect-wizard.ts`'s
-// pure `reduceWizard` state machine. This section owns everything the
-// reducer deliberately doesn't: rendering each step's DOM and performing the
-// actual `invoke` calls (device-flow polling, repo list/create, the real
-// `connect_*` test-fetch-then-persist calls, and finally ticket 08's
-// "Commit as" step).
-//
-// Ephemeral data the reducer doesn't track (access tokens, fetched repo
-// lists, generated/imported SSH key material) lives in these module-level
-// variables, reset every time the wizard is (re)opened -- mirroring how
-// `pendingGithubTokenPair` already holds the raw-form GitHub flow's token
-// between steps.
-
-let wizardState: WizardState = initialWizardState;
-let wizardAccessToken: string | null = null;
-/** Only meaningful for `credentialKind === "oauth"` -- carried alongside `wizardAccessToken` since `connectGithubOauth`/`connectGitlabOauth` need the full token pair, not just the access token, to persist a refreshable connection (tickets 06/07). */
-let wizardRefreshToken: string | undefined;
-let wizardAccessTokenExpiresAt = "";
-let wizardRepos: RepoInfo[] = [];
-let wizardSshKey: SshKeyInfo | null = null;
-/** Bumped on every open/close so a stale device-flow poll loop from a previous attempt can tell it's been abandoned and stop touching the DOM/state. */
-let wizardGeneration = 0;
-
-function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  className?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function dispatchWizard(action: WizardAction) {
-  wizardState = reduceWizard(wizardState, action);
-  if (isWizardSwitchedToManual(wizardState)) {
-    // Ticket 11: close this wizard's own chrome and open the "Sync" section
-    // instead of rendering a step -- reads `wizardState.remoteUrl` before
-    // it's reset by the next `openConnectWizard`, same as `closeConnectWizard`
-    // below leaves it alone until then.
-    handleWizardManualSetupClick();
-    return;
-  }
-  renderWizardStep();
-  if (isWizardDone(wizardState)) {
-    closeConnectWizard();
-  }
-}
-
-function openConnectWizard() {
-  if (!connectWizardOverlayEl) return;
-  wizardGeneration += 1;
-  wizardState = { ...initialWizardState };
-  wizardAccessToken = null;
-  wizardRefreshToken = undefined;
-  wizardAccessTokenExpiresAt = "";
-  wizardRepos = [];
-  wizardSshKey = null;
-  wizardPendingAccessTokenConnect = null;
-  connectWizardOverlayEl.removeAttribute("hidden");
-  renderWizardStep();
-}
-
-function closeConnectWizard() {
-  wizardGeneration += 1; // invalidates any in-flight poll loop
-  connectWizardOverlayEl?.setAttribute("hidden", "");
-}
-
-/**
- * Ticket 11's "Switch to manual setup" escape hatch: closes this wizard's
- * own chrome and opens Settings' always-visible "Sync" section instead,
- * carrying over `wizardState.remoteUrl` if the wizard had already committed
- * one (a pasted/created/picked repository URL) -- see `openSettingsInVanilla`'s
- * doc comment for what "carrying over" does and doesn't cover.
- */
-function handleWizardManualSetupClick() {
-  const remoteUrl = wizardState.remoteUrl ?? "";
-  closeConnectWizard();
-  openSettings({ section: "sync", prefillUrl: remoteUrl });
-}
-
-function providerLabel(provider: WizardProvider | null): string {
-  if (provider === "github") return "GitHub";
-  if (provider === "gitlab") return "GitLab";
-  return "this provider";
-}
-
-/** Renders the current step's content into `#connect-wizard-body`, and updates the shared "Back" button's visibility/label. */
-function renderWizardStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.innerHTML = "";
-
-  const canGoBack = !isBusyStep(wizardState.step) && wizardState.step !== "hasRepo" && wizardState.step !== "done";
-  if (connectWizardBackButtonEl) connectWizardBackButtonEl.hidden = !canGoBack;
-
-  switch (wizardState.step) {
-    case "hasRepo":
-      renderHasRepoStep();
-      break;
-    case "providerChoice":
-      renderProviderChoiceStep();
-      break;
-    case "credentialChoice":
-      renderCredentialChoiceStep();
-      break;
-    case "otherCredentialKindChoice":
-      renderOtherCredentialKindChoiceStep();
-      break;
-    case "oauthSignIn":
-      renderOauthSignInStep();
-      break;
-    case "repoVisibility":
-      renderRepoVisibilityStep();
-      break;
-    case "repoPicker":
-      renderRepoPickerStep();
-      break;
-    case "pasteUrl":
-      renderPasteUrlStep();
-      break;
-    case "connecting":
-      renderConnectingStep();
-      break;
-    case "connectError":
-      renderConnectErrorStep();
-      break;
-    case "commitAuthor":
-      void renderCommitAuthorStep();
-      break;
-    case "done":
-      break;
-  }
-}
-
-function renderHasRepoStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.appendChild(el("p", "wizard-question", "Do you already have a repository?"));
-  const row = el("div", "wizard-button-row");
-
-  const yesButton = el("button", undefined, "Yes, I have one");
-  yesButton.type = "button";
-  yesButton.addEventListener("click", () => dispatchWizard({ type: "chooseHasRepo", hasRepo: true }));
-
-  const noButton = el("button", undefined, "No, create one");
-  noButton.type = "button";
-  noButton.addEventListener("click", () => dispatchWizard({ type: "chooseHasRepo", hasRepo: false }));
-
-  row.appendChild(yesButton);
-  row.appendChild(noButton);
-  connectWizardBodyEl.appendChild(row);
-}
-
-function renderProviderChoiceStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.appendChild(el("p", "wizard-question", "Which provider is the repository on?"));
-  const row = el("div", "wizard-button-row");
-
-  const githubButton = el("button", undefined, "GitHub");
-  githubButton.type = "button";
-  githubButton.addEventListener("click", () => dispatchWizard({ type: "chooseProvider", provider: "github" }));
-  row.appendChild(githubButton);
-
-  const gitlabButton = el("button", undefined, "GitLab");
-  gitlabButton.type = "button";
-  gitlabButton.addEventListener("click", () => dispatchWizard({ type: "chooseProvider", provider: "gitlab" }));
-  row.appendChild(gitlabButton);
-
-  // A generic-provider create-repo API doesn't exist (ticket 09's
-  // create-new path is GitHub/GitLab only) -- only offered for pick-existing.
-  if (wizardState.hasRepo) {
-    const otherButton = el("button", undefined, "Another provider");
-    otherButton.type = "button";
-    otherButton.addEventListener("click", () => dispatchWizard({ type: "chooseProvider", provider: "other" }));
-    row.appendChild(otherButton);
-  }
-
-  connectWizardBodyEl.appendChild(row);
-}
-
-function renderCredentialChoiceStep() {
-  if (!connectWizardBodyEl) return;
-  const label = providerLabel(wizardState.provider);
-  connectWizardBodyEl.appendChild(el("p", "wizard-question", `How do you want to connect to ${label}?`));
-
-  const signInButton = el("button", "wizard-primary-action", `Sign in with ${label}`);
-  signInButton.type = "button";
-  signInButton.addEventListener("click", () => dispatchWizard({ type: "chooseOauthSignIn" }));
-  connectWizardBodyEl.appendChild(signInButton);
-
-  // Ticket 09 checklist item 5: always available, even for GitHub/GitLab --
-  // for orgs that block third-party OAuth apps.
-  const otherWaysButton = el("button", "wizard-secondary-action", "Other ways to connect");
-  otherWaysButton.type = "button";
-  otherWaysButton.addEventListener("click", () => dispatchWizard({ type: "chooseOtherWaysToConnect" }));
-  connectWizardBodyEl.appendChild(otherWaysButton);
-}
-
-function renderOtherCredentialKindChoiceStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.appendChild(el("p", "wizard-question", "How do you want to authenticate?"));
-  const row = el("div", "wizard-button-row");
-
-  const tokenButton = el("button", undefined, "Access token");
-  tokenButton.type = "button";
-  tokenButton.addEventListener("click", () =>
-    dispatchWizard({ type: "chooseOtherCredentialKind", kind: "accessToken" }),
-  );
-  row.appendChild(tokenButton);
-
-  const sshButton = el("button", undefined, "SSH key");
-  sshButton.type = "button";
-  sshButton.addEventListener("click", () => dispatchWizard({ type: "chooseOtherCredentialKind", kind: "sshKey" }));
-  row.appendChild(sshButton);
-
-  connectWizardBodyEl.appendChild(row);
-}
-
-/** Ticket 06/07's device-flow steps, driven the same way the raw forms already do, but landing on `dispatchWizard` transitions instead of their own local status text. */
-function renderOauthSignInStep() {
-  if (!connectWizardBodyEl) return;
-  const provider = wizardState.provider;
-  const statusEl = el("p", "settings-connect-status", `Requesting a device code from ${providerLabel(provider)}…`);
-  connectWizardBodyEl.appendChild(statusEl);
-  const codeEl = el("div", "settings-connect-status");
-  codeEl.hidden = true;
-  connectWizardBodyEl.appendChild(codeEl);
-
-  const generation = wizardGeneration;
-  void runOauthSignIn(provider, statusEl, codeEl, generation);
-}
-
-async function runOauthSignIn(
-  provider: WizardProvider | null,
-  statusEl: HTMLElement,
-  codeEl: HTMLElement,
-  generation: number,
-) {
-  const stale = () => generation !== wizardGeneration;
-  try {
-    const device = provider === "gitlab" ? await startGitlabDeviceFlow() : await startGithubDeviceFlow();
-    if (stale()) return;
-
-    const link = el("a", undefined, device.verificationUri);
-    link.href = device.verificationUri;
-    link.target = "_blank";
-    link.rel = "noopener";
-    const codeText = el("p");
-    codeText.appendChild(document.createTextNode("Go to "));
-    codeText.appendChild(link);
-    codeText.appendChild(document.createTextNode(" and enter code: "));
-    codeText.appendChild(el("strong", undefined, device.userCode));
-    codeEl.innerHTML = "";
-    codeEl.appendChild(codeText);
-    codeEl.hidden = false;
-    statusEl.textContent = "Waiting for you to approve in the browser…";
-
-    const deadline = Date.now() + device.expiresInSecs * 1000;
-    let intervalMs = Math.max(device.intervalSecs, 1) * 1000;
-    let accessToken: string;
-    let refreshToken: string | undefined;
-    let accessTokenExpiresAt: string;
-
-    for (;;) {
-      if (stale()) return;
-      if (Date.now() >= deadline) throw new Error(`The ${providerLabel(provider)} sign-in code expired before it was confirmed.`);
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
-      if (stale()) return;
-
-      const result = provider === "gitlab" ? await pollGitlabDeviceFlow(device.deviceCode) : await pollGithubDeviceFlow(device.deviceCode);
-      if (result.outcome === "pending") continue;
-      if (result.outcome === "slowDown") {
-        intervalMs += 5000;
-        continue;
-      }
-      if (result.outcome === "denied") throw new Error(`${providerLabel(provider)} sign-in was denied.`);
-      if (result.outcome === "expired") throw new Error(`The ${providerLabel(provider)} sign-in code expired before it was confirmed.`);
-      if (result.outcome === "error") throw new Error(result.message);
-
-      accessToken = result.accessToken;
-      refreshToken = result.refreshToken;
-      accessTokenExpiresAt = result.accessTokenExpiresAt;
-      break;
-    }
-
-    if (stale()) return;
-
-    // The GitHub App-installation check from ticket 06 is per-repository, so
-    // it can't run yet here (no repo has been picked/created); the wizard's
-    // later `connecting` step (`performWizardConnect`) runs it right before
-    // the real `connect_github_oauth` test fetch instead, once `remoteUrl`
-    // is known -- same "install first, connect second" order ticket 06's
-    // raw form already uses.
-    wizardAccessToken = accessToken;
-    wizardRefreshToken = refreshToken;
-    wizardAccessTokenExpiresAt = accessTokenExpiresAt;
-    codeEl.hidden = true;
-    dispatchWizard({ type: "oauthSignInSucceeded", accessToken });
-  } catch (err) {
-    if (stale()) return;
-    statusEl.textContent = String(err);
-    codeEl.hidden = true;
-  }
-}
-
-function renderRepoVisibilityStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.appendChild(el("p", "wizard-question", "Name the new repository:"));
-
-  const nameInput = el("input");
-  nameInput.type = "text";
-  nameInput.placeholder = "my-notes";
-  nameInput.value = wizardState.repoName;
-  nameInput.addEventListener("input", () => dispatchWizard({ type: "setRepoName", name: nameInput.value }));
-  connectWizardBodyEl.appendChild(nameInput);
-
-  const visibilityRow = el("div", "wizard-button-row");
-  const privateLabel = el("label");
-  const privateRadio = el("input");
-  privateRadio.type = "radio";
-  privateRadio.name = "wizard-visibility";
-  privateRadio.checked = wizardState.visibility === "private";
-  privateRadio.addEventListener("change", () => dispatchWizard({ type: "setVisibility", visibility: "private" }));
-  privateLabel.appendChild(privateRadio);
-  privateLabel.appendChild(document.createTextNode(" Private (recommended)"));
-  visibilityRow.appendChild(privateLabel);
-
-  const publicLabel = el("label");
-  const publicRadio = el("input");
-  publicRadio.type = "radio";
-  publicRadio.name = "wizard-visibility";
-  publicRadio.checked = wizardState.visibility === "public";
-  publicRadio.addEventListener("change", () => dispatchWizard({ type: "setVisibility", visibility: "public" }));
-  publicLabel.appendChild(publicRadio);
-  publicLabel.appendChild(document.createTextNode(" Public"));
-  visibilityRow.appendChild(publicLabel);
-  connectWizardBodyEl.appendChild(visibilityRow);
-
-  const createButton = el("button", "wizard-primary-action", "Create repository");
-  createButton.type = "button";
-  createButton.addEventListener("click", () => void handleCreateRepoClick(createButton));
-  connectWizardBodyEl.appendChild(createButton);
-
-  const errorEl = el("p", "error wizard-inline-error");
-  errorEl.hidden = true;
-  errorEl.id = "wizard-create-repo-error";
-  connectWizardBodyEl.appendChild(errorEl);
-}
-
-async function handleCreateRepoClick(button: HTMLButtonElement) {
-  const name = wizardState.repoName.trim();
-  const errorEl = document.getElementById("wizard-create-repo-error");
-  const showError = (message: string) => {
-    if (errorEl) {
-      errorEl.textContent = message;
-      errorEl.hidden = false;
-    }
-  };
-  if (!name) {
-    showError("Give the repository a name.");
-    return;
-  }
-  if (!wizardAccessToken) {
-    showError("Sign-in is required before creating a repository.");
-    return;
-  }
-
-  button.setAttribute("disabled", "");
-  const generation = wizardGeneration;
-  try {
-    const isPrivate = wizardState.visibility === "private";
-    const repo =
-      wizardState.provider === "gitlab"
-        ? await createGitlabRepository(name, isPrivate, wizardAccessToken)
-        : await createGithubRepository(name, isPrivate, wizardAccessToken);
-    if (generation !== wizardGeneration) return;
-    dispatchWizard({ type: "repoReady", remoteUrl: repo.cloneUrl });
-  } catch (err) {
-    if (generation !== wizardGeneration) return;
-    showError(`Couldn't create the repository: ${String(err)}`);
-  } finally {
-    if (generation === wizardGeneration) button.removeAttribute("disabled");
-  }
-}
-
-function renderRepoPickerStep() {
-  if (!connectWizardBodyEl) return;
-  const statusEl = el("p", "settings-connect-status", "Loading your repositories…");
-  connectWizardBodyEl.appendChild(statusEl);
-  const listEl = el("ul", "wizard-repo-list");
-  connectWizardBodyEl.appendChild(listEl);
-
-  const generation = wizardGeneration;
-  void loadRepoPicker(statusEl, listEl, generation);
-}
-
-async function loadRepoPicker(statusEl: HTMLElement, listEl: HTMLElement, generation: number) {
-  if (!wizardAccessToken) {
-    statusEl.textContent = "Sign-in is required before listing repositories.";
-    return;
-  }
-  try {
-    wizardRepos =
-      wizardState.provider === "gitlab"
-        ? await listGitlabRepositories(wizardAccessToken)
-        : await listGithubRepositories(wizardAccessToken);
-    if (generation !== wizardGeneration) return;
-
-    if (wizardRepos.length === 0) {
-      statusEl.textContent = "No repositories found for this account.";
-      return;
-    }
-    statusEl.textContent = "Pick a repository:";
-    for (const repo of wizardRepos) {
-      const item = el("li");
-      const button = el("button", "wizard-repo-item");
-      button.type = "button";
-      button.appendChild(el("span", "wizard-repo-name", repo.fullName));
-      button.appendChild(el("span", "wizard-repo-visibility", repo.private ? "Private" : "Public"));
-      button.addEventListener("click", () => dispatchWizard({ type: "repoReady", remoteUrl: repo.cloneUrl }));
-      item.appendChild(button);
-      listEl.appendChild(item);
-    }
-  } catch (err) {
-    if (generation !== wizardGeneration) return;
-    statusEl.textContent = `Couldn't load repositories: ${String(err)}`;
-  }
-}
-
-function renderPasteUrlStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.appendChild(el("p", "wizard-question", "Enter the repository's URL:"));
-
-  const urlInput = el("input");
-  urlInput.type = "text";
-  urlInput.placeholder = "https://example.com/user/repo.git";
-  connectWizardBodyEl.appendChild(urlInput);
-
-  if (wizardState.credentialKind === "accessToken") {
-    const usernameInput = el("input");
-    usernameInput.type = "text";
-    usernameInput.placeholder = "Username";
-    connectWizardBodyEl.appendChild(usernameInput);
-    const tokenInput = el("input");
-    tokenInput.type = "password";
-    tokenInput.placeholder = "Access token";
-    connectWizardBodyEl.appendChild(tokenInput);
-
-    const errorEl = el("p", "error wizard-inline-error");
-    errorEl.hidden = true;
-
-    const connectButton = el("button", "wizard-primary-action", "Connect");
-    connectButton.type = "button";
-    connectButton.addEventListener("click", () => {
-      const remoteUrl = urlInput.value.trim();
-      const username = usernameInput.value.trim();
-      const token = tokenInput.value;
-      if (!remoteUrl || !username || !token) {
-        errorEl.textContent = "Repository URL, username, and access token are all required.";
-        errorEl.hidden = false;
-        return;
-      }
-      errorEl.hidden = true;
-      wizardPendingAccessTokenConnect = { remoteUrl, username, token };
-      dispatchWizard({ type: "urlEntered", remoteUrl });
-    });
-    connectWizardBodyEl.appendChild(connectButton);
-    connectWizardBodyEl.appendChild(errorEl);
-    return;
-  }
-
-  // SSH key path (ticket 05): generate (default) or import, show the public
-  // key + fingerprint, then connect.
-  const keyStatusEl = el("p", "settings-connect-status");
-  connectWizardBodyEl.appendChild(keyStatusEl);
-
-  const generateButton = el("button", undefined, "Generate a new key");
-  generateButton.type = "button";
-  generateButton.addEventListener("click", () => void handleWizardGenerateSshKey(keyStatusEl));
-  connectWizardBodyEl.appendChild(generateButton);
-
-  const importButton = el("button", undefined, "Import an existing key");
-  importButton.type = "button";
-  importButton.addEventListener("click", () => void handleWizardImportSshKey(keyStatusEl));
-  connectWizardBodyEl.appendChild(importButton);
-
-  const connectButton = el("button", "wizard-primary-action", "Connect");
-  connectButton.type = "button";
-  connectButton.addEventListener("click", () => {
-    const remoteUrl = urlInput.value.trim();
-    if (!remoteUrl) {
-      keyStatusEl.textContent = "Enter the repository's URL first.";
-      return;
-    }
-    if (!wizardSshKey) {
-      keyStatusEl.textContent = "Generate (or import) a key first.";
-      return;
-    }
-    dispatchWizard({ type: "urlEntered", remoteUrl });
-  });
-  connectWizardBodyEl.appendChild(connectButton);
-}
-
-/** Holds the pasted-URL access-token form's values between `pasteUrl` and `connecting`, since the reducer only tracks `remoteUrl`. */
-let wizardPendingAccessTokenConnect: { remoteUrl: string; username: string; token: string } | null = null;
-
-async function handleWizardGenerateSshKey(statusEl: HTMLElement) {
-  statusEl.textContent = "Generating…";
-  try {
-    wizardSshKey = await generateSshKey();
-    statusEl.textContent = `Key ready (fingerprint ${wizardSshKey.fingerprintSha256}). Add the public key to your provider, then Connect.`;
-  } catch (err) {
-    statusEl.textContent = String(err);
-  }
-}
-
-/**
- * Ticket 05's import path, offered here via `window.prompt` the same way
- * this app already collects a couple of other simple text values (e.g.
- * the "new page" title prompt, now `PageListContainer.vue`'s `newPage`)
- * rather than a bespoke multi-line
- * form -- validates the key (and passphrase, if given) without persisting
- * anything, same as `handleWizardGenerateSshKey`.
- */
-async function handleWizardImportSshKey(statusEl: HTMLElement) {
-  const privateKeyOpenssh = promptDialog("Paste the private key (OpenSSH format):");
-  if (privateKeyOpenssh === null || !privateKeyOpenssh.trim()) return;
-  const passphrase = promptDialog("Passphrase (leave blank if none):") ?? undefined;
-
-  statusEl.textContent = "Importing…";
-  try {
-    wizardSshKey = await importSshKey(privateKeyOpenssh, passphrase || undefined);
-    statusEl.textContent = `Key imported (fingerprint ${wizardSshKey.fingerprintSha256}). Add the public key to your provider, then Connect.`;
-  } catch (err) {
-    statusEl.textContent = String(err);
-  }
-}
-
-function renderConnectingStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.appendChild(el("p", "settings-connect-status", "Connecting…"));
-  const generation = wizardGeneration;
-  void performWizardConnect(generation);
-}
-
-/**
- * Ticket 09 checklist item 7: the real test fetch every `connect_*` command
- * already runs before persisting anything (`connection::try_connect`) --
- * this just routes to whichever one matches `credentialKind`/`provider` and
- * turns a failure into `connectFailed` (a clear in-wizard error banner) or a
- * success into `connectSucceeded` (-> the "Commit as" step).
- */
-async function performWizardConnect(generation: number) {
-  const remoteUrl = wizardState.remoteUrl;
-  if (!remoteUrl) {
-    dispatchWizard({ type: "connectFailed", message: "No repository URL to connect to." });
-    return;
-  }
-  try {
-    if (wizardState.credentialKind === "oauth") {
-      if (!wizardAccessToken) throw new Error("Sign-in is required before connecting.");
-      if (wizardState.provider === "github") {
-        const installation = await checkGithubInstallation(remoteUrl, wizardAccessToken);
-        if (installation.status === "notInstalled") {
-          throw new Error(
-            `Cerebrite isn't installed on this repository yet. Install it at ${installation.installUrl}, then try again.`,
-          );
-        }
-        await withPlaintextFallbackConsent((allow) =>
-          connectGithubOauth(remoteUrl, wizardAccessToken!, wizardRefreshToken ?? "", wizardAccessTokenExpiresAt, allow),
-        );
-      } else {
-        await withPlaintextFallbackConsent((allow) =>
-          connectGitlabOauth(remoteUrl, wizardAccessToken!, wizardRefreshToken, wizardAccessTokenExpiresAt, allow),
-        );
-      }
-    } else if (wizardState.credentialKind === "accessToken") {
-      if (!wizardPendingAccessTokenConnect) throw new Error("Missing access token details.");
-      await withPlaintextFallbackConsent((allow) =>
-        connectAccessToken(
-          wizardPendingAccessTokenConnect!.remoteUrl,
-          wizardPendingAccessTokenConnect!.username,
-          wizardPendingAccessTokenConnect!.token,
-          allow,
-        ),
-      );
-    } else if (wizardState.credentialKind === "sshKey") {
-      if (!wizardSshKey) throw new Error("Generate or import an SSH key first.");
-      await withPlaintextFallbackConsent((allow) =>
-        connectSshKey(remoteUrl, wizardSshKey!.privateKeyOpenssh, wizardSshKey!.passphrase, allow),
-      );
-    } else {
-      throw new Error("No connection method was chosen.");
-    }
-    if (generation !== wizardGeneration) return;
-    dispatchWizard({ type: "connectSucceeded" });
-  } catch (err) {
-    if (generation !== wizardGeneration) return;
-    dispatchWizard({ type: "connectFailed", message: `Couldn't connect: ${String(err)}` });
-  }
-}
-
-function renderConnectErrorStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.appendChild(el("p", "error", wizardState.error ?? "Couldn't connect."));
-  const retryButton = el("button", "wizard-primary-action", "Try again");
-  retryButton.type = "button";
-  retryButton.addEventListener("click", () => dispatchWizard({ type: "retry" }));
-  connectWizardBodyEl.appendChild(retryButton);
-}
-
-/** Ticket 09's last step, reusing ticket 08's exact commands (never a parallel author-writing path). */
-async function renderCommitAuthorStep() {
-  if (!connectWizardBodyEl) return;
-  connectWizardBodyEl.appendChild(el("p", "wizard-question", "Commit as:"));
-
-  const nameInput = el("input");
-  nameInput.type = "text";
-  nameInput.placeholder = "Name";
-  const emailInput = el("input");
-  emailInput.type = "text";
-  emailInput.placeholder = "Email";
-
-  try {
-    const confirmed = await getCommitAuthor();
-    const author = confirmed ?? (await commitAuthorPrefill()).author;
-    nameInput.value = author?.name ?? "";
-    emailInput.value = author?.email ?? "";
-  } catch {
-    // No vault open -- leave blank; the commands below will surface a clear
-    // error if that's somehow still the case by submit time.
-  }
-
-  connectWizardBodyEl.appendChild(nameInput);
-  connectWizardBodyEl.appendChild(emailInput);
-
-  const errorEl = el("p", "error wizard-inline-error");
-  errorEl.hidden = true;
-
-  const saveButton = el("button", "wizard-primary-action", "Finish");
-  saveButton.type = "button";
-  saveButton.addEventListener("click", () => {
-    void (async () => {
-      try {
-        await confirmCommitAuthor(nameInput.value.trim(), emailInput.value.trim());
-        await refreshCommitAuthorFields();
-        dispatchWizard({ type: "commitAuthorConfirmed" });
-      } catch (err) {
-        errorEl.textContent = String(err);
-        errorEl.hidden = false;
-      }
-    })();
-  });
-  connectWizardBodyEl.appendChild(saveButton);
-  connectWizardBodyEl.appendChild(errorEl);
-}
-
 function closeSettingsModal() {
   settingsModalOverlayEl?.setAttribute("hidden", "");
 }
@@ -1918,25 +1243,17 @@ async function init() {
   // of this file, at module scope) -- it owns its own click-to-open/Escape/
   // outside-click handling, replacing everything that used to be wired up
   // here.
-  syncSectionConnectButtonEl?.addEventListener("click", openConnectWizard);
+  // Ticket 11: both "Connect…" entry points now open the connect wizard via
+  // `state/ui.ts`'s `openConnectWizardModal` directly, the same way
+  // `searchButtonEl` above calls `openSearchModal` directly -- the wizard
+  // itself is the `surfaces/connect-wizard/` Vue island (mounted near the
+  // top of this file), which owns everything past this click.
+  syncSectionConnectButtonEl?.addEventListener("click", openConnectWizardModal);
+  connectWizardOpenButtonEl?.addEventListener("click", openConnectWizardModal);
   syncSectionDisconnectButtonEl?.addEventListener("click", () => void handleDisconnectClick());
   settingsOrphanCleanupButtonEl?.addEventListener("click", () => void handleOrphanCleanupClick());
   settingsRemoveAllCredentialsButtonEl?.addEventListener("click", () => void handleRemoveAllCredentialsClick());
   void refreshSyncStatus();
-
-  connectWizardOpenButtonEl?.addEventListener("click", openConnectWizard);
-  connectWizardCloseButtonEl?.addEventListener("click", closeConnectWizard);
-  connectWizardBackButtonEl?.addEventListener("click", () => dispatchWizard({ type: "back" }));
-  connectWizardManualButtonEl?.addEventListener("click", () => dispatchWizard({ type: "switchToManual" }));
-  connectWizardOverlayEl?.addEventListener("click", (event) => {
-    if (event.target === connectWizardOverlayEl) closeConnectWizard();
-  });
-  connectWizardOverlayEl?.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeConnectWizard();
-    }
-  });
 
   // Ticket 10: the guided clone wizard's and the standalone "git clone"
   // manual dialog's wiring (close/back/switch-to-manual buttons, Escape,

@@ -1,11 +1,14 @@
 <script setup lang="ts">
 // Presentational surface (spec.md#surface-contract): mounts from props
-// alone, no `vault-api`/`dialogs.ts`/`src/state/` imports. This is the
-// **first modal** (spec.md#step-2-search-modal), so its overlay and
-// backdrop are written inline here -- there's no shared `<Modal>` yet (that
-// lands in step 10, the second modal). Renders `#search-modal-overlay`'s
-// old markup/classes verbatim.
+// alone, no `vault-api`/`dialogs.ts`/`src/state/` imports. This was the
+// **first modal** (spec.md#step-2-search-modal), written with its own
+// inline overlay/backdrop; ticket 11 is the *second* modal (the connect
+// wizard), so the shared overlay/backdrop/Escape shell is extracted into
+// `components/Modal.vue` and this surface switches to it here. Renders
+// `#search-modal-overlay`'s old markup/classes verbatim -- `Modal` is given
+// those exact class names as props, so nothing visual changes.
 import { computed, ref, watch } from "vue";
+import Modal from "../../components/Modal.vue";
 import type { SearchEntry, SearchResultEntry } from "./search-entry";
 
 const props = defineProps<{
@@ -28,7 +31,7 @@ const emit = defineEmits<{
   create: [query: string];
 }>();
 
-const rootEl = ref<HTMLElement | null>(null);
+const resultsListEl = ref<HTMLElement | null>(null);
 const inputEl = ref<HTMLInputElement | null>(null);
 
 // Imperative escape hatch (spec.md#imperative-escape-hatches): a stateless
@@ -73,10 +76,6 @@ function activateEntry(entry: SearchEntry) {
   else emit("create", entry.query);
 }
 
-function handleBackdropClick(event: MouseEvent) {
-  if (event.target === rootEl.value) emit("close");
-}
-
 function moveSelection(delta: number) {
   if (props.entries.length === 0) return;
   const next = props.selectedIndex < 0 ? 0 : props.selectedIndex + delta;
@@ -89,13 +88,13 @@ function activateSelected() {
   if (entry) activateEntry(entry);
 }
 
+// Escape is handled by `Modal` itself now (see the template's `@close`) --
+// this only handles the keys `Modal` doesn't know about. Bound on `Modal`
+// via Vue's attribute/listener fallthrough (a non-prop listener on a
+// component falls through to its single root element -- `Modal`'s own
+// overlay div), so both listeners fire on the same bubbled keydown.
 function handleKeydown(event: KeyboardEvent) {
   switch (event.key) {
-    case "Escape":
-      event.preventDefault();
-      event.stopPropagation();
-      emit("close");
-      break;
     case "ArrowDown":
       event.preventDefault();
       moveSelection(1);
@@ -117,63 +116,67 @@ watch(
   () => props.selectedIndex,
   (index) => {
     if (index < 0) return;
-    const rows = rootEl.value?.querySelectorAll<HTMLButtonElement>(".search-result");
+    const rows = resultsListEl.value?.querySelectorAll<HTMLButtonElement>(".search-result");
     rows?.[index]?.scrollIntoView({ block: "nearest" });
   },
 );
 </script>
 
 <template>
-  <div ref="rootEl" class="search-modal-overlay" @click="handleBackdropClick" @keydown="handleKeydown">
-    <div class="search-modal" role="dialog" aria-modal="true" aria-label="Search">
-      <div class="search-modal-header">
+  <Modal
+    label="Search"
+    overlay-class="search-modal-overlay"
+    card-class="search-modal"
+    @close="emit('close')"
+    @keydown="handleKeydown"
+  >
+    <div class="search-modal-header">
+      <input
+        ref="inputEl"
+        class="search-input"
+        type="text"
+        placeholder="Search title, tags, and body…"
+        autocomplete="off"
+        spellcheck="false"
+        :value="query"
+        @input="emit('update:query', ($event.target as HTMLInputElement).value)"
+      />
+      <label class="search-include-trash">
         <input
-          ref="inputEl"
-          class="search-input"
-          type="text"
-          placeholder="Search title, tags, and body…"
-          autocomplete="off"
-          spellcheck="false"
-          :value="query"
-          @input="emit('update:query', ($event.target as HTMLInputElement).value)"
+          type="checkbox"
+          :checked="includeTrash"
+          @change="emit('update:includeTrash', ($event.target as HTMLInputElement).checked)"
         />
-        <label class="search-include-trash">
-          <input
-            type="checkbox"
-            :checked="includeTrash"
-            @change="emit('update:includeTrash', ($event.target as HTMLInputElement).checked)"
-          />
-          Include trash
-        </label>
-      </div>
-      <ul class="search-results-list">
-        <li v-for="(entry, index) in entries" :key="entry.kind === 'result' ? entry.result.id : 'create'">
-          <button
-            type="button"
-            class="search-result"
-            :class="{ active: index === selectedIndex, 'create-page-action': entry.kind === 'create' }"
-            @click="activateEntry(entry)"
-          >
-            <template v-if="entry.kind === 'result'">
-              <span class="search-result-title">
-                <span>{{ searchResultRowLabel(entry.result) }}</span>
-                <span v-if="entry.result.inTrash" class="search-result-in-trash-badge">In trash</span>
-              </span>
-              <span v-if="entry.result.tier === 2 && entry.result.matchedTag" class="search-result-tag-chip">
-                #{{ entry.result.matchedTag }}
-              </span>
-              <span v-else-if="entry.result.tier === 3 && entry.result.snippet" class="search-result-snippet">
-                <template v-for="(part, partIndex) in snippetParts(entry.result.snippet)" :key="partIndex">
-                  <mark v-if="part.marked">{{ part.text }}</mark>
-                  <template v-else>{{ part.text }}</template>
-                </template>
-              </span>
-            </template>
-            <template v-else>Create page: '{{ entry.query }}'</template>
-          </button>
-        </li>
-      </ul>
-      <p v-if="emptyHint" class="search-empty-hint">{{ emptyHint }}</p>
+        Include trash
+      </label>
     </div>
-  </div>
+    <ul ref="resultsListEl" class="search-results-list">
+      <li v-for="(entry, index) in entries" :key="entry.kind === 'result' ? entry.result.id : 'create'">
+        <button
+          type="button"
+          class="search-result"
+          :class="{ active: index === selectedIndex, 'create-page-action': entry.kind === 'create' }"
+          @click="activateEntry(entry)"
+        >
+          <template v-if="entry.kind === 'result'">
+            <span class="search-result-title">
+              <span>{{ searchResultRowLabel(entry.result) }}</span>
+              <span v-if="entry.result.inTrash" class="search-result-in-trash-badge">In trash</span>
+            </span>
+            <span v-if="entry.result.tier === 2 && entry.result.matchedTag" class="search-result-tag-chip">
+              #{{ entry.result.matchedTag }}
+            </span>
+            <span v-else-if="entry.result.tier === 3 && entry.result.snippet" class="search-result-snippet">
+              <template v-for="(part, partIndex) in snippetParts(entry.result.snippet)" :key="partIndex">
+                <mark v-if="part.marked">{{ part.text }}</mark>
+                <template v-else>{{ part.text }}</template>
+              </template>
+            </span>
+          </template>
+          <template v-else>Create page: '{{ entry.query }}'</template>
+        </button>
+      </li>
+    </ul>
+    <p v-if="emptyHint" class="search-empty-hint">{{ emptyHint }}</p>
+  </Modal>
 </template>

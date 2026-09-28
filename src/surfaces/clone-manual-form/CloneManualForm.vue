@@ -4,11 +4,14 @@
 // `#clone-manual-overlay`'s old markup/classes verbatim (spec.md#step-9-
 // clone-wizard--clone-manual-form) -- variant B's raw-git-vocabulary door
 // into the same `clone_and_open_vault` command the guided wizard uses.
-// Device flow and the SSH key sub-form are written inline here (first
-// copies, per the ticket, alongside the clone wizard's own copies); they're
-// extracted into shared components once a second copy exists in step 10.
+// Device flow and the SSH key sub-form were written inline here as the
+// first copies, alongside the clone wizard's own copies; ticket 11's
+// connect wizard is the second copy of each, so they're now
+// `components/DeviceFlow.vue`/`SshKey.vue` and this surface switches to
+// them below.
 import { ref } from "vue";
-import type { DeviceCodeDisplay } from "../clone-wizard/useCloneWizard";
+import DeviceFlow, { type DeviceCodeDisplay } from "../../components/DeviceFlow.vue";
+import SshKey from "../../components/SshKey.vue";
 
 export type ManualCredentialKind = "accessToken" | "sshKey" | "githubOauth" | "gitlabOauth";
 
@@ -120,39 +123,17 @@ function handleKeydown(event: KeyboardEvent) {
         </div>
 
         <div v-else-if="credentialKind === 'sshKey'" class="settings-connect-form">
-          <div class="wizard-button-row">
-            <button type="button" @click="emit('generateSshKey')">Generate a new key</button>
-            <button type="button" @click="emit('importSshKey')">Import an existing key</button>
-          </div>
-          <p v-if="sshKeyStatus" class="settings-connect-status">{{ sshKeyStatus }}</p>
+          <SshKey :status="sshKeyStatus" @generate="emit('generateSshKey')" @import="emit('importSshKey')" />
         </div>
 
         <div v-else-if="credentialKind === 'githubOauth'" class="settings-connect-form">
           <button type="button" @click="emit('githubSignIn')">Sign in with GitHub</button>
-          <div v-if="githubDeviceCode" class="settings-connect-status">
-            <p>
-              Go to
-              <a :href="githubDeviceCode.verificationUri" target="_blank" rel="noopener">{{
-                githubDeviceCode.verificationUri
-              }}</a>
-              and enter code: <strong>{{ githubDeviceCode.userCode }}</strong>
-            </p>
-          </div>
-          <p v-if="githubStatus" class="settings-connect-status">{{ githubStatus }}</p>
+          <DeviceFlow v-if="githubStatus" :status="githubStatus" :device-code="githubDeviceCode" />
         </div>
 
         <div v-else class="settings-connect-form">
           <button type="button" @click="emit('gitlabSignIn')">Sign in with GitLab</button>
-          <div v-if="gitlabDeviceCode" class="settings-connect-status">
-            <p>
-              Go to
-              <a :href="gitlabDeviceCode.verificationUri" target="_blank" rel="noopener">{{
-                gitlabDeviceCode.verificationUri
-              }}</a>
-              and enter code: <strong>{{ gitlabDeviceCode.userCode }}</strong>
-            </p>
-          </div>
-          <p v-if="gitlabStatus" class="settings-connect-status">{{ gitlabStatus }}</p>
+          <DeviceFlow v-if="gitlabStatus" :status="gitlabStatus" :device-code="gitlabDeviceCode" />
         </div>
 
         <button type="button" class="wizard-primary-action" :disabled="submitting" @click="emit('submit')">

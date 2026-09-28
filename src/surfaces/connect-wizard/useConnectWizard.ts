@@ -1,71 +1,78 @@
 // Container (spec.md#surface-contract, "Wizards and the clone manual
-// form"): runs `reduceCloneWizard` and carries out its effects -- device-flow
-// polling, the repo list, and the clone itself -- mirroring exactly how
-// `main.ts`'s old ticket-10 section drove the same reducer (see
-// `clone-wizard.ts`'s own doc comment for the reducer itself, unchanged by
-// this ticket). Ephemeral data the reducer doesn't track (access tokens,
-// fetched repo lists, generated/imported SSH key material, the clone's own
-// result) lives in plain local variables/refs here, reset on every `open()`
-// -- mirroring the old module-level `cloneWizard*` variables, now local to
-// this composable instead of `src/state/` (spec.md#shared-state-statets).
-// No story (containers aren't storied).
+// form"): runs `reduceWizard` and carries out its effects -- device-flow
+// polling, repo list/create, and the real `connect_*` test-fetch-then-
+// persist calls -- mirroring exactly how `main.ts`'s old ticket-09 section
+// drove the same reducer (see `connect-wizard.ts`'s own doc comment for the
+// reducer itself, unchanged by this ticket) and how ticket 10's
+// `useCloneWizard.ts` already wraps its own sibling reducer the same way.
+// Ephemeral data the reducer doesn't track (access tokens, fetched repo
+// lists, generated/imported SSH key material) lives in plain local
+// variables/refs here, reset on every `open()` -- mirroring the old
+// module-level `wizard*` variables, now local to this composable instead of
+// `src/state/` (spec.md#shared-state-statets). No story (containers aren't
+// storied).
 import { computed, ref, shallowRef } from "vue";
 import {
-  reduceCloneWizard,
-  initialCloneWizardState,
-  isCloneWizardDone,
-  isCloneWizardSwitchedToManual,
-  isCloneWizardBusyStep,
-  type CloneWizardState,
-  type CloneWizardAction,
+  reduceWizard,
+  initialWizardState,
+  isDone as isWizardDone,
+  isSwitchedToManual as isWizardSwitchedToManual,
+  isBusyStep,
+  type WizardState,
+  type WizardAction,
   type WizardProvider,
-} from "../../clone-wizard";
+} from "../../connect-wizard";
 import {
-  pickVaultFolder,
   generateSshKey,
   importSshKey,
   startGithubDeviceFlow,
   pollGithubDeviceFlow,
   checkGithubInstallation,
+  createGithubRepository,
   listGithubRepositories,
   startGitlabDeviceFlow,
   pollGitlabDeviceFlow,
+  createGitlabRepository,
   listGitlabRepositories,
+  connectAccessToken,
+  connectSshKey,
+  connectGithubOauth,
+  connectGitlabOauth,
+  commitAuthorPrefill,
+  getCommitAuthor,
   confirmCommitAuthor,
-  cloneAndOpenVault,
   type RepoInfo,
   type SshKeyInfo,
-  type CloneCredential,
   type CommitAuthor,
 } from "../../vault-api";
-import { promptDialog } from "../../dialogs";
-import { setVaultView } from "../../state/ui";
-import { applyVaultOpened } from "../../state/vault";
-import { setCloneManualPrefill } from "../../clone-manual-handoff";
+import { promptDialog, withPlaintextFallbackConsent } from "../../dialogs";
+import { openSettings, closeConnectWizardModal } from "../../state/ui";
 import type { DeviceCodeDisplay } from "../../components/DeviceFlow.vue";
+import type { CommitAuthorValue } from "../../components/CommitAs.vue";
 
-/** Same fallback labels `connect-wizard.ts`'s driving code (main.ts) uses --
- * duplicated here rather than imported/shared, since main.ts's copy stays
- * put until step 10 migrates the connect wizard too (spec.md#shared-
- * components: `DeviceFlow` isn't extracted until its *second* copy). */
 function providerLabel(provider: WizardProvider | null): string {
   if (provider === "github") return "GitHub";
   if (provider === "gitlab") return "GitLab";
   return "this provider";
 }
 
-export type { DeviceCodeDisplay };
+export interface ConnectWizardOptions {
+  /** Ticket 11's temporary callback root prop (see `ConnectWizardContainer.vue`'s
+   * doc comment) -- refreshes Settings' still-vanilla "Commit as" fields
+   * after this wizard's own "Commit as" step saves a new one. */
+  refreshCommitAuthorFieldsInVanilla: () => Promise<void>;
+}
 
-export function useCloneWizard() {
-  const state = ref<CloneWizardState>({ ...initialCloneWizardState });
+export function useConnectWizard(options: ConnectWizardOptions) {
+  const state = ref<WizardState>({ ...initialWizardState });
 
   const oauthStatus = ref("");
   const oauthDeviceCode = shallowRef<DeviceCodeDisplay | null>(null);
   const repos = ref<RepoInfo[]>([]);
   const repoPickerStatus = ref("");
   const sshKeyStatus = ref<string | null>(null);
-  const destinationStatus = ref<string | null>(null);
-  const authorPrefill = ref<CommitAuthor | null>(null);
+  const createRepoError = ref<string | null>(null);
+  const authorPrefill = ref<CommitAuthorValue | null>(null);
   const commitAuthorError = ref<string | null>(null);
 
   // Ephemeral data the reducer doesn't track -- see this module's doc
@@ -75,55 +82,44 @@ export function useCloneWizard() {
   let accessTokenExpiresAt = "";
   let sshKey: SshKeyInfo | null = null;
   /** Holds the pasted-URL access-token form's values between `pasteUrl` and
-   * `destinationPicker`, since the reducer only tracks `remoteUrl` --
-   * mirrors the old `cloneWizardPendingAccessTokenConnect`. */
+   * `connecting`, since the reducer only tracks `remoteUrl` -- mirrors the
+   * old `wizardPendingAccessTokenConnect`. */
   let pendingAccessTokenConnect: { remoteUrl: string; username: string; token: string } | null = null;
-  let clonedPath: string | null = null;
   /** Bumped on every open/close so a stale device-flow poll loop or
-   * in-flight clone from a previous attempt can tell it's been abandoned. */
+   * in-flight connect from a previous attempt can tell it's been abandoned. */
   let generation = 0;
 
   const canGoBack = computed(
-    () => !isCloneWizardBusyStep(state.value.step) && state.value.step !== "providerChoice",
+    () => !isBusyStep(state.value.step) && state.value.step !== "hasRepo" && state.value.step !== "done",
   );
 
   function invalidate(): void {
     generation += 1;
   }
 
-  function dispatch(action: CloneWizardAction): void {
-    state.value = reduceCloneWizard(state.value, action);
-    if (isCloneWizardSwitchedToManual(state.value)) {
+  function dispatch(action: WizardAction): void {
+    state.value = reduceWizard(state.value, action);
+    if (isWizardSwitchedToManual(state.value)) {
       handleSwitchedToManual();
       return;
     }
     runStepEffect();
-    if (isCloneWizardDone(state.value)) {
+    if (isWizardDone(state.value)) {
       close();
-      void finishIntoWorkspace();
     }
   }
 
   /** Ticket 11's "Switch to manual setup" escape hatch: tears down this
-   * wizard (invalidating any in-flight poll/clone) and hands off to the
-   * standalone manual form via `clone-manual-handoff.ts`, carrying over
-   * `remoteUrl`/`destination` if either was already committed -- same
-   * accepted "may re-ask for values" limitation as before. */
+   * wizard (invalidating any in-flight poll/connect) and reuses
+   * `state/ui.ts`'s existing `openSettings` deep-link action to jump
+   * Settings to its always-visible "Sync" section, carrying over
+   * `remoteUrl` if one was already committed -- same accepted "may re-ask
+   * for the credential" limitation the old vanilla wizard had. */
   function handleSwitchedToManual(): void {
     const remoteUrl = state.value.remoteUrl ?? "";
-    const destination = state.value.destination ?? "";
     invalidate();
-    setCloneManualPrefill({ remoteUrl, destination });
-    setVaultView("cloneManual");
-  }
-
-  async function finishIntoWorkspace(): Promise<void> {
-    if (!clonedPath) return;
-    // `clone_and_open_vault` already opened the vault server-side, so this
-    // runs the shared post-open tail directly (view switch + sync refresh +
-    // page/trash load) rather than `state/vault.ts`'s `openVault`, which
-    // would re-invoke the backend `open_vault` command needlessly.
-    await applyVaultOpened(clonedPath);
+    closeConnectWizardModal();
+    openSettings({ section: "sync", prefillUrl: remoteUrl });
   }
 
   function runStepEffect(): void {
@@ -139,8 +135,11 @@ export function useCloneWizard() {
         repos.value = [];
         void loadRepoPicker(gen);
         break;
-      case "cloning":
-        void performClone(gen);
+      case "connecting":
+        void performConnect(gen);
+        break;
+      case "commitAuthor":
+        void primeCommitAuthor();
         break;
       default:
         break;
@@ -195,7 +194,7 @@ export function useCloneWizard() {
       refreshToken = refresh;
       accessTokenExpiresAt = expiresAt;
       oauthDeviceCode.value = null;
-      dispatch({ type: "oauthSignInSucceeded" });
+      dispatch({ type: "oauthSignInSucceeded", accessToken });
     } catch (err) {
       if (stale()) return;
       oauthStatus.value = String(err);
@@ -213,7 +212,7 @@ export function useCloneWizard() {
         state.value.provider === "gitlab" ? await listGitlabRepositories(accessToken) : await listGithubRepositories(accessToken);
       if (gen !== generation) return;
       repos.value = list;
-      repoPickerStatus.value = list.length === 0 ? "No repositories found for this account." : "Pick a repository to clone:";
+      repoPickerStatus.value = list.length === 0 ? "No repositories found for this account." : "Pick a repository:";
     } catch (err) {
       if (gen !== generation) return;
       repoPickerStatus.value = `Couldn't load repositories: ${String(err)}`;
@@ -224,7 +223,7 @@ export function useCloneWizard() {
     sshKeyStatus.value = "Generating…";
     try {
       sshKey = await generateSshKey();
-      sshKeyStatus.value = `Key ready (fingerprint ${sshKey.fingerprintSha256}). Add the public key to your provider, then Continue.`;
+      sshKeyStatus.value = `Key ready (fingerprint ${sshKey.fingerprintSha256}). Add the public key to your provider, then Connect.`;
     } catch (err) {
       sshKeyStatus.value = String(err);
     }
@@ -238,10 +237,48 @@ export function useCloneWizard() {
     sshKeyStatus.value = "Importing…";
     try {
       sshKey = await importSshKey(privateKeyOpenssh, passphrase || undefined);
-      sshKeyStatus.value = `Key imported (fingerprint ${sshKey.fingerprintSha256}). Add the public key to your provider, then Continue.`;
+      sshKeyStatus.value = `Key imported (fingerprint ${sshKey.fingerprintSha256}). Add the public key to your provider, then Connect.`;
     } catch (err) {
       sshKeyStatus.value = String(err);
     }
+  }
+
+  function setRepoName(name: string): void {
+    dispatch({ type: "setRepoName", name });
+  }
+
+  function setVisibility(visibility: "private" | "public"): void {
+    dispatch({ type: "setVisibility", visibility });
+  }
+
+  async function createRepo(): Promise<void> {
+    const name = state.value.repoName.trim();
+    createRepoError.value = null;
+    if (!name) {
+      createRepoError.value = "Give the repository a name.";
+      return;
+    }
+    if (!accessToken) {
+      createRepoError.value = "Sign-in is required before creating a repository.";
+      return;
+    }
+    const gen = generation;
+    try {
+      const isPrivate = state.value.visibility === "private";
+      const repo =
+        state.value.provider === "gitlab"
+          ? await createGitlabRepository(name, isPrivate, accessToken)
+          : await createGithubRepository(name, isPrivate, accessToken);
+      if (gen !== generation) return;
+      dispatch({ type: "repoReady", remoteUrl: repo.cloneUrl });
+    } catch (err) {
+      if (gen !== generation) return;
+      createRepoError.value = `Couldn't create the repository: ${String(err)}`;
+    }
+  }
+
+  function repoSelected(remoteUrl: string): void {
+    dispatch({ type: "repoReady", remoteUrl });
   }
 
   function submitPasteUrlToken(remoteUrl: string, username: string, token: string): void {
@@ -253,36 +290,21 @@ export function useCloneWizard() {
     dispatch({ type: "urlEntered", remoteUrl });
   }
 
-  function pickDestination(): void {
-    const gen = generation;
-    void (async () => {
-      try {
-        const path = await pickVaultFolder();
-        if (!path) return; // user cancelled
-        if (gen !== generation) return;
-        dispatch({ type: "destinationChosen", destination: path });
-      } catch (err) {
-        if (gen !== generation) return;
-        destinationStatus.value = String(err);
-      }
-    })();
-  }
-
-  /** Ticket 10 checklist item 4/5/7: the real clone -- `clone_and_open_vault`
-   * authenticates with whichever credential this wizard obtained, clones,
-   * classifies the four post-clone states, and only *then* persists the
-   * Connection + remembered vault path. */
-  async function performClone(gen: number): Promise<void> {
+  /** Ticket 09 checklist item 7: the real test fetch every `connect_*`
+   * command already runs before persisting anything -- routes to whichever
+   * one matches `credentialKind`/`provider`, wrapped in the same
+   * plaintext-fallback consent gate every other connect door uses, and
+   * turns a failure into `connectFailed` (a clear in-wizard error banner)
+   * or a success into `connectSucceeded` (-> "Commit as"). */
+  async function performConnect(gen: number): Promise<void> {
     const remoteUrl = state.value.remoteUrl;
-    const destination = state.value.destination;
-    if (!remoteUrl || !destination) {
-      dispatch({ type: "cloneFailed", message: "No repository or destination folder to clone into." });
+    if (!remoteUrl) {
+      dispatch({ type: "connectFailed", message: "No repository URL to connect to." });
       return;
     }
     try {
-      let credential: CloneCredential;
       if (state.value.credentialKind === "oauth") {
-        if (!accessToken) throw new Error("Sign-in is required before cloning.");
+        if (!accessToken) throw new Error("Sign-in is required before connecting.");
         if (state.value.provider === "github") {
           const installation = await checkGithubInstallation(remoteUrl, accessToken);
           if (installation.status === "notInstalled") {
@@ -290,53 +312,70 @@ export function useCloneWizard() {
               `Cerebrite isn't installed on this repository yet. Install it at ${installation.installUrl}, then try again.`,
             );
           }
-          credential = {
-            kind: "githubOauth",
-            accessToken,
-            refreshToken: refreshToken ?? "",
-            accessTokenExpiresAt,
-          };
+          await withPlaintextFallbackConsent((allow) =>
+            connectGithubOauth(remoteUrl, accessToken!, refreshToken ?? "", accessTokenExpiresAt, allow),
+          );
         } else {
-          credential = { kind: "gitlabOauth", accessToken, refreshToken, accessTokenExpiresAt };
+          await withPlaintextFallbackConsent((allow) =>
+            connectGitlabOauth(remoteUrl, accessToken!, refreshToken, accessTokenExpiresAt, allow),
+          );
         }
       } else if (state.value.credentialKind === "accessToken") {
         if (!pendingAccessTokenConnect) throw new Error("Missing access token details.");
-        credential = {
-          kind: "accessToken",
-          username: pendingAccessTokenConnect.username,
-          token: pendingAccessTokenConnect.token,
-        };
+        await withPlaintextFallbackConsent((allow) =>
+          connectAccessToken(
+            pendingAccessTokenConnect!.remoteUrl,
+            pendingAccessTokenConnect!.username,
+            pendingAccessTokenConnect!.token,
+            allow,
+          ),
+        );
       } else if (state.value.credentialKind === "sshKey") {
         if (!sshKey) throw new Error("Generate or import an SSH key first.");
-        credential = { kind: "sshKey", privateKeyOpenssh: sshKey.privateKeyOpenssh, passphrase: sshKey.passphrase };
+        await withPlaintextFallbackConsent((allow) =>
+          connectSshKey(remoteUrl, sshKey!.privateKeyOpenssh, sshKey!.passphrase, allow),
+        );
       } else {
-        throw new Error("No authentication method was chosen.");
+        throw new Error("No connection method was chosen.");
       }
-
-      const result = await cloneAndOpenVault(remoteUrl, destination, credential);
       if (gen !== generation) return;
-      clonedPath = result.vault.path;
-      authorPrefill.value = result.authorPrefill.author;
-      dispatch({ type: "cloneSucceeded" });
+      dispatch({ type: "connectSucceeded" });
     } catch (err) {
       if (gen !== generation) return;
-      dispatch({ type: "cloneFailed", message: `Couldn't clone: ${String(err)}` });
+      dispatch({ type: "connectFailed", message: `Couldn't connect: ${String(err)}` });
     }
   }
 
-  /** Ticket 10's last step, reusing ticket 08's exact `confirmCommitAuthor`
-   * command -- prefilled from the clone's own `authorPrefill` (computed by
-   * the backend at clone time) rather than a second `commitAuthorPrefill`
-   * round trip. Leaves the wizard on `commitAuthor` and shows an inline
-   * error on failure, same as before. */
+  /** Ticket 08's exact "Commit as" prefill -- confirmed repo-local ->
+   * global -> empty, same as every other door into it. */
+  async function primeCommitAuthor(): Promise<void> {
+    commitAuthorError.value = null;
+    try {
+      const confirmed = await getCommitAuthor();
+      const author: CommitAuthor | null = confirmed ?? (await commitAuthorPrefill()).author;
+      authorPrefill.value = author ? { name: author.name, email: author.email } : null;
+    } catch {
+      // No vault open -- leave blank; `confirmCommitAuthorStep` below
+      // surfaces a clear error if that's somehow still true at submit time.
+      authorPrefill.value = null;
+    }
+  }
+
+  /** Ticket 09's last step, reusing ticket 08's exact `confirmCommitAuthor`
+   * command -- never a parallel author-writing path. */
   async function confirmCommitAuthorStep(name: string, email: string): Promise<void> {
     commitAuthorError.value = null;
     try {
       await confirmCommitAuthor(name, email);
+      await options.refreshCommitAuthorFieldsInVanilla();
       dispatch({ type: "commitAuthorConfirmed" });
     } catch (err) {
       commitAuthorError.value = String(err);
     }
+  }
+
+  function chooseHasRepo(hasRepo: boolean): void {
+    dispatch({ type: "chooseHasRepo", hasRepo });
   }
 
   function chooseProvider(provider: WizardProvider): void {
@@ -355,10 +394,6 @@ export function useCloneWizard() {
     dispatch({ type: "chooseOtherCredentialKind", kind });
   }
 
-  function repoSelected(remoteUrl: string): void {
-    dispatch({ type: "repoSelected", remoteUrl });
-  }
-
   function retry(): void {
     dispatch({ type: "retry" });
   }
@@ -371,34 +406,34 @@ export function useCloneWizard() {
     dispatch({ type: "switchToManual" });
   }
 
-  /** Cancels the wizard and returns to the first-run folder-picker screen --
-   * there is no vault to fall back into. */
+  /** Closes the wizard without finishing -- per the ticket, `ui.modal`
+   * returns to `'settings'` (the vanilla Settings modal was showing
+   * underneath the whole time; see `closeConnectWizardModal`'s doc
+   * comment). */
   function close(): void {
     invalidate();
-    if (!isCloneWizardDone(state.value)) setVaultView("picker");
+    closeConnectWizardModal();
   }
 
   /** Resets every field (state and ephemeral data alike) and (re)starts
    * effects for the first step -- called by the container whenever
-   * `ui.vaultView` becomes `'cloneWizard'`. */
+   * `ui.modal` becomes `'connectWizard'`. */
   function open(): void {
     invalidate();
-    state.value = { ...initialCloneWizardState };
+    state.value = { ...initialWizardState };
     accessToken = null;
     refreshToken = undefined;
     accessTokenExpiresAt = "";
-    repos.value = [];
     sshKey = null;
     pendingAccessTokenConnect = null;
-    authorPrefill.value = null;
-    commitAuthorError.value = null;
-    clonedPath = null;
+    repos.value = [];
     oauthStatus.value = "";
     oauthDeviceCode.value = null;
     repoPickerStatus.value = "";
     sshKeyStatus.value = null;
-    destinationStatus.value = null;
-    runStepEffect();
+    createRepoError.value = null;
+    authorPrefill.value = null;
+    commitAuthorError.value = null;
   }
 
   return {
@@ -409,21 +444,24 @@ export function useCloneWizard() {
     repos,
     repoPickerStatus,
     sshKeyStatus,
-    destinationStatus,
+    createRepoError,
     authorPrefill,
     commitAuthorError,
     open,
     close,
+    chooseHasRepo,
     chooseProvider,
     chooseOauthSignIn,
     chooseOtherWaysToConnect,
     chooseOtherCredentialKind,
+    setRepoName,
+    setVisibility,
+    createRepo,
     repoSelected,
     submitPasteUrlToken,
     submitPasteUrlSshKey,
     generateSshKeyStep,
     importSshKeyStep,
-    pickDestination,
     retry,
     confirmCommitAuthorStep,
     back,
