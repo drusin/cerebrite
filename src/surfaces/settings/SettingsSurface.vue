@@ -99,7 +99,13 @@ defineExpose({ scrollToSyncSection });
 </script>
 
 <template>
-  <Modal label="Settings" overlay-class="settings-modal-overlay" card-class="settings-modal" @close="$emit('close')">
+  <Modal
+    label="Settings"
+    overlay-class="settings-modal-overlay"
+    card-class="settings-modal"
+    closable
+    @close="$emit('close')"
+  >
     <div class="settings-modal-header">
       <h2>Settings</h2>
     </div>

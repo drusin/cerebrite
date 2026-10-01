@@ -28,6 +28,7 @@ export const SettingsSized: Story = {
     label: "Connect a repository",
     overlayClass: "settings-modal-overlay",
     cardClass: "settings-modal connect-wizard",
+    closable: true,
   },
   render: (args) => ({
     components: { Modal },

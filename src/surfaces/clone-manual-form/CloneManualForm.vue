@@ -16,7 +16,7 @@
 // `connect-label`, since the actual connect happens via this form's own
 // "Clone" button below, not a per-sub-form one.
 import type { DeviceCodeDisplay } from "../../components/DeviceFlow.vue";
-import { ref } from "vue";
+import Modal from "../../components/Modal.vue";
 import CredentialKindForm, { type CredentialKindOption } from "../../components/CredentialKindForm.vue";
 
 export type ManualCredentialKind = CredentialKindOption;
@@ -49,77 +49,78 @@ const emit = defineEmits<{
   gitlabSignIn: [];
   submit: [];
 }>();
-
-const rootEl = ref<HTMLElement | null>(null);
-
-function handleBackdropClick(event: MouseEvent) {
-  if (event.target === rootEl.value) emit("close");
-}
-
-function handleKeydown(event: KeyboardEvent) {
-  if (event.key === "Escape") {
-    event.preventDefault();
-    emit("close");
-  }
-}
 </script>
 
 <template>
-  <div
-    ref="rootEl"
-    class="settings-modal-overlay"
-    @click="handleBackdropClick"
-    @keydown="handleKeydown"
+  <Modal
+    label="Clone a repository (manual)"
+    overlay-class="settings-modal-overlay"
+    card-class="settings-modal"
+    closable
+    @close="emit('close')"
   >
-    <div class="settings-modal" role="dialog" aria-modal="true" aria-label="Clone a repository (manual)">
-      <div class="settings-modal-header">
-        <h2>Clone a repository</h2>
-        <button type="button" aria-label="Close" @click="emit('close')">✕</button>
-      </div>
-      <div class="settings-section">
-        <label>
-          Remote URL
-          <input
-            type="text"
-            placeholder="https://example.com/user/repo.git"
-            :value="remoteUrl"
-            @input="emit('update:remoteUrl', ($event.target as HTMLInputElement).value)"
-          />
-        </label>
-        <label>
-          Branch
-          <input type="text" value="(the repository's default branch)" disabled />
-        </label>
-        <label>
-          Destination folder
-          <input type="text" readonly placeholder="Choose a folder…" :value="destination" />
-        </label>
-        <button type="button" @click="emit('pickDestination')">Choose folder…</button>
-
-        <CredentialKindForm
-          :credential-kind="credentialKind"
-          :show-url-field="false"
-          :token-username="tokenUsername"
-          :token-value="tokenValue"
-          :ssh-key-status="sshKeyStatus"
-          :github-device-code="githubDeviceCode"
-          :github-status="githubStatus"
-          :gitlab-device-code="gitlabDeviceCode"
-          :gitlab-status="gitlabStatus"
-          @update:credential-kind="emit('update:credentialKind', $event)"
-          @update:token-username="emit('update:tokenUsername', $event)"
-          @update:token-value="emit('update:tokenValue', $event)"
-          @generate-ssh-key="emit('generateSshKey')"
-          @import-ssh-key="emit('importSshKey')"
-          @github-sign-in="emit('githubSignIn')"
-          @gitlab-sign-in="emit('gitlabSignIn')"
-        />
-
-        <button type="button" class="wizard-primary-action" :disabled="submitting" @click="emit('submit')">
-          Clone
-        </button>
-        <p v-if="statusMessage" class="settings-connect-status">{{ statusMessage }}</p>
-      </div>
+    <div class="settings-modal-header">
+      <h2>Clone a repository</h2>
     </div>
-  </div>
+    <div class="settings-section">
+      <label>
+        Remote URL
+        <input
+          type="text"
+          placeholder="https://example.com/user/repo.git"
+          :value="remoteUrl"
+          @input="
+            emit('update:remoteUrl', ($event.target as HTMLInputElement).value)
+          "
+        />
+      </label>
+      <label>
+        Branch
+        <input type="text" value="(the repository's default branch)" disabled />
+      </label>
+      <label>
+        Destination folder
+        <input
+          type="text"
+          readonly
+          placeholder="Choose a folder…"
+          :value="destination"
+        />
+      </label>
+      <button type="button" @click="emit('pickDestination')">
+        Choose folder…
+      </button>
+
+      <CredentialKindForm
+        :credential-kind="credentialKind"
+        :show-url-field="false"
+        :token-username="tokenUsername"
+        :token-value="tokenValue"
+        :ssh-key-status="sshKeyStatus"
+        :github-device-code="githubDeviceCode"
+        :github-status="githubStatus"
+        :gitlab-device-code="gitlabDeviceCode"
+        :gitlab-status="gitlabStatus"
+        @update:credential-kind="emit('update:credentialKind', $event)"
+        @update:token-username="emit('update:tokenUsername', $event)"
+        @update:token-value="emit('update:tokenValue', $event)"
+        @generate-ssh-key="emit('generateSshKey')"
+        @import-ssh-key="emit('importSshKey')"
+        @github-sign-in="emit('githubSignIn')"
+        @gitlab-sign-in="emit('gitlabSignIn')"
+      />
+
+      <button
+        type="button"
+        class="wizard-primary-action"
+        :disabled="submitting"
+        @click="emit('submit')"
+      >
+        Clone
+      </button>
+      <p v-if="statusMessage" class="settings-connect-status">
+        {{ statusMessage }}
+      </p>
+    </div>
+  </Modal>
 </template>

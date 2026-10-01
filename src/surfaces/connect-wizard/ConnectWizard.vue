@@ -102,11 +102,11 @@ function submitPasteUrlSshKey() {
     label="Connect a repository"
     overlay-class="settings-modal-overlay"
     card-class="settings-modal connect-wizard"
+    closable
     @close="emit('close')"
   >
     <div class="settings-modal-header">
       <h2>Connect a repository</h2>
-      <button type="button" aria-label="Close" @click="emit('close')">✕</button>
     </div>
 
     <div class="connect-wizard-body">
