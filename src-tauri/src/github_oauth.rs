@@ -458,15 +458,59 @@ pub fn create_repository(
         200 | 201 => {
             let raw: RawRepoResponse =
                 serde_json::from_str(&body).map_err(|e| DeviceFlowError::UnexpectedResponse(e.to_string()))?;
+            let repo_id = raw.id;
+            if let Some(repo_id) = repo_id {
+                grant_installation_access(endpoints, access_token, repo_id);
+            }
             raw.try_into()
         }
         401 | 403 => Err(DeviceFlowError::Rejected(format!(
-            "GitHub rejected the repository creation request with status {status}"
+            "GitHub rejected the repository creation request with status {status}: {body}"
         ))),
         other => Err(DeviceFlowError::UnexpectedResponse(format!(
             "unexpected status {other} creating a repository: {body}"
         ))),
     }
+}
+
+/// A repo created a moment ago isn't covered by an app installation that was
+/// scoped to "selected repositories", so `check_installation` would answer
+/// "not installed" right after create-new. Best-effort: find this app's
+/// installation among the user's, and add the new repo to it. Every failure
+/// is swallowed -- the installation check that follows still reports a
+/// missing installation with the install URL, as before.
+fn grant_installation_access(endpoints: &GitHubEndpoints, access_token: &str, repo_id: u64) {
+    #[derive(Deserialize)]
+    struct Installation {
+        id: u64,
+        app_slug: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Installations {
+        installations: Vec<Installation>,
+    }
+
+    let url = format!("{}/user/installations", endpoints.api_base_url);
+    let Ok((200, body)) = get_bearer(&url, access_token) else { return };
+    let Ok(list) = serde_json::from_str::<Installations>(&body) else { return };
+    let Some(installation) = list
+        .installations
+        .into_iter()
+        .find(|i| i.app_slug.as_deref() == Some(GITHUB_APP_SLUG))
+    else {
+        return;
+    };
+    let url = format!(
+        "{}/user/installations/{}/repositories/{repo_id}",
+        endpoints.api_base_url, installation.id
+    );
+    let _ = reqwest::blocking::Client::new()
+        .put(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", "cerebrite")
+        .header("Content-Length", "0")
+        .send();
 }
 
 /// Ticket 09's pick-existing path: `GET {api_base_url}/user/repos`, sorted by
@@ -493,6 +537,7 @@ pub fn list_repositories(endpoints: &GitHubEndpoints, access_token: &str) -> Res
 
 #[derive(Debug, Deserialize)]
 struct RawRepoResponse {
+    id: Option<u64>,
     name: Option<String>,
     full_name: Option<String>,
     private: Option<bool>,

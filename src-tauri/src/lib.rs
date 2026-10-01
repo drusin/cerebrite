@@ -1193,7 +1193,7 @@ fn start_github_device_flow() -> Result<github_oauth::DeviceCodeInfo, String> {
 /// blocking command, so the frontend can show live progress and let the
 /// user cancel.
 #[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "outcome", rename_all = "camelCase")]
+#[serde(tag = "outcome", rename_all = "camelCase", rename_all_fields = "camelCase")]
 enum DevicePollResult {
     Success {
         access_token: String,
@@ -1358,7 +1358,7 @@ fn start_gitlab_device_flow() -> Result<gitlab_oauth::DeviceCodeInfo, String> {
 /// `refreshToken` may be absent on success (ticket 07's defensive dual
 /// path: GitLab's device grant may not return one at all).
 #[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "outcome", rename_all = "camelCase")]
+#[serde(tag = "outcome", rename_all = "camelCase", rename_all_fields = "camelCase")]
 enum GitlabDevicePollResult {
     Success {
         access_token: String,
