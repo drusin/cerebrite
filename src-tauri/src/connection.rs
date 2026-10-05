@@ -420,7 +420,11 @@ pub fn try_connect(
 ) -> Result<Connection, ConnectError> {
     let candidate = Connection::from_parts(record.clone(), secret.clone());
 
-    crate::sync::test_fetch(remote_url, &candidate, known_hosts_path).map_err(ConnectError::Fetch)?;
+    log::info!("connecting {remote_url} ({:?})", record.credential_kind);
+    crate::sync::test_fetch(remote_url, &candidate, known_hosts_path).map_err(|e| {
+        log::error!("test fetch of {remote_url} failed: {e:?}");
+        ConnectError::Fetch(e)
+    })?;
 
     configure_origin_remote(repo_root, remote_url)
         .map_err(|e| ConnectError::Credential(CredentialError::Other(e.to_string())))?;

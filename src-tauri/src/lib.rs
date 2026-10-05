@@ -539,6 +539,10 @@ fn perform_sync(app: &AppHandle, vault_path: &Path, repo_root: &Path) {
     if matches!(outcome.status, sync::SyncStatus::Synced) {
         *state.last_synced_at.lock().unwrap() = Some(now_unix_secs());
     }
+    match &outcome.status {
+        sync::SyncStatus::Synced => log::debug!("sync finished: {:?}", outcome.status),
+        other => log::warn!("sync finished: {other:?}"),
+    }
     *state.sync_status.lock().unwrap() = outcome.status.clone();
     let _ = app.emit("sync-status-changed", &outcome.status);
 }
@@ -1011,6 +1015,7 @@ fn connect_access_token(
         credential::CallUrgency::Interactive,
     )
     .map_err(|e| e.to_string())?;
+    log::info!("connected {remote_url} with an access token");
 
     // Index bookkeeping (ADR-0013 / ticket 02's `settings::set_connection_store`):
     // records which store this connection's secret ended up in, app-wide, so
@@ -1183,7 +1188,10 @@ fn confirm_ssh_host_key(app: AppHandle, host: String, fingerprint: String) -> Re
 #[tauri::command]
 fn start_github_device_flow() -> Result<github_oauth::DeviceCodeInfo, String> {
     let endpoints = github_oauth::GitHubEndpoints::production();
-    github_oauth::request_device_code(&endpoints, github_oauth::GITHUB_CLIENT_ID).map_err(|e| e.to_string())
+    github_oauth::request_device_code(&endpoints, github_oauth::GITHUB_CLIENT_ID).map_err(|e| {
+        log::error!("start_github_device_flow failed: {e:?}");
+        e.to_string()
+    })
 }
 
 /// Ticket 06 step 2: one poll of GitHub's token endpoint, called repeatedly
@@ -1222,7 +1230,10 @@ fn poll_github_device_flow(device_code: String) -> DevicePollResult {
         github_oauth::PollOutcome::SlowDown => DevicePollResult::SlowDown,
         github_oauth::PollOutcome::Denied => DevicePollResult::Denied,
         github_oauth::PollOutcome::Expired => DevicePollResult::Expired,
-        github_oauth::PollOutcome::Error(e) => DevicePollResult::Error { message: e.to_string() },
+        github_oauth::PollOutcome::Error(e) => {
+            log::error!("poll_github_device_flow failed: {e:?}");
+            DevicePollResult::Error { message: e.to_string() }
+        }
     }
 }
 
@@ -1237,7 +1248,10 @@ fn check_github_installation(remote_url: String, access_token: String) -> Result
     let (owner, repo) =
         github_oauth::owner_repo_from_remote_url(&remote_url).ok_or_else(|| "not a GitHub repository URL".to_string())?;
     let endpoints = github_oauth::GitHubEndpoints::production();
-    github_oauth::check_installation(&endpoints, &access_token, &owner, &repo).map_err(|e| e.to_string())
+    github_oauth::check_installation(&endpoints, &access_token, &owner, &repo).map_err(|e| {
+        log::error!("check_github_installation failed for {owner}/{repo}: {e:?}");
+        e.to_string()
+    })
 }
 
 /// Ticket 08 checklist item 5: what a successful `connect_github_oauth`/
@@ -1317,6 +1331,7 @@ fn connect_github_oauth(
         credential::CallUrgency::Interactive,
     )
     .map_err(|e| e.to_string())?;
+    log::info!("connected {remote_url} with GitHub sign-in");
 
     settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
     notify_sync(&state);
@@ -1349,7 +1364,10 @@ fn connect_github_oauth(
 #[tauri::command]
 fn start_gitlab_device_flow() -> Result<gitlab_oauth::DeviceCodeInfo, String> {
     let endpoints = gitlab_oauth::GitLabEndpoints::production();
-    gitlab_oauth::request_device_code(&endpoints, gitlab_oauth::GITLAB_CLIENT_ID).map_err(|e| e.to_string())
+    gitlab_oauth::request_device_code(&endpoints, gitlab_oauth::GITLAB_CLIENT_ID).map_err(|e| {
+        log::error!("start_gitlab_device_flow failed: {e:?}");
+        e.to_string()
+    })
 }
 
 /// Ticket 07 step 2: one poll of GitLab's token endpoint, called repeatedly
@@ -1387,7 +1405,10 @@ fn poll_gitlab_device_flow(device_code: String) -> GitlabDevicePollResult {
         gitlab_oauth::PollOutcome::SlowDown => GitlabDevicePollResult::SlowDown,
         gitlab_oauth::PollOutcome::Denied => GitlabDevicePollResult::Denied,
         gitlab_oauth::PollOutcome::Expired => GitlabDevicePollResult::Expired,
-        gitlab_oauth::PollOutcome::Error(e) => GitlabDevicePollResult::Error { message: e.to_string() },
+        gitlab_oauth::PollOutcome::Error(e) => {
+            log::error!("poll_gitlab_device_flow failed: {e:?}");
+            GitlabDevicePollResult::Error { message: e.to_string() }
+        }
     }
 }
 
@@ -1765,6 +1786,7 @@ fn clone_and_open_vault(
     let cloned_repo = match clone_result {
         Ok(repo) => repo,
         Err(e) => {
+            log::error!("clone of {remote_url} into {destination} failed: {e:?}");
             cleanup_failed_clone(&destination_path);
             return Err(sync::classify_git_error_for(&e, Some(&connection)).to_string());
         }
@@ -1774,6 +1796,7 @@ fn clone_and_open_vault(
     let (_clone_state, vault_path) = match vault::classify_cloned_repo(&destination_path) {
         Ok(result) => result,
         Err(e) => {
+            log::error!("cloned repo from {remote_url} could not be opened as a vault: {e:?}");
             cleanup_failed_clone(&destination_path);
             return Err(e.to_string());
         }
@@ -2529,7 +2552,25 @@ fn search_pages_impl(state: &AppState, query: &str, include_trash: bool) -> Resu
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Release builds use `panic = "abort"` and the `windows` subsystem, so a
+    // panic would otherwise vanish without a trace; route it to the log first.
+    std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
+
     tauri::Builder::default()
+        .plugin(
+            // Writes `<app log dir>/<bundle id>.log` (on Windows:
+            // `%LOCALAPPDATA%\com.cerebrite.app\logs`), rotating at 2 MB.
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .max_file_size(2_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None }),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                ])
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
