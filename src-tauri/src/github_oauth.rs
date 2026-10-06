@@ -419,7 +419,10 @@ pub fn installation_url() -> String {
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum InstallationStatus {
     Installed,
-    NotInstalled { install_url: String },
+    NotInstalled {
+        #[serde(rename = "installUrl")]
+        install_url: String,
+    },
 }
 
 /// One repository as surfaced to the guided connect wizard (ticket 09): just
