@@ -586,9 +586,20 @@ fn post_bearer_json(url: &str, token: &str, json_body: &serde_json::Value) -> Re
         .header("Authorization", format!("Bearer {token}"))
         .json(json_body)
         .send()
-        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+        .map_err(|e| {
+            log::error!("POST {url} failed to send: {e:?}");
+            DeviceFlowError::Network(e.to_string())
+        })?;
     let status = response.status().as_u16();
-    let body = response.text().map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    let body = response.text().map_err(|e| {
+        log::error!("POST {url} -> {status}: reading the body failed: {e:?}");
+        DeviceFlowError::Network(e.to_string())
+    })?;
+    if (200..300).contains(&status) {
+        log::debug!("POST {url} -> {status}");
+    } else {
+        log::error!("POST {url} -> {status}: {body}");
+    }
     Ok((status, body))
 }
 
@@ -602,9 +613,20 @@ fn get_bearer(url: &str, token: &str) -> Result<(u16, String), DeviceFlowError> 
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
         .send()
-        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+        .map_err(|e| {
+            log::error!("GET {url} failed to send: {e:?}");
+            DeviceFlowError::Network(e.to_string())
+        })?;
     let status = response.status().as_u16();
-    let body = response.text().map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    let body = response.text().map_err(|e| {
+        log::error!("GET {url} -> {status}: reading the body failed: {e:?}");
+        DeviceFlowError::Network(e.to_string())
+    })?;
+    if (200..300).contains(&status) {
+        log::debug!("GET {url} -> {status}");
+    } else {
+        log::error!("GET {url} -> {status}: {body}");
+    }
     Ok((status, body))
 }
 

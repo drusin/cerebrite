@@ -491,26 +491,52 @@ fn grant_installation_access(endpoints: &GitHubEndpoints, access_token: &str, re
     }
 
     let url = format!("{}/user/installations", endpoints.api_base_url);
-    let Ok((200, body)) = get_bearer(&url, access_token) else { return };
-    let Ok(list) = serde_json::from_str::<Installations>(&body) else { return };
+    let list = match get_bearer(&url, access_token) {
+        Ok((200, body)) => match serde_json::from_str::<Installations>(&body) {
+            Ok(list) => list,
+            Err(e) => {
+                log::warn!("granting installation access to repo {repo_id}: unparseable installations list: {e}");
+                return;
+            }
+        },
+        Ok((status, _)) => {
+            log::warn!("granting installation access to repo {repo_id}: listing installations returned {status}");
+            return;
+        }
+        Err(e) => {
+            log::warn!("granting installation access to repo {repo_id}: listing installations failed: {e:?}");
+            return;
+        }
+    };
     let Some(installation) = list
         .installations
         .into_iter()
         .find(|i| i.app_slug.as_deref() == Some(GITHUB_APP_SLUG))
     else {
+        log::warn!("granting installation access to repo {repo_id}: app {GITHUB_APP_SLUG:?} is not among the user's installations");
         return;
     };
     let url = format!(
         "{}/user/installations/{}/repositories/{repo_id}",
         endpoints.api_base_url, installation.id
     );
-    let _ = reqwest::blocking::Client::new()
+    match reqwest::blocking::Client::new()
         .put(&url)
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("Bearer {access_token}"))
         .header("User-Agent", "cerebrite")
         .header("Content-Length", "0")
-        .send();
+        .send()
+    {
+        Ok(r) if r.status().is_success() => log::info!("added repo {repo_id} to installation {}", installation.id),
+        Ok(r) => log::warn!(
+            "adding repo {repo_id} to installation {} returned {}: {}",
+            installation.id,
+            r.status(),
+            r.text().unwrap_or_default()
+        ),
+        Err(e) => log::warn!("adding repo {repo_id} to installation {} failed: {e:?}", installation.id),
+    }
 }
 
 /// Ticket 09's pick-existing path: `GET {api_base_url}/user/repos`, sorted by
@@ -577,10 +603,11 @@ fn post_bearer_json(url: &str, token: &str, json_body: &serde_json::Value) -> Re
         .header("User-Agent", "cerebrite")
         .json(json_body)
         .send()
-        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
-    let status = response.status().as_u16();
-    let body = response.text().map_err(|e| DeviceFlowError::Network(e.to_string()))?;
-    Ok((status, body))
+        .map_err(|e| {
+            log::error!("POST {url} failed to send: {e:?}");
+            DeviceFlowError::Network(e.to_string())
+        })?;
+    finish_bearer_response("POST", url, response)
 }
 
 // -- internal: raw response shapes and shared HTTP plumbing --
@@ -665,10 +692,18 @@ fn post_form(url: &str, form: &[(&str, &str)]) -> Result<String, DeviceFlowError
         .header("Accept", "application/json")
         .form(form)
         .send()
-        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
-    response
-        .text()
-        .map_err(|e| DeviceFlowError::Network(e.to_string()))
+        .map_err(|e| {
+            log::error!("POST {url} failed to send: {e:?}");
+            DeviceFlowError::Network(e.to_string())
+        })?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        log::warn!("POST {url} -> {status}");
+    }
+    response.text().map_err(|e| {
+        log::error!("POST {url} -> {status}: reading the body failed: {e:?}");
+        DeviceFlowError::Network(e.to_string())
+    })
 }
 
 /// A blocking `GET` with a `Bearer` token, returning (status, body).
@@ -680,9 +715,41 @@ fn get_bearer(url: &str, token: &str) -> Result<(u16, String), DeviceFlowError> 
         .header("Authorization", format!("Bearer {token}"))
         .header("User-Agent", "cerebrite")
         .send()
-        .map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+        .map_err(|e| {
+            log::error!("GET {url} failed to send: {e:?}");
+            DeviceFlowError::Network(e.to_string())
+        })?;
+    finish_bearer_response("GET", url, response)
+}
+
+/// Reads a `Bearer`-authenticated response's (status, body), logging any
+/// non-2xx answer with GitHub's body and the `X-Accepted-GitHub-Permissions`
+/// header (what permission the endpoint wanted, e.g. `administration=write`
+/// for repo creation) -- the usual explanation of a 403 "Resource not
+/// accessible by integration".
+fn finish_bearer_response(
+    method: &str,
+    url: &str,
+    response: reqwest::blocking::Response,
+) -> Result<(u16, String), DeviceFlowError> {
     let status = response.status().as_u16();
-    let body = response.text().map_err(|e| DeviceFlowError::Network(e.to_string()))?;
+    let accepted = response
+        .headers()
+        .get("x-accepted-github-permissions")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = response.text().map_err(|e| {
+        log::error!("{method} {url} -> {status}: reading the body failed: {e:?}");
+        DeviceFlowError::Network(e.to_string())
+    })?;
+    if (200..300).contains(&status) {
+        log::debug!("{method} {url} -> {status}");
+    } else {
+        log::error!(
+            "{method} {url} -> {status}: {body} (endpoint accepts permissions: {})",
+            accepted.as_deref().unwrap_or("not reported")
+        );
+    }
     Ok((status, body))
 }
 

@@ -738,6 +738,16 @@ fn credential_stores(app: &AppHandle) -> Result<(Option<credential::KeychainBack
     Ok((keychain, plaintext))
 }
 
+/// Logs `e` (with `context`) at error level and turns it into the string the
+/// frontend shows -- for `map_err` in commands that would otherwise surface
+/// a failure to the UI without leaving any trace in the logfile.
+fn log_and_stringify<E: std::fmt::Debug + std::fmt::Display>(context: impl std::fmt::Display) -> impl FnOnce(E) -> String {
+    move |e| {
+        log::error!("{context} failed: {e:?}");
+        e.to_string()
+    }
+}
+
 /// Code-review follow-up (ticket 02/04): shared by `connect_access_token`,
 /// `connect_ssh_key`, `connect_github_oauth`, and `connect_gitlab_oauth` --
 /// decides which store a *new* connection's secret goes into. Prefers the
@@ -766,6 +776,7 @@ fn resolve_store_kind(
     } else if allow_plaintext_fallback {
         Ok(connection_record::StoreKind::Plaintext)
     } else {
+        log::warn!("no usable keychain and plaintext fallback not consented to; refusing to store credential");
         Err(credential::PLAINTEXT_CONSENT_REQUIRED.to_string())
     }
 }
@@ -1014,14 +1025,14 @@ fn connect_access_token(
         None, // access tokens are HTTPS-only; SSH host-key checking doesn't apply
         credential::CallUrgency::Interactive,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(log_and_stringify(format!("connect_access_token for {remote_url}")))?;
     log::info!("connected {remote_url} with an access token");
 
     // Index bookkeeping (ADR-0013 / ticket 02's `settings::set_connection_store`):
     // records which store this connection's secret ended up in, app-wide, so
     // a later cleanup/"remove all credentials" pass can find it without
     // walking every vault on disk.
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(log_and_stringify("recording connection store in settings"))?;
 
     // The vault now has a working connection -- nudge the background sync
     // loop to try immediately rather than waiting for its next periodic
@@ -1155,7 +1166,7 @@ fn connect_ssh_key(
     )
     .map_err(|e| e.to_string())?;
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(log_and_stringify("recording connection store in settings"))?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::SshKey);
@@ -1330,10 +1341,10 @@ fn connect_github_oauth(
         None, // OAuth sign-in is HTTPS-only; SSH host-key checking doesn't apply
         credential::CallUrgency::Interactive,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(log_and_stringify(format!("connect_github_oauth for {remote_url}")))?;
     log::info!("connected {remote_url} with GitHub sign-in");
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(log_and_stringify("recording connection store in settings"))?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
@@ -1345,7 +1356,9 @@ fn connect_github_oauth(
     // means no offer is made, never a failed connect.
     let existing_author = author::read_repo_local(&repo_root).unwrap_or(None);
     let endpoints = github_oauth::GitHubEndpoints::production();
-    let provider_identity = author::fetch_github_identity(&endpoints.api_base_url, &access_token).ok();
+    let provider_identity = author::fetch_github_identity(&endpoints.api_base_url, &access_token)
+        .map_err(|e| log::warn!("fetching GitHub identity for the author offer failed: {e:?}"))
+        .ok();
     let provider_suggested_author = match (&existing_author, &provider_identity) {
         (Some(existing), Some(suggested)) if existing != suggested => Some(suggested.clone()),
         _ => None,
@@ -1477,12 +1490,13 @@ fn connect_gitlab_oauth(
         None, // OAuth sign-in is HTTPS-only; SSH host-key checking doesn't apply
         credential::CallUrgency::Interactive,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(log_and_stringify(format!("connect_gitlab_oauth for {remote_url}")))?;
 
-    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(|e| e.to_string())?;
+    settings::set_connection_store(&app, &record.connection_id, store_kind, &repo_root, store_kind == connection_record::StoreKind::Plaintext).map_err(log_and_stringify("recording connection store in settings"))?;
     notify_sync(&state);
 
     debug_assert_eq!(connection.credential_kind(), connection_record::CredentialKind::OauthSignIn);
+    log::info!("connected {remote_url} with GitLab sign-in");
 
     // Ticket 08 checklist item 5, GitLab half -- see `connect_github_oauth`'s
     // matching comment. GitLab's `GET /user` may not carry `commit_email` at
@@ -1496,6 +1510,7 @@ fn connect_gitlab_oauth(
     // its own installation check), so it's named here directly.
     const GITLAB_API_BASE_URL: &str = "https://gitlab.com/api/v4";
     let provider_identity = author::fetch_gitlab_identity(GITLAB_API_BASE_URL, &access_token)
+        .map_err(|e| log::warn!("fetching GitLab identity for the author offer failed: {e:?}"))
         .ok()
         .flatten();
     let provider_suggested_author = match (&existing_author, &provider_identity) {
@@ -1519,7 +1534,7 @@ fn connect_gitlab_oauth(
 #[tauri::command]
 fn create_github_repository(name: String, private: bool, access_token: String) -> Result<github_oauth::RepoInfo, String> {
     let endpoints = github_oauth::GitHubEndpoints::production();
-    github_oauth::create_repository(&endpoints, &access_token, &name, private).map_err(|e| e.to_string())
+    github_oauth::create_repository(&endpoints, &access_token, &name, private).map_err(log_and_stringify(format!("create_github_repository (name={name:?}, private={private})")))
 }
 
 /// Ticket 09's pick-existing path, GitHub half: lists the signed-in user's
@@ -1528,7 +1543,7 @@ fn create_github_repository(name: String, private: bool, access_token: String) -
 #[tauri::command]
 fn list_github_repositories(access_token: String) -> Result<Vec<github_oauth::RepoInfo>, String> {
     let endpoints = github_oauth::GitHubEndpoints::production();
-    github_oauth::list_repositories(&endpoints, &access_token).map_err(|e| e.to_string())
+    github_oauth::list_repositories(&endpoints, &access_token).map_err(log_and_stringify("list_github_repositories"))
 }
 
 /// Ticket 09's create-new path, GitLab half -- mirrors
@@ -1536,7 +1551,7 @@ fn list_github_repositories(access_token: String) -> Result<Vec<github_oauth::Re
 #[tauri::command]
 fn create_gitlab_repository(name: String, private: bool, access_token: String) -> Result<gitlab_oauth::RepoInfo, String> {
     let endpoints = gitlab_oauth::GitLabEndpoints::production();
-    gitlab_oauth::create_repository(&endpoints, &access_token, &name, private).map_err(|e| e.to_string())
+    gitlab_oauth::create_repository(&endpoints, &access_token, &name, private).map_err(log_and_stringify(format!("create_gitlab_repository (name={name:?}, private={private})")))
 }
 
 /// Ticket 09's pick-existing path, GitLab half -- mirrors
@@ -1545,7 +1560,7 @@ fn create_gitlab_repository(name: String, private: bool, access_token: String) -
 #[tauri::command]
 fn list_gitlab_repositories(access_token: String) -> Result<Vec<gitlab_oauth::RepoInfo>, String> {
     let endpoints = gitlab_oauth::GitLabEndpoints::production();
-    gitlab_oauth::list_repositories(&endpoints, &access_token).map_err(|e| e.to_string())
+    gitlab_oauth::list_repositories(&endpoints, &access_token).map_err(log_and_stringify("list_gitlab_repositories"))
 }
 
 /// Provider hosts recognized as `Provider::GitHub`/`Provider::GitLab`;
