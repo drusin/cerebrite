@@ -91,3 +91,13 @@ Cerebrite window with a working Tauri bridge.
   OpenSSL) and `rusqlite` (bundled SQLite) both compile their C dependencies
   from source. Subsequent runs reuse the incremental cache and finish in
   under a second unless the cache gets corrupted (see above).
+- **GitHub API calls from inside the sandbox can't be trusted.** The sandbox
+  proxy injects its own credential into requests to `api.github.com`,
+  overriding the `Authorization` header the app sends, so every authenticated
+  call returns `401 Bad credentials` even with a freshly issued `ghu_` token
+  (tell-tale: an unauthenticated `curl https://api.github.com/rate_limit`
+  also answers 401 instead of 200). The device flow itself works; anything
+  after sign-in (installation check, repo create/list) must be tested
+  outside the sandbox. Also, `github.githubassets.com` must be allowed
+  (`sbx policy allow network github.githubassets.com`) or GitHub's pages lose
+  their JS and the device-flow "Authorize" button stays disabled.

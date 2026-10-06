@@ -20,6 +20,8 @@ import {
   type CloneWizardAction,
   type WizardProvider,
 } from "../../clone-wizard";
+import { ensureGithubAppInstalled } from "../../github-app-install";
+import { openInBrowser } from "../../open-external";
 import {
   pickVaultFolder,
   generateSshKey,
@@ -156,6 +158,7 @@ export function useCloneWizard() {
 
       oauthDeviceCode.value = { verificationUri: device.verificationUri, userCode: device.userCode };
       oauthStatus.value = "Waiting for you to approve in the browser…";
+      void openInBrowser(device.verificationUri);
 
       const deadline = Date.now() + device.expiresInSecs * 1000;
       let intervalMs = Math.max(device.intervalSecs, 1) * 1000;
@@ -195,6 +198,8 @@ export function useCloneWizard() {
       refreshToken = refresh;
       accessTokenExpiresAt = expiresAt;
       oauthDeviceCode.value = null;
+      if (provider === "github") await ensureGithubAppInstalled(token, (status) => (oauthStatus.value = status), stale);
+      if (stale()) return;
       dispatch({ type: "oauthSignInSucceeded" });
     } catch (err) {
       if (stale()) return;

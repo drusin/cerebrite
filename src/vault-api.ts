@@ -336,6 +336,12 @@ export function checkGithubInstallation(remoteUrl: string, accessToken: string):
   return invoke("check_github_installation", { remoteUrl, accessToken });
 }
 
+/// Account-level check (no repository needed): is the GitHub App installed
+/// for the signed-in user at all? Run right after sign-in.
+export function checkGithubAppInstalled(accessToken: string): Promise<InstallationStatus> {
+  return invoke("check_github_app_installed", { accessToken });
+}
+
 /// Ticket 08 checklist item 5: what a successful `connectGithubOauth`/
 /// `connectGitlabOauth` hands back alongside "connected". `providerSuggestedAuthor`
 /// is present only when the vault already had a *different* confirmed

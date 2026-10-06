@@ -1265,6 +1265,24 @@ fn check_github_installation(remote_url: String, access_token: String) -> Result
     })
 }
 
+/// Account-level installation check, run right after GitHub sign-in so a
+/// first-time user is sent to install the app before they ever reach the
+/// create/pick steps. A rejected token is an error the wizard shows, not
+/// something to wave through.
+#[tauri::command]
+fn check_github_app_installed(access_token: String) -> Result<github_oauth::InstallationStatus, String> {
+    let endpoints = github_oauth::GitHubEndpoints::production();
+    let installed = github_oauth::app_installed_for_user(&endpoints, &access_token).map_err(|e| {
+        log::error!("check_github_app_installed failed: {e:?}");
+        e.to_string()
+    })?;
+    Ok(if installed {
+        github_oauth::InstallationStatus::Installed
+    } else {
+        github_oauth::InstallationStatus::NotInstalled { install_url: github_oauth::installation_url() }
+    })
+}
+
 /// Ticket 08 checklist item 5: what a successful `connect_github_oauth`/
 /// `connect_gitlab_oauth` hands back alongside "connected" -- the one-time
 /// "switch to the provider's address?" offer. `provider_suggested_author`
@@ -2629,6 +2647,7 @@ pub fn run() {
             check_github_installation,
             connect_github_oauth,
             create_github_repository,
+            check_github_app_installed,
             list_github_repositories,
             start_gitlab_device_flow,
             poll_gitlab_device_flow,

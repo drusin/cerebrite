@@ -464,11 +464,46 @@ pub fn create_repository(
             }
             raw.try_into()
         }
+        403 if matches!(app_installed_for_user(endpoints, access_token), Ok(false)) => Err(DeviceFlowError::Rejected(format!(
+            "Cerebrite isn't installed on your GitHub account yet, so it can't create a repository. \
+             Install it (choose \"All repositories\") at {}, then try again.",
+            installation_url()
+        ))),
         401 | 403 => Err(DeviceFlowError::Rejected(format!(
             "GitHub rejected the repository creation request with status {status}: {body}"
         ))),
         other => Err(DeviceFlowError::UnexpectedResponse(format!(
             "unexpected status {other} creating a repository: {body}"
+        ))),
+    }
+}
+
+/// Whether the GitHub App is among the installations this user token can
+/// see. A rejected token (401/403) is an error, not "not installed": the
+/// caller must not walk the user on as if sign-in had worked.
+pub fn app_installed_for_user(endpoints: &GitHubEndpoints, access_token: &str) -> Result<bool, DeviceFlowError> {
+    #[derive(Deserialize)]
+    struct Installation {
+        app_slug: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Installations {
+        installations: Vec<Installation>,
+    }
+
+    let url = format!("{}/user/installations", endpoints.api_base_url);
+    let (status, body) = get_bearer(&url, access_token)?;
+    match status {
+        200 => {
+            let list: Installations =
+                serde_json::from_str(&body).map_err(|e| DeviceFlowError::UnexpectedResponse(e.to_string()))?;
+            Ok(list.installations.iter().any(|i| i.app_slug.as_deref() == Some(GITHUB_APP_SLUG)))
+        }
+        401 | 403 => Err(DeviceFlowError::Rejected(format!(
+            "GitHub rejected the sign-in token with status {status}: {body}"
+        ))),
+        other => Err(DeviceFlowError::UnexpectedResponse(format!(
+            "unexpected status {other} listing app installations: {body}"
         ))),
     }
 }
@@ -1129,6 +1164,36 @@ mod tests {
         )]);
         let result = create_repository(&endpoints_for(port), "gho_abc", "notes", true);
         assert!(matches!(result, Err(DeviceFlowError::UnexpectedResponse(_))));
+    }
+
+    #[test]
+    fn create_repository_points_to_the_install_url_when_the_app_is_not_installed() {
+        let port = mock_server::spawn(vec![
+            (403, r#"{"message":"Resource not accessible by integration"}"#.to_string()),
+            (200, r#"{"total_count":0,"installations":[]}"#.to_string()),
+        ]);
+        let result = create_repository(&endpoints_for(port), "gho_abc", "notes", true);
+        match result {
+            Err(DeviceFlowError::Rejected(msg)) => assert!(msg.contains("/installations/new"), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn app_installed_for_user_reports_presence_of_the_app() {
+        let body = format!(r#"{{"total_count":1,"installations":[{{"id":1,"app_slug":"{GITHUB_APP_SLUG}"}}]}}"#);
+        let port = mock_server::spawn(vec![(200, body)]);
+        assert!(app_installed_for_user(&endpoints_for(port), "gho_abc").unwrap());
+
+        let port = mock_server::spawn(vec![(200, r#"{"total_count":0,"installations":[]}"#.to_string())]);
+        assert!(!app_installed_for_user(&endpoints_for(port), "gho_abc").unwrap());
+    }
+
+    #[test]
+    fn app_installed_for_user_surfaces_a_rejected_token_instead_of_guessing() {
+        let port = mock_server::spawn(vec![(401, r#"{"message":"Bad credentials"}"#.to_string())]);
+        let result = app_installed_for_user(&endpoints_for(port), "bad-token");
+        assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
     }
 
     #[test]

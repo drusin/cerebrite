@@ -12,6 +12,8 @@
 // `src/state/` (spec.md#shared-state-statets). No story (containers aren't
 // storied).
 import { computed, ref, shallowRef } from "vue";
+import { ensureGithubAppInstalled } from "../../github-app-install";
+import { openInBrowser } from "../../open-external";
 import {
   reduceWizard,
   initialWizardState,
@@ -154,6 +156,7 @@ export function useConnectWizard() {
 
       oauthDeviceCode.value = { verificationUri: device.verificationUri, userCode: device.userCode };
       oauthStatus.value = "Waiting for you to approve in the browser…";
+      void openInBrowser(device.verificationUri);
 
       const deadline = Date.now() + device.expiresInSecs * 1000;
       let intervalMs = Math.max(device.intervalSecs, 1) * 1000;
@@ -193,6 +196,8 @@ export function useConnectWizard() {
       refreshToken = refresh;
       accessTokenExpiresAt = expiresAt;
       oauthDeviceCode.value = null;
+      if (provider === "github") await ensureGithubAppInstalled(token, (status) => (oauthStatus.value = status), stale);
+      if (stale()) return;
       dispatch({ type: "oauthSignInSucceeded", accessToken });
     } catch (err) {
       if (stale()) return;
