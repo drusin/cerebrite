@@ -522,6 +522,9 @@ pub fn create_repository(
             }
             raw.try_into()
         }
+        422 if body.contains("name already exists") => Err(DeviceFlowError::Rejected(format!(
+            "You already have a repository named \"{name}\" on GitHub. Pick a different name, or choose the existing repository instead."
+        ))),
         403 if matches!(app_installed_for_user(endpoints, access_token), Ok(false)) => Err(DeviceFlowError::Rejected(format!(
             "Cerebrite isn't installed on your GitHub account yet, so it can't create a repository. \
              Install it (choose \"All repositories\") at {}, then try again.",
@@ -1240,7 +1243,10 @@ mod tests {
                 .to_string(),
         )]);
         let result = create_repository(&endpoints_for(port), "gho_abc", "notes", true);
-        assert!(matches!(result, Err(DeviceFlowError::UnexpectedResponse(_))));
+        match result {
+            Err(DeviceFlowError::Rejected(msg)) => assert!(msg.contains("already have a repository named \"notes\""), "{msg}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     #[test]
