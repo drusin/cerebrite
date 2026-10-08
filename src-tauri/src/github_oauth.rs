@@ -299,32 +299,87 @@ pub fn needs_refresh(token_expiry: Option<&str>) -> bool {
 }
 
 /// Whether the GitHub App is installed on `owner/repo` (ticket 06 checklist
-/// item 3): `GET {api_base_url}/repos/{owner}/{repo}/installation` with the
-/// user-to-server token as a Bearer credential. A 404 means "not installed
-/// on this repo" (or the token can't see the installation, which is
-/// functionally the same thing from this app's point of view: no
-/// credential this token grants reaches the repo), in which case the
-/// caller is handed the app's installation URL to send the user to.
+/// item 3). `GET /repos/{owner}/{repo}/installation` can't be used: it needs
+/// app (JWT) authentication and answers a user-to-server token with 401.
+/// Instead, find this app's installation among `GET /user/installations`,
+/// then page through `GET /user/installations/{id}/repositories` (which
+/// user-to-server tokens may call) looking for the repo. No installation, or
+/// the repo missing from it, means "not installed on this repo": the caller
+/// is handed the app's installation URL to send the user to.
 pub fn check_installation(
     endpoints: &GitHubEndpoints,
     access_token: &str,
     owner: &str,
     repo: &str,
 ) -> Result<InstallationStatus, DeviceFlowError> {
-    let url = format!("{}/repos/{owner}/{repo}/installation", endpoints.api_base_url);
-    let (status, _body) = get_bearer(&url, access_token)?;
-    match status {
-        200 => Ok(InstallationStatus::Installed),
-        404 => Ok(InstallationStatus::NotInstalled {
-            install_url: installation_url(),
-        }),
-        401 | 403 => Err(DeviceFlowError::Rejected(format!(
-            "GitHub rejected the installation check with status {status}"
-        ))),
-        other => Err(DeviceFlowError::UnexpectedResponse(format!(
-            "unexpected status {other} checking installation"
-        ))),
+    #[derive(Deserialize)]
+    struct Installation {
+        id: u64,
+        app_slug: Option<String>,
     }
+    #[derive(Deserialize)]
+    struct Installations {
+        installations: Vec<Installation>,
+    }
+    #[derive(Deserialize)]
+    struct Repo {
+        full_name: String,
+    }
+    #[derive(Deserialize)]
+    struct Repos {
+        repositories: Vec<Repo>,
+    }
+
+    let not_installed = || {
+        Ok(InstallationStatus::NotInstalled {
+            install_url: installation_url(),
+        })
+    };
+    let rejected = |status: u16| {
+        DeviceFlowError::Rejected(format!("GitHub rejected the installation check with status {status}"))
+    };
+    let unexpected = |status: u16| {
+        DeviceFlowError::UnexpectedResponse(format!("unexpected status {status} checking installation"))
+    };
+    let parse_err = |e: serde_json::Error| DeviceFlowError::UnexpectedResponse(e.to_string());
+
+    let url = format!("{}/user/installations?per_page=100", endpoints.api_base_url);
+    let (status, body) = get_bearer(&url, access_token)?;
+    let list: Installations = match status {
+        200 => serde_json::from_str(&body).map_err(parse_err)?,
+        401 | 403 => return Err(rejected(status)),
+        other => return Err(unexpected(other)),
+    };
+    let Some(installation) = list
+        .installations
+        .into_iter()
+        .find(|i| i.app_slug.as_deref() == Some(GITHUB_APP_SLUG))
+    else {
+        return not_installed();
+    };
+
+    let wanted = format!("{owner}/{repo}");
+    const PER_PAGE: usize = 100;
+    const MAX_PAGES: usize = 10;
+    for page in 1..=MAX_PAGES {
+        let url = format!(
+            "{}/user/installations/{}/repositories?per_page={PER_PAGE}&page={page}",
+            endpoints.api_base_url, installation.id
+        );
+        let (status, body) = get_bearer(&url, access_token)?;
+        let repos: Repos = match status {
+            200 => serde_json::from_str(&body).map_err(parse_err)?,
+            401 | 403 => return Err(rejected(status)),
+            other => return Err(unexpected(other)),
+        };
+        if repos.repositories.iter().any(|r| r.full_name.eq_ignore_ascii_case(&wanted)) {
+            return Ok(InstallationStatus::Installed);
+        }
+        if repos.repositories.len() < PER_PAGE {
+            break;
+        }
+    }
+    not_installed()
 }
 
 /// Ticket 06 checklist item 5, the unattended half: called once per
@@ -735,7 +790,9 @@ fn post_form(url: &str, form: &[(&str, &str)]) -> Result<String, DeviceFlowError
             DeviceFlowError::Network(e.to_string())
         })?;
     let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
+    if (200..300).contains(&status) {
+        log::info!("POST {url} -> {status}");
+    } else {
         log::warn!("POST {url} -> {status}");
     }
     response.text().map_err(|e| {
@@ -781,7 +838,7 @@ fn finish_bearer_response(
         DeviceFlowError::Network(e.to_string())
     })?;
     if (200..300).contains(&status) {
-        log::debug!("{method} {url} -> {status}");
+        log::info!("{method} {url} -> {status}");
     } else {
         log::error!(
             "{method} {url} -> {status}: {body} (endpoint accepts permissions: {})",
@@ -1114,17 +1171,27 @@ mod tests {
         assert!(matches!(result, Err(DeviceFlowError::Rejected(_))));
     }
 
+    fn installations_body() -> String {
+        format!(r#"{{"total_count":1,"installations":[{{"id":7,"app_slug":"{GITHUB_APP_SLUG}"}}]}}"#)
+    }
+
     #[test]
-    fn check_installation_reports_installed_on_200() {
-        let port = mock_server::spawn(vec![(200, r#"{"id":1}"#.to_string())]);
-        let status = check_installation(&endpoints_for(port), "gho_abc", "dawid", "notes").unwrap();
+    fn check_installation_reports_installed_when_the_repo_is_in_the_installation() {
+        let port = mock_server::spawn(vec![
+            (200, installations_body()),
+            (200, r#"{"total_count":1,"repositories":[{"full_name":"Dawid/Notes"}]}"#.to_string()),
+        ]);
+        let status = check_installation(&endpoints_for(port), "ghu_abc", "dawid", "notes").unwrap();
         assert_eq!(status, InstallationStatus::Installed);
     }
 
     #[test]
-    fn check_installation_reports_not_installed_with_an_install_url_on_404() {
-        let port = mock_server::spawn(vec![(404, r#"{"message":"Not Found"}"#.to_string())]);
-        let status = check_installation(&endpoints_for(port), "gho_abc", "dawid", "notes").unwrap();
+    fn check_installation_reports_not_installed_when_the_repo_is_missing_from_the_installation() {
+        let port = mock_server::spawn(vec![
+            (200, installations_body()),
+            (200, r#"{"total_count":1,"repositories":[{"full_name":"dawid/other"}]}"#.to_string()),
+        ]);
+        let status = check_installation(&endpoints_for(port), "ghu_abc", "dawid", "notes").unwrap();
         match status {
             InstallationStatus::NotInstalled { install_url } => {
                 assert!(install_url.contains("/installations/new"));
@@ -1132,6 +1199,13 @@ mod tests {
             }
             other => panic!("expected NotInstalled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_installation_reports_not_installed_when_the_app_has_no_installation() {
+        let port = mock_server::spawn(vec![(200, r#"{"total_count":0,"installations":[]}"#.to_string())]);
+        let status = check_installation(&endpoints_for(port), "ghu_abc", "dawid", "notes").unwrap();
+        assert!(matches!(status, InstallationStatus::NotInstalled { .. }));
     }
 
     #[test]

@@ -1259,10 +1259,15 @@ fn check_github_installation(remote_url: String, access_token: String) -> Result
     let (owner, repo) =
         github_oauth::owner_repo_from_remote_url(&remote_url).ok_or_else(|| "not a GitHub repository URL".to_string())?;
     let endpoints = github_oauth::GitHubEndpoints::production();
-    github_oauth::check_installation(&endpoints, &access_token, &owner, &repo).map_err(|e| {
-        log::error!("check_github_installation failed for {owner}/{repo}: {e:?}");
-        e.to_string()
-    })
+    github_oauth::check_installation(&endpoints, &access_token, &owner, &repo)
+        .map(|status| {
+            log::info!("check_github_installation for {owner}/{repo}: {status:?}");
+            status
+        })
+        .map_err(|e| {
+            log::error!("check_github_installation failed for {owner}/{repo}: {e:?}");
+            e.to_string()
+        })
 }
 
 /// Account-level installation check, run right after GitHub sign-in so a
@@ -1276,6 +1281,7 @@ fn check_github_app_installed(access_token: String) -> Result<github_oauth::Inst
         log::error!("check_github_app_installed failed: {e:?}");
         e.to_string()
     })?;
+    log::info!("check_github_app_installed: app installed for user = {installed}");
     Ok(if installed {
         github_oauth::InstallationStatus::Installed
     } else {
@@ -1552,7 +1558,9 @@ fn connect_gitlab_oauth(
 #[tauri::command]
 fn create_github_repository(name: String, private: bool, access_token: String) -> Result<github_oauth::RepoInfo, String> {
     let endpoints = github_oauth::GitHubEndpoints::production();
-    github_oauth::create_repository(&endpoints, &access_token, &name, private).map_err(log_and_stringify(format!("create_github_repository (name={name:?}, private={private})")))
+    github_oauth::create_repository(&endpoints, &access_token, &name, private)
+        .inspect(|repo| log::info!("create_github_repository (name={name:?}, private={private}) created {}", repo.html_url))
+        .map_err(log_and_stringify(format!("create_github_repository (name={name:?}, private={private})")))
 }
 
 /// Ticket 09's pick-existing path, GitHub half: lists the signed-in user's
@@ -1561,7 +1569,9 @@ fn create_github_repository(name: String, private: bool, access_token: String) -
 #[tauri::command]
 fn list_github_repositories(access_token: String) -> Result<Vec<github_oauth::RepoInfo>, String> {
     let endpoints = github_oauth::GitHubEndpoints::production();
-    github_oauth::list_repositories(&endpoints, &access_token).map_err(log_and_stringify("list_github_repositories"))
+    github_oauth::list_repositories(&endpoints, &access_token)
+        .inspect(|repos| log::info!("list_github_repositories returned {} repositories", repos.len()))
+        .map_err(log_and_stringify("list_github_repositories"))
 }
 
 /// Ticket 09's create-new path, GitLab half -- mirrors
@@ -1569,7 +1579,9 @@ fn list_github_repositories(access_token: String) -> Result<Vec<github_oauth::Re
 #[tauri::command]
 fn create_gitlab_repository(name: String, private: bool, access_token: String) -> Result<gitlab_oauth::RepoInfo, String> {
     let endpoints = gitlab_oauth::GitLabEndpoints::production();
-    gitlab_oauth::create_repository(&endpoints, &access_token, &name, private).map_err(log_and_stringify(format!("create_gitlab_repository (name={name:?}, private={private})")))
+    gitlab_oauth::create_repository(&endpoints, &access_token, &name, private)
+        .inspect(|repo| log::info!("create_gitlab_repository (name={name:?}, private={private}) created {}", repo.html_url))
+        .map_err(log_and_stringify(format!("create_gitlab_repository (name={name:?}, private={private})")))
 }
 
 /// Ticket 09's pick-existing path, GitLab half -- mirrors
@@ -1578,7 +1590,9 @@ fn create_gitlab_repository(name: String, private: bool, access_token: String) -
 #[tauri::command]
 fn list_gitlab_repositories(access_token: String) -> Result<Vec<gitlab_oauth::RepoInfo>, String> {
     let endpoints = gitlab_oauth::GitLabEndpoints::production();
-    gitlab_oauth::list_repositories(&endpoints, &access_token).map_err(log_and_stringify("list_gitlab_repositories"))
+    gitlab_oauth::list_repositories(&endpoints, &access_token)
+        .inspect(|repos| log::info!("list_gitlab_repositories returned {} repositories", repos.len()))
+        .map_err(log_and_stringify("list_gitlab_repositories"))
 }
 
 /// Provider hosts recognized as `Provider::GitHub`/`Provider::GitLab`;

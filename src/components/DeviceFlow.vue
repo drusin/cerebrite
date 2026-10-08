@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { ref } from "vue";
+
 // Shared component (spec.md#shared-components): "a shared component is
 // extracted when a second copy migrates" -- the clone wizard (ticket 10)
 // wrote this inline as the first Vue copy (itself already a second *overall*
@@ -8,14 +10,14 @@
 // it. Presentational: never imports `vault-api`/`dialogs.ts`/a `src/state/`
 // module, and mounts from props alone -- purely a display of whatever the
 // container's own device-flow polling loop (identical in every caller) has
-// found so far; there is nothing here for the user to click; the poll loop
+// found so far; the only interaction is copying the code to the clipboard; the poll loop
 // itself stays in each container/composable, not duplicated here.
 export interface DeviceCodeDisplay {
   verificationUri: string;
   userCode: string;
 }
 
-defineProps<{
+const props = defineProps<{
   /** e.g. "Requesting a device code from GitHub…", "Waiting for you to
    * approve in the browser…", or an error string once the poll loop fails. */
   status: string;
@@ -23,6 +25,19 @@ defineProps<{
    * succeeds/fails and the caller clears it). */
   deviceCode: DeviceCodeDisplay | null;
 }>();
+
+const copied = ref(false);
+
+async function copyCode() {
+  if (!props.deviceCode) return;
+  try {
+    await navigator.clipboard.writeText(props.deviceCode.userCode);
+    copied.value = true;
+    setTimeout(() => (copied.value = false), 2000);
+  } catch {
+    copied.value = false;
+  }
+}
 </script>
 
 <template>
@@ -32,6 +47,7 @@ defineProps<{
       Go to
       <a :href="deviceCode.verificationUri" target="_blank" rel="noopener">{{ deviceCode.verificationUri }}</a>
       and enter code: <strong>{{ deviceCode.userCode }}</strong>
+      <button type="button" @click="copyCode">{{ copied ? "Copied" : "Copy code" }}</button>
     </p>
   </div>
 </template>
